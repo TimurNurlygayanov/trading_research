@@ -27,27 +27,18 @@ log = structlog.get_logger(__name__)
 def _dispatch_backtest_job(strategy_id: str) -> None:
     """
     Dispatch a strategy to Modal for the full backtest pipeline.
-    Fails gracefully if Modal is not installed or not configured.
+    Uses modal.Function.lookup() so the app must be deployed first:
+      modal deploy modal_jobs/backtest_job.py
     """
     try:
-        import modal  # noqa: F401
-        from modal_jobs.backtest_job import run_backtest_pipeline
-
-        # Spawn asynchronously so the orchestrator is not blocked.
-        run_backtest_pipeline.spawn(strategy_id)
+        import modal
+        fn = modal.Function.lookup("trading-research-backtest", "run_backtest_pipeline")
+        fn.spawn(strategy_id)
         log.info("modal_backtest_dispatched", strategy_id=strategy_id)
     except ImportError:
-        log.warning(
-            "modal_not_installed",
-            strategy_id=strategy_id,
-            msg="Modal package not available; skipping remote dispatch.",
-        )
+        log.warning("modal_not_installed", strategy_id=strategy_id)
     except Exception as exc:
-        log.error(
-            "modal_dispatch_failed",
-            strategy_id=strategy_id,
-            error=str(exc),
-        )
+        log.error("modal_dispatch_failed", strategy_id=strategy_id, error=str(exc))
         db.update_strategy(strategy_id, {
             "status": "failed",
             "error_log": f"Modal dispatch error: {type(exc).__name__}: {exc}",
@@ -57,26 +48,18 @@ def _dispatch_backtest_job(strategy_id: str) -> None:
 def _dispatch_validator_job(strategy_id: str) -> None:
     """
     Dispatch a strategy to Modal for validation / summarise / learn.
-    Fails gracefully if Modal is not installed or not configured.
+    Uses modal.Function.lookup() — requires deployed app:
+      modal deploy modal_jobs/validator_job.py
     """
     try:
-        import modal  # noqa: F401
-        from modal_jobs.validator_job import run_validator_pipeline
-
-        run_validator_pipeline.spawn(strategy_id)
+        import modal
+        fn = modal.Function.lookup("trading-research-validator", "run_validator_pipeline")
+        fn.spawn(strategy_id)
         log.info("modal_validator_dispatched", strategy_id=strategy_id)
     except ImportError:
-        log.warning(
-            "modal_not_installed",
-            strategy_id=strategy_id,
-            msg="Modal package not available; skipping validator dispatch.",
-        )
+        log.warning("modal_not_installed", strategy_id=strategy_id)
     except Exception as exc:
-        log.error(
-            "modal_validator_dispatch_failed",
-            strategy_id=strategy_id,
-            error=str(exc),
-        )
+        log.error("modal_validator_dispatch_failed", strategy_id=strategy_id, error=str(exc))
         db.update_strategy(strategy_id, {
             "status": "failed",
             "error_log": f"Modal validator dispatch error: {type(exc).__name__}: {exc}",

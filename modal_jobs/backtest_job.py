@@ -123,12 +123,21 @@ def run_backtest_pipeline(strategy_id: str) -> dict:
         strategy_class = strategy_classes[0]
 
         # 5. Optimize on training data
-        # Convert param_space from JSON format to optimizer format
+        # Convert param_space from JSON format to optimizer tuple format.
+        # LLM may produce either:
+        #   ["int", 5, 30]               → ("int", 5, 30)
+        #   ["float", 1.0, 4.0]          → ("float", 1.0, 4.0)
+        #   ["categorical", 1.2, 1.5, 2] → ("categorical", [1.2, 1.5, 2])
+        #   ["categorical", [1.2, 1.5]]  → ("categorical", [1.2, 1.5])
         opt_space = {}
         for k, v in param_space.items():
-            if isinstance(v, list) and len(v) >= 3:
-                opt_space[k] = tuple(v)
-            elif isinstance(v, list) and len(v) == 2:
+            if not isinstance(v, list) or len(v) < 2:
+                continue
+            kind = v[0]
+            if kind == "categorical":
+                choices = v[1] if isinstance(v[1], list) else v[1:]
+                opt_space[k] = ("categorical", list(choices))
+            else:
                 opt_space[k] = tuple(v)
 
         best_params, study = optimize_strategy(

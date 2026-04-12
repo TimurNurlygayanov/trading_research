@@ -142,6 +142,73 @@ def api_stats() -> JSONResponse:
     })
 
 
+@app.post("/api/strategy/{strategy_id}/retry")
+def api_retry_strategy(strategy_id: str, background_tasks: BackgroundTasks) -> JSONResponse:
+    """
+    Reset a failed strategy to the appropriate previous status so the queue
+    worker picks it up again on the next cycle.
+
+    Retry logic (most conservative — go back one step):
+      - Has backtest_code → reset to "implemented"  (re-dispatch to Modal)
+      - Has pre_filter_score but no code → reset to "filtered" (re-run implementer)
+      - Nothing yet → reset to "idea" (re-run pre_filter)
+    """
+    try:
+        strategy = db.get_strategy(strategy_id)
+        if not strategy:
+            return JSONResponse({"error": "not found"}, status_code=404)
+        if strategy.get("status") != "failed":
+            return JSONResponse({"error": "only failed strategies can be retried"}, status_code=400)
+
+        if strategy.get("backtest_code"):
+            retry_status = "implemented"
+        elif strategy.get("pre_filter_score") is not None:
+            retry_status = "filtered"
+        else:
+            retry_status = "idea"
+
+        retry_count = (strategy.get("retry_count") or 0) + 1
+        db.update_strategy(strategy_id, {
+            "status": retry_status,
+            "error_log": None,
+            "retry_count": retry_count,
+        })
+        log.info("strategy_retry", strategy_id=strategy_id, retry_status=retry_status)
+        background_tasks.add_task(_scheduled_queue_worker)
+        return JSONResponse({"ok": True, "retry_status": retry_status})
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+@app.post("/api/strategy/{strategy_id}/update")
+async def api_update_strategy(strategy_id: str, request: Request,
+                               background_tasks: BackgroundTasks) -> JSONResponse:
+    """Update hypothesis/name on a failed strategy and reset to 'idea' for full re-run."""
+    try:
+        body = await request.json()
+        strategy = db.get_strategy(strategy_id)
+        if not strategy:
+            return JSONResponse({"error": "not found"}, status_code=404)
+
+        updates: dict = {"error_log": None, "retry_count": (strategy.get("retry_count") or 0) + 1}
+        if "name" in body and body["name"].strip():
+            updates["name"] = body["name"].strip()
+        if "hypothesis" in body and body["hypothesis"].strip():
+            updates["hypothesis"] = body["hypothesis"].strip()
+        # Always restart from scratch when content changes
+        updates["status"] = "idea"
+        updates["pre_filter_score"] = None
+        updates["backtest_code"] = None
+        updates["hyperparams"] = None
+
+        db.update_strategy(strategy_id, updates)
+        log.info("strategy_updated", strategy_id=strategy_id)
+        background_tasks.add_task(_scheduled_queue_worker)
+        return JSONResponse({"ok": True})
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
 @app.get("/api/strategies")
 def api_strategies(
     status: str = Query("all"),
@@ -475,6 +542,51 @@ function renderPanel(s) {
       <div class="error-box">${esc(s.error_log)}</div></div>`;
   }
 
+  let actionsHtml = '';
+  if (s.status === 'failed') {
+    const retryLabel = s.backtest_code ? 'Retry from Modal dispatch'
+                     : s.pre_filter_score != null ? 'Retry from Implementer'
+                     : 'Retry from Pre-filter';
+    actionsHtml = `
+    <div class="panel-section" id="actions-${s.id}">
+      <h3>Actions</h3>
+      <div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:14px">
+        <button onclick="retryStrategy('${s.id}')"
+          style="background:#6366f1;border:none;border-radius:8px;color:#fff;
+                 padding:9px 18px;font-size:.85rem;font-weight:600;cursor:pointer">
+          ↺ ${retryLabel}
+        </button>
+        <button onclick="toggleEditForm('${s.id}')"
+          style="background:#1e2533;border:1px solid #374151;border-radius:8px;color:#94a3b8;
+                 padding:9px 18px;font-size:.85rem;font-weight:600;cursor:pointer">
+          ✎ Edit &amp; Retry from scratch
+        </button>
+      </div>
+      <div id="edit-form-${s.id}" style="display:none">
+        <div style="margin-bottom:12px">
+          <label style="display:block;font-size:.72rem;font-weight:600;text-transform:uppercase;
+                        letter-spacing:.06em;color:#64748b;margin-bottom:6px">Strategy Name</label>
+          <input id="edit-name-${s.id}" type="text" value="${esc(s.name)}"
+            style="width:100%;background:#0f1623;border:1px solid #374151;border-radius:8px;
+                   color:#f1f5f9;padding:8px 12px;font-size:.9rem;outline:none">
+        </div>
+        <div style="margin-bottom:12px">
+          <label style="display:block;font-size:.72rem;font-weight:600;text-transform:uppercase;
+                        letter-spacing:.06em;color:#64748b;margin-bottom:6px">Description / Hypothesis</label>
+          <textarea id="edit-hyp-${s.id}" rows="5"
+            style="width:100%;background:#0f1623;border:1px solid #374151;border-radius:8px;
+                   color:#f1f5f9;padding:8px 12px;font-size:.9rem;outline:none;
+                   resize:vertical;font-family:inherit">${esc(s.hypothesis || '')}</textarea>
+        </div>
+        <button onclick="saveAndRetry('${s.id}')"
+          style="background:#059669;border:none;border-radius:8px;color:#fff;
+                 padding:9px 18px;font-size:.85rem;font-weight:600;cursor:pointer">
+          Save &amp; Retry from scratch
+        </button>
+      </div>
+    </div>`;
+  }
+
   let reportHtml = '';
   if (s.report_text) {
     // Render markdown-ish text: bold, headers, lists
@@ -528,13 +640,64 @@ function renderPanel(s) {
       </div>
     </div>
 
-    ${wfHtml}${paramsHtml}${errHtml}${reportHtml}`;
+    ${actionsHtml}${wfHtml}${paramsHtml}${errHtml}${reportHtml}`;
 }
 
 function fmtNum(v) { return v != null ? parseFloat(v).toFixed(3) : '—'; }
 function esc(s) {
   if (!s) return '';
   return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+async function retryStrategy(id) {
+  const btn = event.target;
+  btn.disabled = true;
+  btn.textContent = 'Retrying…';
+  try {
+    const r = await fetch(`/api/strategy/${id}/retry`, {method: 'POST'});
+    const data = await r.json();
+    if (data.ok) {
+      btn.textContent = '✓ Queued — refreshing…';
+      setTimeout(() => { closePanel(); loadAll(); }, 1200);
+    } else {
+      btn.textContent = '✗ ' + (data.error || 'Error');
+      btn.disabled = false;
+    }
+  } catch(e) {
+    btn.textContent = '✗ Network error';
+    btn.disabled = false;
+  }
+}
+
+function toggleEditForm(id) {
+  const el = document.getElementById(`edit-form-${id}`);
+  el.style.display = el.style.display === 'none' ? 'block' : 'none';
+}
+
+async function saveAndRetry(id) {
+  const name = document.getElementById(`edit-name-${id}`).value;
+  const hyp  = document.getElementById(`edit-hyp-${id}`).value;
+  const btn  = event.target;
+  btn.disabled = true;
+  btn.textContent = 'Saving…';
+  try {
+    const r = await fetch(`/api/strategy/${id}/update`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({name, hypothesis: hyp}),
+    });
+    const data = await r.json();
+    if (data.ok) {
+      btn.textContent = '✓ Saved — refreshing…';
+      setTimeout(() => { closePanel(); loadAll(); }, 1200);
+    } else {
+      btn.textContent = '✗ ' + (data.error || 'Error');
+      btn.disabled = false;
+    }
+  } catch(e) {
+    btn.textContent = '✗ Network error';
+    btn.disabled = false;
+  }
 }
 
 // Auto-refresh every 30s
