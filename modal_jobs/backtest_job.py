@@ -66,6 +66,7 @@ def run_backtest_pipeline(strategy_id: str) -> dict:
 
     try:
         from db import supabase_client as db
+        from agents.utils import add_pipeline_note
         from backtest.data_fetcher import fetch_ohlcv, split_train_oos
         from backtest.engine import run_backtest
         from backtest.leakage_detector import check_leakage
@@ -96,6 +97,8 @@ def run_backtest_pipeline(strategy_id: str) -> dict:
 
         db.update_strategy(strategy_id, {"status": "implementing"})
 
+        add_pipeline_note(strategy_id, f"Backtest job started on Modal — symbol={symbol}, timeframe={timeframe}.")
+
         # 2. Leakage check
         leakage_result = check_leakage(code)
         if not leakage_result.passed:
@@ -105,6 +108,7 @@ def run_backtest_pipeline(strategy_id: str) -> dict:
                 "leakage_issues": leakage_result.issues,
                 "error_log": f"Leakage check failed (score={leakage_result.score}): {leakage_result.issues[:3]}",
             })
+            add_pipeline_note(strategy_id, f"Backtest FAILED leakage check — score {leakage_result.score}/10. Issues: {'; '.join(leakage_result.issues[:3])}")
             return {"passed": False, "reason": "leakage_check_failed", "issues": leakage_result.issues}
 
         # 3. Fetch data
@@ -152,6 +156,12 @@ def run_backtest_pipeline(strategy_id: str) -> dict:
         # 7. Final backtest on full training data
         train_result = run_backtest(strategy_class, train_df, params=best_params)
 
+        add_pipeline_note(
+            strategy_id,
+            f"Optuna done — best params: {best_params}. "
+            f"Walk-forward scores: {[round(s,3) for s in (wf_scores or [])]}."
+        )
+
         if not train_result.passed:
             db.update_strategy(strategy_id, {
                 "status": "failed",
@@ -161,6 +171,7 @@ def run_backtest_pipeline(strategy_id: str) -> dict:
                 "error_log": train_result.reject_reason,
                 "hyperparams": best_params,
             })
+            add_pipeline_note(strategy_id, f"Backtest FAILED — {train_result.reject_reason}")
             return {"passed": False, "reason": train_result.reject_reason}
 
         # 8. OOS backtest
@@ -192,6 +203,15 @@ def run_backtest_pipeline(strategy_id: str) -> dict:
             "walk_forward_scores": wf_scores,
             "hyperparams": best_params,
         })
+
+        oos_sharpe_str = f"{oos_result.sharpe:.3f}" if oos_result else "N/A"
+        mc_str = f"{mc_pvalue:.4f}" if mc_pvalue is not None else "N/A"
+        add_pipeline_note(
+            strategy_id,
+            f"Backtest passed — train Sharpe {train_result.sharpe:.3f}, "
+            f"OOS Sharpe {oos_sharpe_str}, {train_result.total_trades} trades, "
+            f"Monte Carlo p={mc_str}. Sending to validator."
+        )
 
         return {
             "passed": True,

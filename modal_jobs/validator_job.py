@@ -61,6 +61,7 @@ def run_validator_pipeline(strategy_id: str) -> dict:
 
     try:
         from db import supabase_client as db
+        from agents.utils import add_pipeline_note
 
         # ----------------------------------------------------------------
         # 1. Validator
@@ -76,6 +77,7 @@ def run_validator_pipeline(strategy_id: str) -> dict:
                 "status": "rejected",
                 "error_log": reason,
             })
+            add_pipeline_note(strategy_id, f"Validator REJECTED — {reason}")
             return {
                 "passed": False,
                 "strategy_id": strategy_id,
@@ -120,6 +122,7 @@ def run_validator_pipeline(strategy_id: str) -> dict:
         # ----------------------------------------------------------------
         # 4. Mark strategy as live
         # ----------------------------------------------------------------
+        add_pipeline_note(strategy_id, "Validator passed. Summariser and Learner complete. Strategy is LIVE.")
         db.update_strategy(strategy_id, {"status": "live"})
 
         return {

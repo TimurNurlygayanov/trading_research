@@ -15,7 +15,7 @@ from dotenv import load_dotenv
 
 from db import supabase_client as db
 from agents.prompts import IMPLEMENTER_SYSTEM, IMPLEMENTER_USER_TEMPLATE
-from agents.utils import full_description
+from agents.utils import full_description, add_pipeline_note
 from backtest.leakage_detector import check_leakage
 
 load_dotenv()
@@ -168,6 +168,14 @@ def run_implementer(strategy_id: str) -> dict[str, Any]:
     log.info(
         f"Implementer: strategy={strategy_id} → implemented "
         f"(leakage_score={leakage_score}, class={result.get('strategy_class', '?')})"
+    )
+
+    issues_summary = f" Issues: {'; '.join(leakage_issues[:3])}" if leakage_issues else ""
+    leak_status = "clean" if leakage_score >= MIN_LEAKAGE_SCORE else f"WARNING score {leakage_score:.1f}/10"
+    add_pipeline_note(
+        strategy_id,
+        f"Implementer generated {result.get('strategy_class', 'Strategy')} — "
+        f"leakage {leak_status}.{issues_summary} Dispatching to Modal for backtest."
     )
 
     return {

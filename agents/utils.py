@@ -1,7 +1,25 @@
 """Shared utilities for all agents."""
 from __future__ import annotations
 
+import datetime
 import json
+
+
+def add_pipeline_note(strategy_id: str, text: str) -> None:
+    """Append an automated pipeline note to the strategy's comments."""
+    from db import supabase_client as db
+    strategy = db.get_strategy(strategy_id)
+    if not strategy:
+        return
+    existing = strategy.get("comments") or []
+    if isinstance(existing, str):
+        try:
+            existing = json.loads(existing)
+        except (ValueError, TypeError):
+            existing = []
+    ts = datetime.datetime.utcnow().isoformat()[:19]
+    existing.append({"text": f"[pipeline] {text}", "ts": ts})
+    db.update_strategy(strategy_id, {"comments": existing})
 
 
 def full_description(strategy: dict) -> str:
