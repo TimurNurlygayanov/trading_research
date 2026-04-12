@@ -40,7 +40,8 @@ image = (
         "python-dotenv==1.0.1",
         "scipy==1.14.1",
         "pyarrow",
-        "anthropic>=0.25.0",   # needed by code_fixer / agents called inside
+        "massive",             # market data client used by data_fetcher
+        "anthropic>=0.25.0",
     )
     .add_local_dir(_os.path.join(_ROOT, "db"),       remote_path="/root/db")
     .add_local_dir(_os.path.join(_ROOT, "agents"),   remote_path="/root/agents")
