@@ -34,8 +34,8 @@ def _dispatch_backtest_job(strategy_id: str) -> None:
         import modal
         fn = modal.Function.from_name("trading-research-backtest", "run_backtest_pipeline")
         call = fn.spawn(strategy_id)
-        job_id = getattr(call, "object_id", None)
-        db.update_strategy(strategy_id, {"modal_job_id": job_id})
+        job_id = call.object_id
+        db.update_strategy(strategy_id, {"status": "backtesting", "modal_job_id": job_id})
         log.info("modal_backtest_dispatched", strategy_id=strategy_id, job_id=job_id)
     except ImportError:
         log.warning("modal_not_installed", strategy_id=strategy_id)
@@ -56,7 +56,7 @@ def _dispatch_validator_job(strategy_id: str) -> None:
         import modal
         fn = modal.Function.from_name("trading-research-validator", "run_validator_pipeline")
         call = fn.spawn(strategy_id)
-        job_id = getattr(call, "object_id", None)
+        job_id = call.object_id
         db.update_strategy(strategy_id, {"modal_job_id": job_id})
         log.info("modal_validator_dispatched", strategy_id=strategy_id, job_id=job_id)
     except ImportError:
@@ -276,6 +276,8 @@ def _process_implemented_strategies() -> int:
     implemented = db.get_strategies_by_status("implemented", limit=5)
     for strategy in implemented:
         strategy_id = strategy.get("id")
+        if strategy.get("modal_job_id"):
+            continue  # already dispatched
         try:
             _dispatch_backtest_job(strategy_id)
             dispatched += 1
@@ -286,6 +288,8 @@ def _process_implemented_strategies() -> int:
     validating = db.get_strategies_by_status("validating", limit=10)
     for strategy in validating:
         strategy_id = strategy.get("id")
+        if strategy.get("modal_job_id"):
+            continue  # already dispatched
         try:
             _dispatch_validator_job(strategy_id)
             dispatched += 1

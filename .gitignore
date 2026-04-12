@@ -31,6 +31,9 @@ env/
 .idea/
 *.swp
 
+# Claude Code
+.claude/
+
 # Jupyter
 .ipynb_checkpoints/
 *.ipynb

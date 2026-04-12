@@ -285,9 +285,10 @@ def run_backtest_pipeline(strategy_id: str) -> dict:
                 f"(minimum {MIN_TRADES_FOR_MC} required for reliable p-value)."
             )
 
-        # 10. Update DB with full results
+        # 10. Update DB with full results (clear modal_job_id so validator can dispatch)
         db.update_strategy(strategy_id, {
             "status": "validating",
+            "modal_job_id": None,
             "backtest_sharpe": train_result.sharpe,
             "backtest_calmar": train_result.calmar,
             "max_drawdown": train_result.max_drawdown,
