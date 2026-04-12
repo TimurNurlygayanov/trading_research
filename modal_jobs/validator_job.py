@@ -23,8 +23,8 @@ image = (
     modal.Image.debian_slim(python_version="3.13")
     .pip_install(
         "pandas==2.2.3",
-        "pandas_ta==0.3.14b",
-        "numpy==2.1.3",
+        "pandas_ta==0.4.71b0",
+        "numpy",
         "backtesting==0.3.3",
         "optuna==3.6.1",
         "scikit-learn==1.5.2",
