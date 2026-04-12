@@ -86,7 +86,7 @@ def run_backtest_pipeline(strategy_id: str) -> dict:
         from backtest.leakage_detector import check_leakage
         from backtest.optimizer import optimize_strategy
         from backtest.walk_forward import walk_forward
-        from backtest.monte_carlo import run_monte_carlo
+        from backtest.monte_carlo import monte_carlo_test as run_monte_carlo
 
         # 1. Load strategy
         strategy = db.get_strategy(strategy_id)
