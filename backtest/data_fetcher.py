@@ -141,12 +141,12 @@ def fetch_ohlcv(
         )
 
         try:
-            aggs = client.get_aggs(
-                ticker=ticker,
-                multiplier=multiplier,
-                timespan=timespan,
-                from_=chunk_start.isoformat(),
-                to=chunk_end.isoformat(),
+            agg_iter = client.list_aggs(
+                ticker,
+                multiplier,
+                timespan,
+                chunk_start.isoformat(),
+                chunk_end.isoformat(),
                 adjusted=adjusted,
                 sort="asc",
                 limit=50000,
@@ -157,7 +157,7 @@ def fetch_ohlcv(
                 f"{chunk_start}→{chunk_end}: {e}"
             ) from e
 
-        for bar in aggs:
+        for bar in agg_iter:
             all_bars.append({
                 "datetime": pd.Timestamp(bar.timestamp, unit="ms", tz="UTC"),
                 "Open":   float(bar.open),

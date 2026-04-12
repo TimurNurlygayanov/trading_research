@@ -117,10 +117,14 @@ def preload_ohlcv_data(
 
                 # Bars-per-year breakdown — shows which years have good data coverage
                 bars_by_year: dict = {}
+                bars_by_hour: dict = {}
                 for ts in df.index:
                     y = str(ts.year)
+                    h = ts.hour
                     bars_by_year[y] = bars_by_year.get(y, 0) + 1
+                    bars_by_hour[h] = bars_by_hour.get(h, 0) + 1
                 print(f"[preload] {key} coverage by year: {bars_by_year}")
+                print(f"[preload] {key} coverage by hour (UTC): { {h: bars_by_hour[h] for h in sorted(bars_by_hour)} }")
 
                 # Recent 500 bars for chart display
                 recent = df.tail(500)
