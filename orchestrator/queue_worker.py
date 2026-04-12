@@ -85,6 +85,7 @@ def _process_user_ideas() -> int:
     processed = 0
     for idea in ideas:
         idea_id = idea.get("id")
+        strategy_id: str | None = None
         try:
             # Create strategy record — insert_strategy returns a dict, extract the id
             strategy_record = db.insert_strategy({
@@ -136,8 +137,72 @@ def _process_user_ideas() -> int:
 
         except Exception as exc:
             log.error("idea_processing_failed", idea_id=idea_id, error=str(exc))
+            # If we managed to create the strategy record before the crash,
+            # mark it failed so it doesn't sit in "idea" state forever.
+            if strategy_id:
+                try:
+                    db.update_strategy(strategy_id, {
+                        "status": "failed",
+                        "error_log": f"idea_processing_failed: {type(exc).__name__}: {exc}",
+                    })
+                except Exception:
+                    pass
 
     return processed
+
+
+def _recover_stuck_idea_strategies() -> int:
+    """
+    Safety net: pick up strategies stuck in "idea" status.
+
+    This happens when _process_user_ideas() crashes between creating the
+    strategy record and finishing pre_filter — leaving the strategy in "idea"
+    with no further trigger (the user_idea is already marked "picked_up").
+    """
+    sb = db.get_client()
+    result = (
+        sb.table("strategies")
+        .select("id, name")
+        .eq("status", "idea")
+        .order("created_at")
+        .limit(5)
+        .execute()
+    )
+    strategies = result.data or []
+    if not strategies:
+        return 0
+
+    recovered = 0
+    for strategy in strategies:
+        strategy_id = strategy["id"]
+        try:
+            try:
+                check_budget("pre_filter")
+            except BudgetExceeded as budget_err:
+                log.warning("budget_exceeded_recover_idea",
+                            strategy_id=strategy_id, error=str(budget_err))
+                db.update_strategy(strategy_id, {
+                    "status": "failed",
+                    "error_log": str(budget_err),
+                })
+                recovered += 1
+                continue
+
+            from agents.pre_filter import run_pre_filter
+            log.info("recovering_stuck_idea", strategy_id=strategy_id,
+                     name=strategy.get("name"))
+            run_pre_filter(strategy_id)
+            log.info("recovered_idea_pre_filter_complete", strategy_id=strategy_id)
+            recovered += 1
+        except Exception as exc:
+            log.error("recover_idea_failed", strategy_id=strategy_id, error=str(exc))
+            db.update_strategy(strategy_id, {
+                "status": "failed",
+                "error_log": f"recover_idea pre_filter error: {type(exc).__name__}: {exc}",
+            })
+            recovered += 1
+
+    return recovered
 
 
 def _process_filtered_strategies() -> int:
@@ -382,6 +447,7 @@ def process_queue() -> None:
     log.info("queue_worker_start")
 
     ideas_processed       = _process_user_ideas()
+    recovered_ideas       = _recover_stuck_idea_strategies()
     filtered_processed    = _process_filtered_strategies()
     validating_dispatched = _process_implemented_strategies()
     auto_fixed            = _process_failed_strategies()
@@ -389,6 +455,7 @@ def process_queue() -> None:
     log.info(
         "queue_worker_done",
         ideas_processed=ideas_processed,
+        recovered_ideas=recovered_ideas,
         filtered_processed=filtered_processed,
         validating_dispatched=validating_dispatched,
         auto_fixed=auto_fixed,

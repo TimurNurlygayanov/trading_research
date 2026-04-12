@@ -434,6 +434,13 @@ def api_dismiss_generated_idea(idea_id: str) -> JSONResponse:
         return JSONResponse({"error": str(exc)}, status_code=500)
 
 
+@app.post("/api/queue/run")
+def api_queue_run(background_tasks: BackgroundTasks) -> JSONResponse:
+    """Trigger an immediate queue processing cycle (runs in background)."""
+    background_tasks.add_task(_scheduled_queue_worker)
+    return JSONResponse({"ok": True, "message": "Queue worker started in background."})
+
+
 @app.post("/api/generated-ideas/refresh")
 def api_refresh_generated_ideas(background_tasks: BackgroundTasks) -> JSONResponse:
     """Trigger a manual idea-generation cycle (runs in background)."""
