@@ -41,8 +41,8 @@ SCORING CRITERIA (score 1-10):
    - 1: weak but plausible reason
    - 0: no logical basis (e.g., "buy on full moon")
 
-3. Signal frequency potential (0-2): Could this generate >= 100 signals/year on FX/crypto hourly data?
-   - 2: high frequency indicators (RSI, BB, MA crossovers on 1H-4H) — easily 100+/year
+3. Signal frequency potential (0-2): Could this generate >= 100 signals/year on the mentioned timeframe?
+   - 2: high frequency at the target timeframe (e.g. RSI/MA crossovers on 5m/15m/1H) — easily 100+/year
    - 1: borderline (daily setups, rare confluence) — might be < 100/year
    - 0: very rare setup — definitely < 100/year
 
@@ -73,7 +73,7 @@ OUTPUT FORMAT (JSON only, no other text):
   "rejection_reason": "<reason if rejected, else null>",
   "suggested_modifications": "<suggestions if verdict=modify, else null>",
   "suggested_indicators": ["<indicator1>", "<indicator2>"],
-  "suggested_timeframes": ["1h", "4h"],
+  "suggested_timeframes": ["<IMPORTANT: if the description explicitly mentions a timeframe (e.g. '5m', '15m', '1h'), use EXACTLY that timeframe as the first entry. Otherwise suggest based on strategy type: scalping→5m/15m, intraday→1h/4h, swing→4h/1d>"],
   "suggested_symbols": ["EURUSD", "GBPUSD"],
   "strategy_name": "<concise 4-8 word title for this strategy, e.g. 'RSI Divergence VWAP Bounce 1H'>",
   "refined_description": "<rewrite the strategy description incorporating your suggestions: make entry/exit rules precise and quantifiable, add missing details like stop-loss type, TP target, session filter. Keep the user's original intent. 2-4 sentences max.>",
@@ -123,6 +123,55 @@ MANDATORY CLASS ATTRIBUTES (all tunable by Optuna):
 - end_hour: int = 20            (session end, UTC hour)
 - max_daily_losses: int = 3     (risk management — max losing trades per day)
 
+IF using SuperTrend, also add:
+- st_period: int = 7            (SuperTrend ATR period)
+- st_mult: float = 3.0          (SuperTrend multiplier)
+
+PANDAS_TA COMPLEX INDICATORS — use these exact signatures (do NOT implement these manually):
+
+SuperTrend (use ta.supertrend, NEVER implement manually):
+```python
+# Returns a DataFrame with columns like SUPERT_7_3.0, SUPERTd_7_3.0, SUPERTl_7_3.0
+_st = ta.supertrend(high, low, close, length=self.st_period, multiplier=self.st_mult)
+# Build column names ONCE from the actual params (avoids float formatting issues)
+_st_col  = f"SUPERT_{self.st_period}_{float(self.st_mult)}"
+_std_col = f"SUPERTd_{self.st_period}_{float(self.st_mult)}"
+# Direction column: 1 = uptrend (price above supertrend), -1 = downtrend
+self.st_dir  = self.I(lambda: _st[_std_col].values, name="ST_dir")
+self.st_line = self.I(lambda: _st[_st_col].values,  name="ST_line")
+# In next(): long when self.st_dir[-2] == 1, short when self.st_dir[-2] == -1
+```
+
+Ichimoku:
+```python
+_ichi = ta.ichimoku(high, low, close)[0]  # returns (span_df, kijun_df)
+self.tenkan = self.I(lambda: _ichi["ITS_9"].values, name="Tenkan")
+self.kijun  = self.I(lambda: _ichi["IKS_26"].values, name="Kijun")
+```
+
+MACD (returns DataFrame):
+```python
+_macd = ta.macd(close, fast=self.fast_p, slow=self.slow_p, signal=self.signal_p)
+self.macd_line = self.I(lambda: _macd[f"MACD_{self.fast_p}_{self.slow_p}_{self.signal_p}"].values, name="MACD")
+self.macd_sig  = self.I(lambda: _macd[f"MACDs_{self.fast_p}_{self.slow_p}_{self.signal_p}"].values, name="MACDs")
+```
+
+Bollinger Bands:
+```python
+_bb = ta.bbands(close, length=self.bb_period, std=self.bb_std)
+self.bb_upper = self.I(lambda: _bb[f"BBU_{self.bb_period}_{float(self.bb_std)}"].values, name="BB_upper")
+self.bb_lower = self.I(lambda: _bb[f"BBL_{self.bb_period}_{float(self.bb_std)}"].values, name="BB_lower")
+self.bb_mid   = self.I(lambda: _bb[f"BBM_{self.bb_period}_{float(self.bb_std)}"].values, name="BB_mid")
+```
+
+Simple scalar indicators (return Series directly — no column selection needed):
+```python
+self.rsi  = self.I(lambda: ta.rsi(close, length=self.rsi_period).values, name="RSI")
+self.atr  = self.I(lambda: ta.atr(high, low, close, length=self.atr_period).values, name="ATR")
+self.ema  = self.I(lambda: ta.ema(close, length=self.ema_period).values, name="EMA")
+self.adx  = self.I(lambda: ta.adx(high, low, close, length=self.adx_period)[f"ADX_{self.adx_period}"].values, name="ADX")
+```
+
 SIGNAL COUNT VALIDATION — include this EXACTLY in your code:
 ```python
 def _count_signals(self) -> None:
@@ -152,7 +201,7 @@ Return a JSON object with these exact keys:
   "hypothesis": "<one paragraph explaining the edge>",
   "indicators_used": ["rsi", "atr", ...],
   "recommended_symbols": ["EURUSD", "GBPUSD"],
-  "recommended_timeframes": ["1h", "4h"],
+  "recommended_timeframes": ["<use the timeframe from Recommended timeframes input — do NOT change it unless clearly wrong>"],
   "notes": "<any implementation caveats>"
 }}
 
@@ -247,6 +296,8 @@ Pre-filter notes: {pre_filter_notes}
 Suggested indicators: {indicators}
 Recommended timeframes: {timeframes}
 Recommended symbols: {symbols}
+
+IMPORTANT: The "Recommended timeframes" above is the user's intended timeframe — use it EXACTLY in recommended_timeframes output. If multiple timeframes listed, use the first one.
 
 Knowledge base (what works and fails):
 {knowledge_base_context}
