@@ -442,6 +442,50 @@ def api_refresh_generated_ideas(background_tasks: BackgroundTasks) -> JSONRespon
 
 
 # ---------------------------------------------------------------------------
+# Data cache API
+# ---------------------------------------------------------------------------
+
+@app.get("/api/data/cache")
+def api_data_cache() -> JSONResponse:
+    """Return metadata for all cached OHLCV datasets (no chart data)."""
+    try:
+        datasets = db.get_data_cache()
+        return JSONResponse({"datasets": datasets})
+    except Exception as exc:
+        log.error("api_data_cache_error", error=str(exc))
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+@app.get("/api/data/cache/{symbol}/{timeframe}")
+def api_data_cache_bars(symbol: str, timeframe: str) -> JSONResponse:
+    """Return recent_bars for a single dataset (used by the price chart)."""
+    try:
+        bars = db.get_data_cache_bars(symbol.upper(), timeframe.lower())
+        return JSONResponse({"bars": bars})
+    except Exception as exc:
+        log.error("api_data_cache_bars_error", symbol=symbol, error=str(exc))
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+@app.post("/api/data/preload")
+def api_data_preload(background_tasks: BackgroundTasks) -> JSONResponse:
+    """Trigger the Modal preload job to fetch/refresh OHLCV data."""
+    def _run_preload():
+        try:
+            import modal as _modal
+            fn = _modal.Function.from_name(
+                "trading-research-preload", "preload_ohlcv_data"
+            )
+            fn.spawn()
+            log.info("preload_job_spawned")
+        except Exception as exc:
+            log.error("preload_job_spawn_failed", error=str(exc))
+
+    background_tasks.add_task(_run_preload)
+    return JSONResponse({"ok": True, "message": "Preload job started on Modal."})
+
+
+# ---------------------------------------------------------------------------
 # Dashboard UI
 # ---------------------------------------------------------------------------
 
@@ -579,6 +623,7 @@ _DASHBOARD_HTML = r"""<!DOCTYPE html>
   <a href="/dashboard" class="active">Dashboard</a>
   <a href="/ideas">Ideas</a>
   <a href="/research">Research</a>
+  <a href="/data">Data</a>
   <a href="/health">Health</a>
   <div class="nav-right">
     <div class="budget-pill">Today: <span id="spend">…</span> / <span id="limit">$8.00</span></div>
@@ -1488,6 +1533,7 @@ _RESEARCH_HTML = r"""<!DOCTYPE html>
   <a href="/dashboard">Dashboard</a>
   <a href="/ideas">Ideas</a>
   <a href="/research" class="active">Research</a>
+  <a href="/data">Data</a>
   <a href="/health">Health</a>
   <div class="nav-right">
     <button class="refresh-btn" id="refresh-btn" onclick="triggerRefresh()">
@@ -1676,6 +1722,329 @@ loadIdeas('pending');
 @app.get("/research", response_class=HTMLResponse)
 def research_page() -> HTMLResponse:
     return HTMLResponse(_RESEARCH_HTML)
+
+
+# ---------------------------------------------------------------------------
+# Data cache page
+# ---------------------------------------------------------------------------
+
+_DATA_HTML = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Data Cache — Trading Research</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+         background: #0a0d14; color: #e2e8f0; min-height: 100vh; }
+
+  .nav { display: flex; align-items: center; gap: 0; background: #111827;
+         border-bottom: 1px solid #1f2937; padding: 0 24px; }
+  .nav-logo { font-weight: 700; font-size: 0.95rem; color: #f8fafc;
+              padding: 14px 0; margin-right: 32px; letter-spacing: -.01em; }
+  .nav a { display: block; padding: 14px 16px; font-size: 0.85rem; color: #94a3b8;
+           text-decoration: none; border-bottom: 2px solid transparent; transition: color .15s; }
+  .nav a:hover, .nav a.active { color: #f1f5f9; border-bottom-color: #6366f1; }
+  .nav-right { margin-left: auto; display: flex; align-items: center; gap: 12px; }
+
+  .page { max-width: 1200px; margin: 0 auto; padding: 32px 24px; }
+  .page-header { display: flex; align-items: flex-start; justify-content: space-between;
+                 margin-bottom: 28px; flex-wrap: wrap; gap: 14px; }
+  .page-title { font-size: 1.4rem; font-weight: 700; color: #f8fafc; margin-bottom: 4px; }
+  .page-sub   { font-size: 0.85rem; color: #64748b; }
+
+  .btn-primary { background: #6366f1; border: none; border-radius: 8px; color: #fff;
+                 font-size: 0.85rem; font-weight: 600; padding: 9px 18px; cursor: pointer; }
+  .btn-primary:hover { background: #4f46e5; }
+  .btn-primary:disabled { opacity: .55; cursor: default; }
+
+  .status-bar { background: #111827; border: 1px solid #1f2937; border-radius: 10px;
+                padding: 12px 18px; margin-bottom: 24px; font-size: 0.83rem; color: #64748b;
+                display: none; }
+  .status-bar.visible { display: block; }
+  .status-bar.running { border-color: #3b2f00; color: #fcd34d; background: #1a1500; }
+  .status-bar.ok      { border-color: #14532d; color: #86efac; background: #0a1f0f; }
+  .status-bar.err     { border-color: #7f1d1d; color: #fca5a5; background: #1f0a0a; }
+
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); gap: 20px; }
+
+  .ds-card { background: #111827; border: 1px solid #1f2937; border-radius: 14px; overflow: hidden; }
+  .ds-header { padding: 16px 18px 12px; border-bottom: 1px solid #1f2937;
+               display: flex; align-items: center; justify-content: space-between; }
+  .ds-title { font-size: 1rem; font-weight: 700; color: #f8fafc; }
+  .tf-badge { background: #1e2d3d; color: #7dd3fc; border-radius: 6px;
+              padding: 3px 10px; font-size: 0.75rem; font-weight: 600;
+              font-family: "SF Mono", monospace; }
+
+  .chart-area { height: 80px; background: #0a0f1a; position: relative; }
+  canvas.price-chart { width: 100%; height: 80px; display: block; }
+
+  .ds-stats { padding: 14px 18px; display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  .stat { }
+  .stat-label { font-size: 0.68rem; text-transform: uppercase; letter-spacing: .06em;
+                color: #475569; margin-bottom: 3px; }
+  .stat-val   { font-size: 0.9rem; font-weight: 600; color: #e2e8f0;
+                font-family: "SF Mono", "Fira Code", monospace; }
+  .stat-val.good { color: #4ade80; }
+  .stat-val.warn { color: #fbbf24; }
+  .stat-val.bad  { color: #f87171; }
+
+  .ds-footer { padding: 10px 18px; border-top: 1px solid #1f2937;
+               display: flex; align-items: center; justify-content: space-between; }
+  .cached-ts { font-size: 0.72rem; color: #374151; }
+  .btn-refresh { background: none; border: 1px solid #374151; border-radius: 6px;
+                 color: #64748b; font-size: 0.75rem; padding: 4px 10px; cursor: pointer; }
+  .btn-refresh:hover { color: #f1f5f9; border-color: #6366f1; }
+  .btn-refresh:disabled { opacity: .4; cursor: default; }
+
+  .not-cached { padding: 32px 18px; text-align: center; color: #475569;
+                font-size: 0.875rem; border-top: 1px solid #1f2937; }
+  .not-cached button { margin-top: 12px; background: #6366f1; border: none;
+                       border-radius: 8px; color: #fff; font-size: 0.82rem;
+                       font-weight: 600; padding: 7px 16px; cursor: pointer; }
+
+  .loading { text-align: center; padding: 80px 0; color: #475569; }
+</style>
+</head>
+<body>
+
+<nav class="nav">
+  <div class="nav-logo">Trading Research</div>
+  <a href="/dashboard">Dashboard</a>
+  <a href="/ideas">Ideas</a>
+  <a href="/research">Research</a>
+  <a href="/data" class="active">Data</a>
+  <a href="/health">Health</a>
+  <div class="nav-right">
+    <button class="btn-primary" id="preload-btn" onclick="preloadAll()">
+      ↓ Preload all data
+    </button>
+  </div>
+</nav>
+
+<div class="page">
+  <div class="page-header">
+    <div>
+      <div class="page-title">OHLCV Data Cache</div>
+      <div class="page-sub">Cached market data on the Modal Volume used for backtesting. 1m from 2024, 5m from 2022, 1h from 2015.</div>
+    </div>
+  </div>
+
+  <div class="status-bar" id="status-bar"></div>
+  <div id="grid-wrap"><div class="loading">Loading…</div></div>
+</div>
+
+<script>
+// Datasets to show (always rendered as cards, even if not yet cached)
+const DATASETS = [
+  {symbol: 'EURUSD', timeframe: '1h',  label: '1 Hour',   color: '#6366f1'},
+  {symbol: 'EURUSD', timeframe: '5m',  label: '5 Min',    color: '#22d3ee'},
+  {symbol: 'EURUSD', timeframe: '1m',  label: '1 Min',    color: '#a78bfa'},
+];
+
+let cacheMap = {};   // key → metadata row from Supabase
+
+async function loadCache() {
+  try {
+    const r = await fetch('/api/data/cache');
+    const d = await r.json();
+    cacheMap = {};
+    for (const ds of (d.datasets || [])) {
+      cacheMap[ds.symbol + '_' + ds.timeframe] = ds;
+    }
+    renderGrid();
+  } catch(e) {
+    document.getElementById('grid-wrap').innerHTML =
+      '<div class="loading">Failed to load cache info.</div>';
+  }
+}
+
+function renderGrid() {
+  const wrap = document.getElementById('grid-wrap');
+  wrap.innerHTML = `<div class="grid">${DATASETS.map(ds => renderCard(ds)).join('')}</div>`;
+  // Load charts asynchronously
+  DATASETS.forEach(ds => {
+    const key = ds.symbol + '_' + ds.timeframe;
+    if (cacheMap[key]) loadChart(ds.symbol, ds.timeframe, ds.color);
+  });
+}
+
+function renderCard(ds) {
+  const key  = ds.symbol + '_' + ds.timeframe;
+  const meta = cacheMap[key];
+  if (!meta) {
+    return `
+    <div class="ds-card" id="card-${key}">
+      <div class="ds-header">
+        <span class="ds-title">${ds.symbol}</span>
+        <span class="tf-badge">${ds.timeframe}</span>
+      </div>
+      <div class="not-cached">
+        Not cached yet
+        <br><button onclick="preloadOne('${ds.symbol}','${ds.timeframe}',this)">↓ Load now</button>
+      </div>
+    </div>`;
+  }
+
+  const bars   = meta.bar_count ? meta.bar_count.toLocaleString() : '—';
+  const first  = meta.first_date ? meta.first_date.slice(0,10) : '—';
+  const last   = meta.last_date  ? meta.last_date.slice(0,10)  : '—';
+  const sizeMb = meta.file_size_mb ? meta.file_size_mb.toFixed(1) + ' MB' : '—';
+  const compl  = meta.completeness_pct != null ? meta.completeness_pct.toFixed(1) + '%' : '—';
+  const complCls = meta.completeness_pct >= 90 ? 'good' : meta.completeness_pct >= 70 ? 'warn' : 'bad';
+  const mean   = meta.price_mean ? meta.price_mean.toFixed(5) : '—';
+  const vol    = meta.avg_volume ? meta.avg_volume.toFixed(2) : '—';
+  const cachedTs = meta.cached_at ? meta.cached_at.slice(0,16).replace('T',' ') + ' UTC' : '—';
+
+  return `
+  <div class="ds-card" id="card-${key}">
+    <div class="ds-header">
+      <span class="ds-title">${ds.symbol}</span>
+      <span class="tf-badge">${ds.timeframe} · ${ds.label}</span>
+    </div>
+    <div class="chart-area">
+      <canvas class="price-chart" id="chart-${key}" width="700" height="80"></canvas>
+    </div>
+    <div class="ds-stats">
+      <div class="stat"><div class="stat-label">Bars</div><div class="stat-val">${bars}</div></div>
+      <div class="stat"><div class="stat-label">Size</div><div class="stat-val">${sizeMb}</div></div>
+      <div class="stat"><div class="stat-label">From</div><div class="stat-val" style="font-size:.78rem">${first}</div></div>
+      <div class="stat"><div class="stat-label">To</div><div class="stat-val" style="font-size:.78rem">${last}</div></div>
+      <div class="stat"><div class="stat-label">Completeness</div><div class="stat-val ${complCls}">${compl}</div></div>
+      <div class="stat"><div class="stat-label">Avg Close</div><div class="stat-val">${mean}</div></div>
+      <div class="stat"><div class="stat-label">Min</div><div class="stat-val">${meta.price_min ? meta.price_min.toFixed(5) : '—'}</div></div>
+      <div class="stat"><div class="stat-label">Max</div><div class="stat-val">${meta.price_max ? meta.price_max.toFixed(5) : '—'}</div></div>
+      <div class="stat"><div class="stat-label">Std Dev</div><div class="stat-val">${meta.price_std ? meta.price_std.toFixed(5) : '—'}</div></div>
+      <div class="stat"><div class="stat-label">Avg Volume</div><div class="stat-val">${vol}</div></div>
+    </div>
+    <div class="ds-footer">
+      <span class="cached-ts">Cached: ${cachedTs}</span>
+      <button class="btn-refresh" onclick="preloadOne('${ds.symbol}','${ds.timeframe}',this)">↻ Refresh</button>
+    </div>
+  </div>`;
+}
+
+async function loadChart(symbol, timeframe, color) {
+  const key = symbol + '_' + timeframe;
+  try {
+    const r = await fetch(`/api/data/cache/${symbol}/${timeframe}`);
+    const d = await r.json();
+    const bars = d.bars || [];
+    if (bars.length < 2) return;
+    drawChart(key, bars, color);
+  } catch(e) {}
+}
+
+function drawChart(key, bars, color) {
+  const canvas = document.getElementById('chart-' + key);
+  if (!canvas) return;
+
+  // Use device pixel ratio for crisp rendering
+  const dpr  = window.devicePixelRatio || 1;
+  const rect  = canvas.getBoundingClientRect();
+  const W     = canvas.width  = (rect.width  || 340) * dpr;
+  const H     = canvas.height = 80 * dpr;
+  canvas.style.width  = (rect.width  || 340) + 'px';
+  canvas.style.height = '80px';
+
+  const ctx   = canvas.getContext('2d');
+  ctx.scale(dpr, dpr);
+  const w = W / dpr, h = H / dpr;
+
+  const closes = bars.map(b => b.c);
+  const min = Math.min(...closes);
+  const max = Math.max(...closes);
+  const range = max - min || 1;
+  const pad   = 4;
+
+  const xScale = v => (v / (closes.length - 1)) * w;
+  const yScale = v => h - pad - ((v - min) / range) * (h - pad * 2);
+
+  // Background
+  ctx.fillStyle = '#0a0f1a';
+  ctx.fillRect(0, 0, w, h);
+
+  // Gradient fill under line
+  const grad = ctx.createLinearGradient(0, 0, 0, h);
+  grad.addColorStop(0, color + '44');
+  grad.addColorStop(1, color + '00');
+  ctx.beginPath();
+  closes.forEach((c, i) => {
+    i === 0 ? ctx.moveTo(xScale(i), yScale(c)) : ctx.lineTo(xScale(i), yScale(c));
+  });
+  ctx.lineTo(xScale(closes.length - 1), h);
+  ctx.lineTo(0, h);
+  ctx.closePath();
+  ctx.fillStyle = grad;
+  ctx.fill();
+
+  // Price line
+  ctx.beginPath();
+  ctx.strokeStyle = color;
+  ctx.lineWidth   = 1.5;
+  ctx.lineJoin    = 'round';
+  closes.forEach((c, i) => {
+    i === 0 ? ctx.moveTo(xScale(i), yScale(c)) : ctx.lineTo(xScale(i), yScale(c));
+  });
+  ctx.stroke();
+
+  // Min/max labels
+  ctx.fillStyle = '#475569';
+  ctx.font = `${9 * dpr / dpr}px -apple-system, sans-serif`;
+  ctx.fillText(min.toFixed(4), 4, h - pad);
+  ctx.fillText(max.toFixed(4), 4, pad + 9);
+}
+
+async function preloadAll() {
+  const btn = document.getElementById('preload-btn');
+  btn.disabled = true;
+  btn.textContent = '↓ Preloading…';
+  showStatus('running', '⚙ Preload job started on Modal — this takes 5–20 minutes for full data. Refresh the page once complete.');
+  try {
+    await fetch('/api/data/preload', {method: 'POST'});
+  } catch(e) {
+    showStatus('err', '✗ Failed to start preload job: ' + e.message);
+  }
+  setTimeout(() => {
+    btn.disabled = false;
+    btn.textContent = '↓ Preload all data';
+  }, 5000);
+}
+
+async function preloadOne(symbol, timeframe, btn) {
+  btn.disabled = true;
+  btn.textContent = '…';
+  showStatus('running', `⚙ Preload job started for ${symbol} ${timeframe} — check back in a few minutes.`);
+  try {
+    await fetch('/api/data/preload', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+    });
+  } catch(e) {
+    showStatus('err', '✗ Failed: ' + e.message);
+  }
+  setTimeout(() => {
+    btn.disabled = false;
+    btn.textContent = btn.className.includes('btn-refresh') ? '↻ Refresh' : '↓ Load now';
+  }, 5000);
+}
+
+function showStatus(type, msg) {
+  const el = document.getElementById('status-bar');
+  el.textContent = msg;
+  el.className = 'status-bar visible ' + type;
+}
+
+loadCache();
+</script>
+</body>
+</html>"""
+
+
+@app.get("/data", response_class=HTMLResponse)
+def data_page() -> HTMLResponse:
+    return HTMLResponse(_DATA_HTML)
 
 
 # ---------------------------------------------------------------------------

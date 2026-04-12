@@ -161,6 +161,44 @@ def update_generated_idea(idea_id: str, updates: dict[str, Any]) -> None:
     sb.table("generated_ideas").update(updates).eq("id", idea_id).execute()
 
 
+# ── data_cache ───────────────────────────────────────────────────────────────
+
+def upsert_data_cache(symbol: str, timeframe: str, data: dict[str, Any]) -> None:
+    """Insert or update a data_cache row (keyed by symbol + timeframe)."""
+    sb = get_client()
+    data["cached_at"] = datetime.utcnow().isoformat()
+    sb.table("data_cache").upsert(data, on_conflict="symbol,timeframe").execute()
+
+
+def get_data_cache(symbol: str | None = None) -> list[dict[str, Any]]:
+    """Return cache metadata for all datasets (without recent_bars to keep payload small)."""
+    sb = get_client()
+    q = sb.table("data_cache").select(
+        "symbol, timeframe, bar_count, first_date, last_date, "
+        "file_size_mb, price_min, price_max, price_mean, price_std, "
+        "avg_volume, completeness_pct, cached_at"
+    ).order("symbol").order("timeframe")
+    if symbol:
+        q = q.eq("symbol", symbol)
+    return q.execute().data or []
+
+
+def get_data_cache_bars(symbol: str, timeframe: str) -> list[dict[str, Any]]:
+    """Return recent_bars for a single dataset (used by /data chart endpoint)."""
+    sb = get_client()
+    result = (
+        sb.table("data_cache")
+        .select("recent_bars")
+        .eq("symbol", symbol)
+        .eq("timeframe", timeframe)
+        .execute()
+    )
+    if not result.data:
+        return []
+    raw = result.data[0].get("recent_bars") or []
+    return raw if isinstance(raw, list) else []
+
+
 def get_daily_spend(for_date: date | None = None) -> float:
     sb = get_client()
     target = (for_date or date.today()).isoformat()
