@@ -1262,9 +1262,17 @@ _IDEAS_HTML = """<!DOCTYPE html>
   body {
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
     background: #0f1117; color: #e2e8f0;
-    margin: 0; padding: 24px;
+    margin: 0; padding: 0;
     min-height: 100vh;
   }
+  .nav { display: flex; align-items: center; gap: 0; background: #111827;
+         border-bottom: 1px solid #1f2937; padding: 0 24px; }
+  .nav-logo { font-weight: 700; font-size: 0.95rem; color: #f8fafc;
+              padding: 14px 0; margin-right: 32px; letter-spacing: -.01em; }
+  .nav a { display: block; padding: 14px 16px; font-size: 0.85rem; color: #94a3b8;
+           text-decoration: none; border-bottom: 2px solid transparent; transition: color .15s; }
+  .nav a:hover, .nav a.active { color: #f1f5f9; border-bottom-color: #6366f1; }
+  .page { padding: 32px 24px; }
   h1 { font-size: 1.5rem; font-weight: 600; margin: 0 0 4px; color: #f8fafc; }
   .subtitle { color: #94a3b8; font-size: 0.875rem; margin: 0 0 32px; }
   .card {
@@ -1317,6 +1325,16 @@ button[type=submit] {
 </style>
 </head>
 <body>
+<nav class="nav">
+  <div class="nav-logo">Trading Research</div>
+  <a href="/dashboard">Dashboard</a>
+  <a href="/ideas" class="active">Ideas</a>
+  <a href="/research">Research</a>
+  <a href="/data">Data</a>
+  <a href="/health">Health</a>
+</nav>
+
+<div class="page">
 <div style="max-width:680px;margin:0 auto 28px">
   <h1>Strategy Ideas</h1>
   <p class="subtitle">Describe your idea in plain English — the pipeline handles the rest.</p>
@@ -1340,6 +1358,7 @@ button[type=submit] {
 
 {ideas_section}
 
+</div>
 </body>
 </html>"""
 
@@ -1386,11 +1405,7 @@ def _render_ideas_page(flash: str = "", flash_type: str = "") -> str:
 
 
 @app.get("/ideas", response_class=HTMLResponse)
-def ideas_page(submitted: str = "") -> HTMLResponse:
-    if submitted:
-        return HTMLResponse(_render_ideas_page(
-            "Idea submitted! It will be picked up within 10 minutes.", "success"
-        ))
+def ideas_page() -> HTMLResponse:
     return HTMLResponse(_render_ideas_page())
 
 
@@ -1421,8 +1436,8 @@ def submit_idea(
         log.info("idea_submitted", idea_id=idea_id, title=title)
         # Process immediately in background instead of waiting for the 10-min scheduler
         background_tasks.add_task(_scheduled_queue_worker)
-        # POST → redirect → GET prevents double-submit on refresh
-        return RedirectResponse(url="/ideas?submitted=1", status_code=303)
+        # Redirect to dashboard so the user can see their idea in the pipeline
+        return RedirectResponse(url="/dashboard", status_code=303)
     except Exception as exc:
         log.error("idea_submit_failed", error=str(exc))
         return HTMLResponse(_render_ideas_page(f"Error saving idea: {exc}", "error"))
