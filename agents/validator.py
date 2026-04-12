@@ -35,9 +35,9 @@ def run_validator(strategy_id: str) -> dict[str, Any]:
     if not strategy:
         raise ValueError(f"Strategy {strategy_id} not found")
 
-    code = strategy.get("strategy_code", "")
+    code = strategy.get("backtest_code", "")
     if not code:
-        _mark_failed(strategy_id, "No strategy_code found — run Implementer first")
+        _mark_failed(strategy_id, "No backtest_code found — run Implementer first")
         raise ValueError(f"Strategy {strategy_id} has no code to validate")
 
     user_msg = VALIDATOR_USER_TEMPLATE.format(
@@ -124,9 +124,9 @@ def run_validator(strategy_id: str) -> dict[str, Any]:
 
     db.update_strategy(strategy_id, {
         "status": new_status,
-        "strategy_code": final_code,         # Save corrected code if improved
+        "backtest_code": final_code,         # Save corrected code if improved
         "leakage_score": final_leakage_result.score,
-        "leakage_issues": json.dumps(deduped_issues),
+        "leakage_issues": deduped_issues,
         "error_log": error_log,
     })
 

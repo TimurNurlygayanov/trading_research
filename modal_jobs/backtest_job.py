@@ -95,7 +95,7 @@ def run_backtest_pipeline(strategy_id: str) -> dict:
         timeframes = strategy.get("timeframes") or ["1h"]
         timeframe = timeframes[0]
 
-        db.update_strategy(strategy_id, {"status": "implementing"})
+        db.update_strategy(strategy_id, {"status": "backtesting"})
 
         add_pipeline_note(strategy_id, f"Backtest job started on Modal — symbol={symbol}, timeframe={timeframe}.")
 

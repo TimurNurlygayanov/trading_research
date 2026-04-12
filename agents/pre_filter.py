@@ -89,12 +89,15 @@ def run_pre_filter(strategy_id: str) -> dict[str, Any]:
     log.info(f"Pre-filter: strategy={strategy_id} score={score} verdict={verdict} → {new_status}")
 
     if new_status == "failed":
-        add_pipeline_note(strategy_id, f"Pre-filter REJECTED — score {score:.1f}/10. {result.get('rejection_reason', '')}")
+        add_pipeline_note(strategy_id, f"Pre-filter REJECTED — score {score:.1f}/10.\n{result.get('rejection_reason', '')}")
     else:
         mods = result.get("suggested_modifications")
         note = f"Pre-filter passed — score {score:.1f}/10, verdict: {verdict}."
         if mods:
-            note += f" Suggestions: {mods}"
+            # Convert "1. ... 2. ..." into a proper newline-separated list
+            import re
+            mods_formatted = re.sub(r'\s+(\d+\.)\s+', r'\n\1 ', mods.strip())
+            note += f"\n\nSuggestions:\n{mods_formatted}"
         add_pipeline_note(strategy_id, note)
 
     return result

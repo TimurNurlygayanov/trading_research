@@ -3,7 +3,7 @@ services:
     name: trading-research-orchestrator
     runtime: python
     plan: starter
-    buildCommand: pip install -r requirements.txt
+    buildCommand: pip install -r requirements.txt && modal deploy modal_jobs/backtest_job.py && modal deploy modal_jobs/validator_job.py
     startCommand: python -m uvicorn orchestrator.main:app --host 0.0.0.0 --port $PORT
     envVars:
       - key: PYTHON_VERSION

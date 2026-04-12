@@ -1,19 +1,18 @@
 """
 Modal job: runs the Validator, Summariser, and Learner agents for a strategy.
 
-Even though these are primarily LLM calls, running them on Modal provides:
-  - Consistent execution environment
-  - Isolation from the Render orchestrator
-  - Access to the same secrets and DB connection
-
 Pipeline:
 1. Run validator agent (LLM + rule checks)
+   - If validator provides corrected_code that passes leakage, save it and
+     re-dispatch to the backtest job (up to MAX_VALIDATOR_CORRECTIONS=2 times).
 2. If validation passes, run summariser
 3. Run learner (updates knowledge base)
 4. Mark strategy as "live" or "rejected"
 
 Modal config: 2 CPUs, 4 GB RAM, 10 min timeout.
 """
+
+MAX_VALIDATOR_CORRECTIONS = 2  # how many times the validator can fix & re-backtest
 import modal
 
 app = modal.App("trading-research-validator")
@@ -72,19 +71,61 @@ def run_validator_pipeline(strategy_id: str) -> dict:
         passed: bool = validator_result.get("passed", False)
 
         if not passed:
-            reason = validator_result.get("reason", "Validator rejected strategy")
+            # Check if the validator provided corrected code worth re-backtesting
+            strategy = db.get_strategy(strategy_id)
+            correction_count = (strategy or {}).get("validator_corrections", 0)
+            final_code = validator_result.get("final_code", "")
+            corrections_made = validator_result.get("corrections_made", [])
+
+            if (
+                final_code
+                and corrections_made
+                and correction_count < MAX_VALIDATOR_CORRECTIONS
+            ):
+                # Save corrected code, increment counter, re-dispatch to backtest
+                db.update_strategy(strategy_id, {
+                    "status": "implemented",
+                    "backtest_code": final_code,
+                    "validator_corrections": correction_count + 1,
+                    "error_log": None,
+                })
+                corrections_text = "\n".join(f"- {c}" for c in corrections_made[:10])
+                add_pipeline_note(
+                    strategy_id,
+                    f"Validator found issues — applied {len(corrections_made)} correction(s) "
+                    f"(attempt {correction_count + 1}/{MAX_VALIDATOR_CORRECTIONS}):\n{corrections_text}\n\n"
+                    f"Re-dispatching to backtest with fixed code."
+                )
+                # Re-dispatch to Modal backtest job
+                import modal as _modal
+                backtest_fn = _modal.Function.from_name(
+                    "trading-research-backtest", "run_backtest_pipeline"
+                )
+                backtest_fn.spawn(strategy_id)
+                return {
+                    "passed": False,
+                    "strategy_id": strategy_id,
+                    "reason": "corrections_applied_rebacktesting",
+                }
+
+            # No correctable code or correction limit reached → reject
+            issues = validator_result.get("leakage_issues", []) + validator_result.get("logic_bugs", [])
+            reason = "; ".join(issues[:3]) if issues else validator_result.get("validator_notes", "Validation failed")
             db.update_strategy(strategy_id, {
-                "status": "rejected",
+                "status": "failed",
                 "error_log": reason,
             })
-            add_pipeline_note(strategy_id, f"Validator REJECTED — {reason}")
+            add_pipeline_note(
+                strategy_id,
+                f"Validator REJECTED after {correction_count} correction attempt(s).\n{reason}"
+            )
             return {
                 "passed": False,
                 "strategy_id": strategy_id,
                 "reason": reason,
             }
 
-        # If the validator produced corrected code, it has already persisted it.
+        # Validator passed — corrected code already persisted by run_validator()
         # ----------------------------------------------------------------
         # 2. Summariser
         # ----------------------------------------------------------------

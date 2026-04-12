@@ -76,18 +76,6 @@ class LeakageVisitor(ast.NodeVisitor):
                 )
         self.generic_visit(node)
 
-    def visit_Subscript(self, node: ast.Subscript) -> None:
-        # Check for shift(-N) pattern: series.shift(-N) where N > 0
-        if isinstance(node.slice, ast.UnaryOp) and isinstance(node.slice.op, ast.USub):
-            if isinstance(node.slice.operand, ast.Constant) and isinstance(node.slice.operand.value, int):
-                val = node.slice.operand.value
-                if val > 0:
-                    self.issues.append(
-                        f"Line {node.lineno}: Negative index [{-val}] — "
-                        "ensure this is accessing PAST bars ([-1]=current, [-2]=previous). "
-                        "Positive offset [+N] would be future data."
-                    )
-        self.generic_visit(node)
 
 
 # ── Regex-based checks (faster for common patterns) ─────────────────────────

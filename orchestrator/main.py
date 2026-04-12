@@ -121,9 +121,11 @@ def api_stats() -> JSONResponse:
             counts[r["status"]] = counts.get(r["status"], 0) + 1
 
         total = len(rows)
-        done = counts.get("done", 0)
-        failed = counts.get("failed", 0)
-        in_progress = total - done - failed - counts.get("idea", 0)
+        done = counts.get("done", 0) + counts.get("live", 0)
+        failed = counts.get("failed", 0) + counts.get("rejected", 0)
+        in_progress = sum(counts.get(s, 0) for s in (
+            "filtered", "implementing", "implemented", "backtesting", "validating"
+        ))
 
         today_spend = db.get_daily_spend()
         remaining = get_remaining_budget()
@@ -368,11 +370,27 @@ _DASHBOARD_HTML = r"""<!DOCTYPE html>
            font-size: 0.72rem; font-weight: 600; white-space: nowrap; }
   .s-idea        { background: #1e293b; color: #94a3b8; }
   .s-filtered    { background: #1e3a5f; color: #93c5fd; }
-  .s-implementing{ background: #2d1f5e; color: #c4b5fd; }
-  .s-implemented { background: #3b2f00; color: #fcd34d; }
-  .s-validating  { background: #1c3352; color: #67e8f9; }
+  .s-implementing{ background: #2d1f5e; color: #c4b5fd; animation: pulse-purple 2s infinite; }
+  .s-implemented { background: #2d1f5e; color: #c4b5fd; }
+  .s-backtesting { background: #3b2f00; color: #fcd34d; animation: pulse-yellow 2s infinite; }
+  .s-validating  { background: #1c3352; color: #67e8f9; animation: pulse-cyan 2s infinite; }
+  .s-live        { background: #14532d; color: #86efac; }
   .s-done        { background: #14532d; color: #86efac; }
   .s-failed      { background: #450a0a; color: #fca5a5; }
+  .s-rejected    { background: #450a0a; color: #fca5a5; }
+
+  @keyframes pulse-purple {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(139,92,246,.5); }
+    50%       { box-shadow: 0 0 0 4px rgba(139,92,246,0); }
+  }
+  @keyframes pulse-yellow {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(251,191,36,.5); }
+    50%       { box-shadow: 0 0 0 4px rgba(251,191,36,0); }
+  }
+  @keyframes pulse-cyan {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(103,232,249,.5); }
+    50%       { box-shadow: 0 0 0 4px rgba(103,232,249,0); }
+  }
 
   /* ── metric cells ── */
   .metric { font-family: "SF Mono", "Fira Code", monospace; font-size: 0.82rem; }
@@ -464,7 +482,7 @@ _DASHBOARD_HTML = r"""<!DOCTYPE html>
 </div>
 
 <script>
-const STATUS_ORDER = ['all','idea','filtered','implementing','implemented','validating','done','failed'];
+const STATUS_ORDER = ['all','idea','filtered','implementing','implemented','backtesting','validating','live','failed'];
 let currentStatus = 'all';
 let statsData = {};
 let strategiesData = [];
@@ -510,6 +528,20 @@ function switchTab(s) {
   loadAll();
 }
 
+const STATUS_LABELS = {
+  'idea':         'Idea',
+  'filtered':     'Queued',
+  'implementing': '⚙ Implementing…',
+  'implemented':  'Dispatched',
+  'backtesting':  '⚙ Backtesting…',
+  'validating':   '⚙ Validating…',
+  'live':         '✓ Live',
+  'done':         '✓ Done',
+  'failed':       '✗ Failed',
+  'rejected':     '✗ Rejected',
+};
+function statusLabel(s) { return STATUS_LABELS[s] || s; }
+
 function renderTable(rows) {
   const tbody = document.getElementById('tbody');
   if (!rows.length) {
@@ -534,7 +566,7 @@ function renderTable(rows) {
     ).join('');
     return `<tr class="data-row" onclick="openPanel('${r.id}')">
       <td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(r.name)}">${esc(r.name)}</td>
-      <td><span class="badge ${badgeCls}">${r.status}</span></td>
+      <td><span class="badge ${badgeCls}">${statusLabel(r.status)}</span></td>
       <td style="max-width:140px">${tagsHtml || '<span style="color:#374151">—</span>'}</td>
       <td class="metric ${sharpeCls}">${sharpe}</td>
       <td class="metric ${oosCls}">${oosSharpe}</td>
@@ -669,7 +701,7 @@ function renderPanel(s) {
 
   document.getElementById('panel-content').innerHTML = `
     <h2>${esc(s.name)}</h2>
-    <div style="margin-bottom:12px"><span class="badge ${badgeCls}">${s.status}</span>
+    <div style="margin-bottom:12px"><span class="badge ${badgeCls}">${statusLabel(s.status)}</span>
       <span style="color:#475569;font-size:.78rem;margin-left:8px">
         ${s.source || 'user'} · ${(s.created_at||'').slice(0,10)}</span></div>
     <p class="panel-hyp">${esc(s.hypothesis || '')}</p>
@@ -749,11 +781,21 @@ function renderComments(comments) {
     return '<span style="color:#475569;font-size:.8rem">No comments yet</span>';
   }
   const list = typeof comments === 'string' ? JSON.parse(comments) : comments;
-  return list.map(c => `
-    <div style="background:#0f1623;border-radius:8px;padding:10px 12px;margin-bottom:8px">
-      <div style="font-size:.82rem;color:#e2e8f0;white-space:pre-wrap;word-break:break-word">${esc(c.text)}</div>
-      <div style="font-size:.7rem;color:#475569;margin-top:4px">${c.ts ? c.ts.replace('T',' ') : ''}</div>
-    </div>`).join('');
+  return list.map(c => {
+    const isPipeline = (c.text || '').startsWith('[pipeline]');
+    const text = isPipeline ? esc(c.text.slice('[pipeline]'.length).trim()) : esc(c.text);
+    const bg    = isPipeline ? '#0d1a2d' : '#0f1623';
+    const border = isPipeline ? 'border-left:3px solid #334155' : 'border-left:3px solid #6366f1';
+    const label = isPipeline
+      ? `<span style="font-size:.68rem;font-weight:600;text-transform:uppercase;letter-spacing:.06em;color:#475569;margin-bottom:5px;display:block">Pipeline</span>`
+      : `<span style="font-size:.68rem;font-weight:600;text-transform:uppercase;letter-spacing:.06em;color:#818cf8;margin-bottom:5px;display:block">You</span>`;
+    return `
+    <div style="background:${bg};border-radius:8px;padding:10px 14px;margin-bottom:8px;${border}">
+      ${label}
+      <div style="font-size:.82rem;color:${isPipeline ? '#94a3b8' : '#e2e8f0'};white-space:pre-wrap;word-break:break-word;line-height:1.55">${text}</div>
+      <div style="font-size:.7rem;color:#374151;margin-top:5px">${c.ts ? c.ts.replace('T',' ') : ''}</div>
+    </div>`;
+  }).join('');
 }
 
 async function addComment(id) {

@@ -36,6 +36,8 @@ def run_implementer(strategy_id: str) -> dict[str, Any]:
     if not strategy:
         raise ValueError(f"Strategy {strategy_id} not found")
 
+    db.update_strategy(strategy_id, {"status": "implementing"})
+
     knowledge = db.get_knowledge_summary(limit=20)
     knowledge_text = _format_knowledge(knowledge)
 
