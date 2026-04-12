@@ -12,9 +12,9 @@ Responsibilities:
 from __future__ import annotations
 
 import os
-import signal
 import sys
-import traceback
+import traceback  # noqa: F401  (used in scheduled job wrappers)
+from contextlib import asynccontextmanager
 
 import structlog
 import uvicorn
@@ -40,10 +40,52 @@ structlog.configure(
 log = structlog.get_logger(__name__)
 
 # ---------------------------------------------------------------------------
+# Scheduler (module-level so scheduled job wrappers can reference it)
+# ---------------------------------------------------------------------------
+
+scheduler = BackgroundScheduler(timezone="UTC")
+
+# ---------------------------------------------------------------------------
+# FastAPI lifespan — replaces manual signal handler
+# ---------------------------------------------------------------------------
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # ── startup ──────────────────────────────────────────────────────────────
+    log.info("orchestrator_starting", python_version=sys.version,
+             port=os.environ.get("PORT", 8000))
+    try:
+        db.get_daily_spend()
+        log.info("db_connection_ok")
+    except Exception as exc:
+        log.error("db_connection_failed", error=str(exc))
+
+    _scheduled_budget_log()
+
+    scheduler.add_job(_scheduled_queue_worker, trigger="interval", minutes=10,
+                      id="queue_worker", replace_existing=True)
+    scheduler.add_job(_scheduled_research_cycle, trigger="interval",
+                      hours=int(os.environ.get("RESEARCH_INTERVAL_HOURS", 4)),
+                      id="research_cycle", replace_existing=True)
+    scheduler.add_job(_scheduled_budget_log, trigger="interval", hours=1,
+                      id="budget_log", replace_existing=True)
+    scheduler.start()
+    log.info("scheduler_started", jobs=[j.id for j in scheduler.get_jobs()])
+
+    yield  # app runs here
+
+    # ── shutdown (uvicorn sends SIGTERM → lifespan exits cleanly) ────────────
+    log.info("orchestrator_shutting_down")
+    if scheduler.running:
+        scheduler.shutdown(wait=False)
+    log.info("orchestrator_stopped")
+
+
+# ---------------------------------------------------------------------------
 # FastAPI app
 # ---------------------------------------------------------------------------
 
-app = FastAPI(title="Trading Research Orchestrator")
+app = FastAPI(title="Trading Research Orchestrator", lifespan=lifespan)
 
 
 @app.get("/health")
@@ -753,74 +795,6 @@ def _scheduled_budget_log() -> None:
         log.warning("budget_log_failed", error=str(exc))
 
 
-# ---------------------------------------------------------------------------
-# Startup / shutdown
-# ---------------------------------------------------------------------------
-
-scheduler = BackgroundScheduler(timezone="UTC")
-
-
-def _startup() -> None:
-    log.info(
-        "orchestrator_starting",
-        python_version=sys.version,
-        port=os.environ.get("PORT", 8000),
-    )
-
-    # Verify DB connection on startup
-    try:
-        db.get_daily_spend()
-        log.info("db_connection_ok")
-    except Exception as exc:
-        log.error("db_connection_failed", error=str(exc))
-        # Do not exit — Render will restart if the health check fails
-
-    _scheduled_budget_log()
-
-    # Register scheduled jobs
-    scheduler.add_job(
-        _scheduled_queue_worker,
-        trigger="interval",
-        minutes=10,
-        id="queue_worker",
-        replace_existing=True,
-    )
-    scheduler.add_job(
-        _scheduled_research_cycle,
-        trigger="interval",
-        hours=int(os.environ.get("RESEARCH_INTERVAL_HOURS", 4)),
-        id="research_cycle",
-        replace_existing=True,
-    )
-    scheduler.add_job(
-        _scheduled_budget_log,
-        trigger="interval",
-        hours=1,
-        id="budget_log",
-        replace_existing=True,
-    )
-
-    scheduler.start()
-    log.info("scheduler_started", jobs=[j.id for j in scheduler.get_jobs()])
-
-
-def _shutdown() -> None:
-    log.info("orchestrator_shutting_down")
-    if scheduler.running:
-        scheduler.shutdown(wait=False)
-    log.info("orchestrator_stopped")
-
-
-def _handle_sigterm(signum, frame) -> None:  # noqa: ANN001
-    log.info("sigterm_received")
-    _shutdown()
-    sys.exit(0)
-
-
-signal.signal(signal.SIGTERM, _handle_sigterm)
-
-# Run startup when the module is loaded (works with uvicorn)
-_startup()
 
 
 # ---------------------------------------------------------------------------

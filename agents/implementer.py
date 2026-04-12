@@ -148,12 +148,18 @@ def run_implementer(strategy_id: str) -> dict[str, Any]:
 
     db.update_strategy(strategy_id, {
         "status": "implemented",
-        "strategy_code": result["code"],
-        "param_space": json.dumps(result.get("param_space", {})),
-        "strategy_class": result.get("strategy_class", ""),
-        "indicators_used": json.dumps(result.get("indicators_used", [])),
+        "backtest_code": result["code"],
+        # hyperparams stores the param_space dict until Optuna replaces it with best params
+        "hyperparams": result.get("param_space", {}),
+        # indicators stores metadata: class name + indicator list
+        "indicators": {
+            "strategy_class": result.get("strategy_class", ""),
+            "indicators_used": result.get("indicators_used", []),
+            "symbols": result.get("recommended_symbols", ["EURUSD"]),
+            "timeframes": result.get("recommended_timeframes", ["1h"]),
+        },
         "leakage_score": leakage_score,
-        "leakage_issues": json.dumps(leakage_issues),
+        "leakage_issues": leakage_issues,   # jsonb — pass list directly
         "hypothesis": result.get("hypothesis", strategy.get("hypothesis", "")),
         "error_log": None,
     })
