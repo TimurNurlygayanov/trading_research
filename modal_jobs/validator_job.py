@@ -16,12 +16,11 @@ MAX_VALIDATOR_CORRECTIONS = 2  # how many times the validator can fix & re-backt
 import os as _os
 import modal
 
-_PROJECT_ROOT = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
-_project_mount = modal.Mount.from_local_dir(_PROJECT_ROOT, remote_path="/root")
+_HERE = _os.path.dirname(_os.path.abspath(__file__))
+_ROOT = _os.path.dirname(_HERE)
 
 app = modal.App("trading-research-validator")
 
-# Reuse the same image definition as the backtest job so Modal can cache it.
 image = (
     modal.Image.debian_slim(python_version="3.13")
     .pip_install(
@@ -38,6 +37,9 @@ image = (
         "anthropic>=0.25.0",
         "structlog>=24.0.0",
     )
+    .add_local_dir(_os.path.join(_ROOT, "db"),       remote_path="/root/db")
+    .add_local_dir(_os.path.join(_ROOT, "agents"),   remote_path="/root/agents")
+    .add_local_dir(_os.path.join(_ROOT, "backtest"), remote_path="/root/backtest")
 )
 
 
@@ -47,7 +49,6 @@ image = (
     memory=4096,
     timeout=600,  # 10 minutes
     secrets=[modal.Secret.from_name("trading-research-secrets")],
-    mounts=[_project_mount],
 )
 def run_validator_pipeline(strategy_id: str) -> dict:
     """

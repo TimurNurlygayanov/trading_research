@@ -19,13 +19,13 @@ OHLCV data cached in Modal Volume — only downloaded once per symbol/timeframe.
 import os as _os
 import modal
 
-# Mount the project root (parent of modal_jobs/) into /root so that
-# `db`, `agents`, `backtest`, etc. are all importable inside the container.
-_PROJECT_ROOT = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
-_project_mount = modal.Mount.from_local_dir(_PROJECT_ROOT, remote_path="/root")
+_HERE = _os.path.dirname(_os.path.abspath(__file__))   # .../modal_jobs/
+_ROOT = _os.path.dirname(_HERE)                         # .../trading_research/
 
 app = modal.App("trading-research-backtest")
 
+# Bake local source packages into the image so they're always importable.
+# Using add_local_dir with absolute paths avoids all CWD / __file__ ambiguity.
 image = (
     modal.Image.debian_slim(python_version="3.13")
     .pip_install(
@@ -39,8 +39,12 @@ image = (
         "supabase==2.9.1",
         "python-dotenv==1.0.1",
         "scipy==1.14.1",
-        "pyarrow",   # for parquet cache
+        "pyarrow",
+        "anthropic>=0.25.0",   # needed by code_fixer / agents called inside
     )
+    .add_local_dir(_os.path.join(_ROOT, "db"),       remote_path="/root/db")
+    .add_local_dir(_os.path.join(_ROOT, "agents"),   remote_path="/root/agents")
+    .add_local_dir(_os.path.join(_ROOT, "backtest"), remote_path="/root/backtest")
 )
 
 # Persistent volume — OHLCV data cached here across runs
@@ -54,7 +58,6 @@ CACHE_DIR = "/ohlcv_cache"
     timeout=1200,  # 20 minutes — enough headroom with caching + fewer trials
     secrets=[modal.Secret.from_name("trading-research-secrets")],
     volumes={CACHE_DIR: ohlcv_cache},
-    mounts=[_project_mount],
 )
 def run_backtest_pipeline(strategy_id: str) -> dict:
     """
