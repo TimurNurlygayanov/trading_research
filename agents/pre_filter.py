@@ -15,6 +15,7 @@ from dotenv import load_dotenv
 
 from db import supabase_client as db
 from agents.prompts import PRE_FILTER_SYSTEM, PRE_FILTER_USER_TEMPLATE
+from agents.utils import full_description
 
 load_dotenv()
 log = logging.getLogger(__name__)
@@ -37,7 +38,7 @@ def run_pre_filter(strategy_id: str) -> dict[str, Any]:
 
     user_msg = PRE_FILTER_USER_TEMPLATE.format(
         title=strategy.get("name", ""),
-        description=strategy.get("hypothesis", ""),
+        description=full_description(strategy),
         notes=strategy.get("entry_logic", ""),
         source=strategy.get("source", ""),
         knowledge_base_context=knowledge_text,
@@ -75,12 +76,15 @@ def run_pre_filter(strategy_id: str) -> dict[str, Any]:
     else:
         new_status = "failed"
 
-    db.update_strategy(strategy_id, {
+    updates: dict = {
         "status": new_status,
         "pre_filter_score": score,
         "pre_filter_notes": json.dumps(result),
         "error_log": result.get("rejection_reason") if new_status == "failed" else None,
-    })
+    }
+    if result.get("strategy_name"):
+        updates["name"] = result["strategy_name"].strip()
+    db.update_strategy(strategy_id, updates)
 
     log.info(f"Pre-filter: strategy={strategy_id} score={score} verdict={verdict} → {new_status}")
     return result

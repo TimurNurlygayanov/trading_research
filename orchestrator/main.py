@@ -224,6 +224,32 @@ def api_delete_strategy(strategy_id: str) -> JSONResponse:
         return JSONResponse({"error": str(exc)}, status_code=500)
 
 
+@app.post("/api/strategy/{strategy_id}/comment")
+async def api_add_comment(strategy_id: str, request: Request) -> JSONResponse:
+    """Append a user comment to a strategy without touching the original description."""
+    try:
+        body = await request.json()
+        text = (body.get("text") or "").strip()
+        if not text:
+            return JSONResponse({"error": "comment text required"}, status_code=400)
+
+        strategy = db.get_strategy(strategy_id)
+        if not strategy:
+            return JSONResponse({"error": "not found"}, status_code=404)
+
+        import datetime
+        existing = strategy.get("comments") or []
+        if isinstance(existing, str):
+            import json as _json
+            existing = _json.loads(existing)
+        new_comment = {"text": text, "ts": datetime.datetime.utcnow().isoformat()[:19]}
+        existing.append(new_comment)
+        db.update_strategy(strategy_id, {"comments": existing})
+        return JSONResponse({"ok": True, "comments": existing})
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
 @app.post("/api/strategy/{strategy_id}/tags")
 async def api_update_tags(strategy_id: str, request: Request) -> JSONResponse:
     try:
@@ -250,7 +276,7 @@ def api_strategies(
             "signals_per_year, total_signals, leakage_score, profit_factor, "
             "oos_sharpe, oos_win_rate, oos_total_trades, monte_carlo_pvalue, "
             "walk_forward_scores, hypothesis, hyperparams, best_session_hours, "
-            "error_log, report_url, tags, created_at, updated_at"
+            "error_log, report_url, tags, comments, created_at, updated_at"
         )
         if status != "all":
             q = q.eq("status", status)
@@ -675,6 +701,23 @@ function renderPanel(s) {
 
     ${actionsHtml}${wfHtml}${paramsHtml}${errHtml}${reportHtml}
     <div class="panel-section" style="border-top:1px solid #1f2937;padding-top:16px;margin-top:4px">
+      <h3>Comments</h3>
+      <div id="comments-list-${s.id}" style="margin-bottom:10px">
+        ${renderComments(s.comments)}
+      </div>
+      <div style="display:flex;gap:8px;align-items:flex-start">
+        <textarea id="comment-input-${s.id}" rows="2" placeholder="Add a comment…"
+          style="flex:1;background:#0f1623;border:1px solid #374151;border-radius:8px;
+                 color:#f1f5f9;padding:7px 12px;font-size:.85rem;outline:none;
+                 resize:none;font-family:inherit"></textarea>
+        <button onclick="addComment('${s.id}')"
+          style="background:#1e2533;border:1px solid #374151;border-radius:8px;
+                 color:#94a3b8;padding:7px 14px;font-size:.82rem;cursor:pointer;white-space:nowrap;align-self:flex-start">
+          Add
+        </button>
+      </div>
+    </div>
+    <div class="panel-section" style="border-top:1px solid #1f2937;padding-top:16px;margin-top:4px">
       <h3>Tags</h3>
       <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:10px" id="tag-display-${s.id}">
         ${(s.tags||[]).map(t=>`<span class="tag-pill">${esc(t)}</span>`).join('')}
@@ -699,6 +742,35 @@ function renderPanel(s) {
         Delete strategy
       </button>
     </div>`;
+}
+
+function renderComments(comments) {
+  if (!comments || !comments.length) {
+    return '<span style="color:#475569;font-size:.8rem">No comments yet</span>';
+  }
+  const list = typeof comments === 'string' ? JSON.parse(comments) : comments;
+  return list.map(c => `
+    <div style="background:#0f1623;border-radius:8px;padding:10px 12px;margin-bottom:8px">
+      <div style="font-size:.82rem;color:#e2e8f0;white-space:pre-wrap;word-break:break-word">${esc(c.text)}</div>
+      <div style="font-size:.7rem;color:#475569;margin-top:4px">${c.ts ? c.ts.replace('T',' ') : ''}</div>
+    </div>`).join('');
+}
+
+async function addComment(id) {
+  const input = document.getElementById(`comment-input-${id}`);
+  const text = input.value.trim();
+  if (!text) return;
+  const r = await fetch(`/api/strategy/${id}/comment`, {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({text}),
+  });
+  const data = await r.json();
+  if (data.ok) {
+    input.value = '';
+    document.getElementById(`comments-list-${id}`).innerHTML = renderComments(data.comments);
+  } else {
+    alert('Error: ' + (data.error || 'unknown'));
+  }
 }
 
 function fmtNum(v) { return v != null ? parseFloat(v).toFixed(3) : '—'; }
@@ -838,8 +910,7 @@ _IDEAS_HTML = """<!DOCTYPE html>
   input[type=text]:focus, textarea:focus, select:focus { border-color: #6366f1; }
   textarea { resize: vertical; min-height: 110px; font-family: inherit; }
   .field { margin-bottom: 20px; }
-  .row { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
-  button[type=submit] {
+button[type=submit] {
     width: 100%; background: #6366f1; color: #fff;
     border: none; border-radius: 8px; padding: 12px;
     font-size: 1rem; font-weight: 600; cursor: pointer;
@@ -883,33 +954,12 @@ _IDEAS_HTML = """<!DOCTYPE html>
 <div class="card">
   <form method="post" action="/ideas">
     <div class="field">
-      <label>Title *</label>
-      <input type="text" name="title" placeholder="e.g. RSI divergence + VWAP bounce on 1H" required maxlength="120">
-    </div>
-    <div class="field">
       <label>Description *</label>
       <textarea name="description" placeholder="Describe the entry/exit logic, which indicators, timeframe, markets. The more detail the better — but vague ideas work too." required></textarea>
     </div>
     <div class="field">
       <label>Notes (optional)</label>
       <textarea name="notes" placeholder="Known caveats, inspiration papers, session preferences, etc." style="min-height:70px"></textarea>
-    </div>
-    <div class="row">
-      <div class="field">
-        <label>Priority</label>
-        <select name="priority">
-          <option value="1">1 — Highest</option>
-          <option value="2">2</option>
-          <option value="3">3</option>
-          <option value="4">4</option>
-          <option value="5" selected>5 — Normal</option>
-          <option value="6">6</option>
-          <option value="7">7</option>
-          <option value="8">8</option>
-          <option value="9">9</option>
-          <option value="10">10 — Lowest</option>
-        </select>
-      </div>
     </div>
     <button type="submit">Submit for Analysis</button>
   </form>
@@ -932,7 +982,7 @@ def _render_ideas_page(flash: str = "", flash_type: str = "") -> str:
         sb = db.get_client()
         result = (
             sb.table("user_ideas")
-            .select("id, title, description, priority, status, created_at")
+            .select("id, title, description, status, created_at")
             .order("created_at", desc=True)
             .limit(20)
             .execute()
@@ -951,7 +1001,6 @@ def _render_ideas_page(flash: str = "", flash_type: str = "") -> str:
                   <div class="idea-title">
                     {r['title']}
                     <span class="badge {badge_cls}">{r['status']}</span>
-                    <span style="color:#475569;font-size:.8rem;font-weight:400;margin-left:6px">p{r['priority']}</span>
                   </div>
                   <div style="color:#94a3b8;font-size:.875rem;margin:4px 0 4px">{desc_preview}</div>
                   <div class="idea-meta">{ts}</div>
@@ -975,18 +1024,17 @@ def ideas_page(submitted: str = "") -> HTMLResponse:
 @app.post("/ideas")
 def submit_idea(
     background_tasks: BackgroundTasks,
-    title: str = Form(...),
     description: str = Form(...),
     notes: str = Form(""),
-    priority: int = Form(5),
 ):
-    title = title.strip()
     description = description.strip()
     notes = notes.strip()
 
-    if not title or not description:
-        # Can't redirect on validation error — return the form with message
-        return HTMLResponse(_render_ideas_page("Title and description are required.", "error"))
+    if not description:
+        return HTMLResponse(_render_ideas_page("Description is required.", "error"))
+
+    # Auto-generate a placeholder title from description (LLM will rename it during pre-filter)
+    title = description[:80].rstrip() + ("…" if len(description) > 80 else "")
 
     try:
         sb = db.get_client()
@@ -994,7 +1042,6 @@ def submit_idea(
             "title": title,
             "description": description,
             "notes": notes or None,
-            "priority": max(1, min(10, priority)),
             "status": "pending",
         }).execute()
         idea_id = result.data[0]["id"] if result.data else "?"

@@ -15,6 +15,7 @@ from dotenv import load_dotenv
 
 from db import supabase_client as db
 from agents.prompts import IMPLEMENTER_SYSTEM, IMPLEMENTER_USER_TEMPLATE
+from agents.utils import full_description
 from backtest.leakage_detector import check_leakage
 
 load_dotenv()
@@ -43,7 +44,7 @@ def run_implementer(strategy_id: str) -> dict[str, Any]:
 
     user_msg = IMPLEMENTER_USER_TEMPLATE.format(
         title=strategy.get("name", ""),
-        description=strategy.get("hypothesis", ""),
+        description=full_description(strategy),
         notes=strategy.get("entry_logic", ""),
         pre_filter_notes=pre_filter_data.get("notes", ""),
         indicators=", ".join(pre_filter_data.get("suggested_indicators", [])),

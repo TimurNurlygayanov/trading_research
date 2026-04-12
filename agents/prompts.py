@@ -75,6 +75,7 @@ OUTPUT FORMAT (JSON only, no other text):
   "suggested_indicators": ["<indicator1>", "<indicator2>"],
   "suggested_timeframes": ["1h", "4h"],
   "suggested_symbols": ["EURUSD", "GBPUSD"],
+  "strategy_name": "<concise 4-8 word title for this strategy, e.g. 'RSI Divergence VWAP Bounce 1H'>",
   "notes": "<any important considerations for the Implementer agent>"
 }}
 

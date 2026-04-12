@@ -17,6 +17,7 @@ from dotenv import load_dotenv
 
 from db import supabase_client as db
 from agents.prompts import SUMMARISER_SYSTEM, SUMMARISER_USER_TEMPLATE
+from agents.utils import full_description
 
 load_dotenv()
 log = logging.getLogger(__name__)
@@ -85,7 +86,7 @@ def _build_user_message(strategy: dict) -> str:
 
     return SUMMARISER_USER_TEMPLATE.format(
         strategy_name=strategy.get("name", strategy.get("id", "Unknown")),
-        hypothesis=strategy.get("hypothesis", "N/A"),
+        hypothesis=full_description(strategy),
         sharpe=_fmt(strategy.get("backtest_sharpe")),
         calmar=_fmt(strategy.get("backtest_calmar")),
         max_drawdown=_fmt(strategy.get("max_drawdown")),

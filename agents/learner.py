@@ -16,6 +16,7 @@ from dotenv import load_dotenv
 
 from db import supabase_client as db
 from agents.prompts import LEARNER_SYSTEM, LEARNER_USER_TEMPLATE
+from agents.utils import full_description
 
 load_dotenv()
 log = logging.getLogger(__name__)
@@ -111,7 +112,7 @@ def _build_user_message(strategy: dict) -> str:
 
     return LEARNER_USER_TEMPLATE.format(
         strategy_name=strategy.get("name", strategy.get("id", "Unknown")),
-        hypothesis=strategy.get("hypothesis", "N/A"),
+        hypothesis=full_description(strategy),
         status=strategy.get("status", "unknown"),
         reject_reason=strategy.get("error_log") or "N/A",
         sharpe=_fmt(strategy.get("sharpe_ratio")),

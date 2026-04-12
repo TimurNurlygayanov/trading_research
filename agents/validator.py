@@ -16,6 +16,7 @@ from dotenv import load_dotenv
 
 from db import supabase_client as db
 from agents.prompts import VALIDATOR_SYSTEM, VALIDATOR_USER_TEMPLATE
+from agents.utils import full_description
 from backtest.leakage_detector import check_leakage
 
 load_dotenv()
@@ -41,7 +42,7 @@ def run_validator(strategy_id: str) -> dict[str, Any]:
 
     user_msg = VALIDATOR_USER_TEMPLATE.format(
         strategy_name=strategy.get("name", strategy_id),
-        description=strategy.get("hypothesis", ""),
+        description=full_description(strategy),
         code=code,
     )
 
