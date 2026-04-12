@@ -61,10 +61,19 @@ async def lifespan(app: FastAPI):
     except Exception as exc:
         log.error("db_connection_failed", error=str(exc))
 
+    # Run any pending DB migrations before starting the scheduler
+    try:
+        from db.migrate import run_migrations
+        run_migrations()
+    except Exception as exc:
+        log.error("startup_migrations_failed", error=str(exc))
+
     _scheduled_budget_log()
 
+    from datetime import datetime, timedelta
     scheduler.add_job(_scheduled_queue_worker, trigger="interval", minutes=10,
-                      id="queue_worker", replace_existing=True)
+                      id="queue_worker", replace_existing=True,
+                      next_run_time=datetime.utcnow() + timedelta(seconds=10))
     scheduler.add_job(_scheduled_research_cycle, trigger="interval",
                       hours=int(os.environ.get("RESEARCH_INTERVAL_HOURS", 4)),
                       id="research_cycle", replace_existing=True)
@@ -930,7 +939,10 @@ function renderPanel(s) {
 }
 
 function elapsedSince(ts) {
-  const diff = Math.floor((Date.now() - new Date(ts + 'Z')) / 1000);
+  if (!ts) return '?';
+  const d = new Date(ts);
+  if (isNaN(d.getTime())) return '?';
+  const diff = Math.floor((Date.now() - d.getTime()) / 1000);
   if (diff < 60) return diff + 's';
   if (diff < 3600) return Math.floor(diff/60) + 'm ' + (diff%60) + 's';
   return Math.floor(diff/3600) + 'h ' + Math.floor((diff%3600)/60) + 'm';

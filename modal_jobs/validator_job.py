@@ -13,7 +13,11 @@ Modal config: 2 CPUs, 4 GB RAM, 10 min timeout.
 """
 
 MAX_VALIDATOR_CORRECTIONS = 2  # how many times the validator can fix & re-backtest
+import os as _os
 import modal
+
+_PROJECT_ROOT = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+_project_mount = modal.Mount.from_local_dir(_PROJECT_ROOT, remote_path="/root")
 
 app = modal.App("trading-research-validator")
 
@@ -43,6 +47,7 @@ image = (
     memory=4096,
     timeout=600,  # 10 minutes
     secrets=[modal.Secret.from_name("trading-research-secrets")],
+    mounts=[_project_mount],
 )
 def run_validator_pipeline(strategy_id: str) -> dict:
     """

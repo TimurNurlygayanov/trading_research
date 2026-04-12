@@ -6,6 +6,7 @@ Priority order:
   2. Filtered strategies -> implementer -> Modal backtest
   3. Implemented strategies -> check Modal job status
   4. Done strategies -> summariser -> learner
+  5. Failed strategies -> classify error -> auto-fix or retry
 
 All LLM-calling agents are guarded by check_budget().
 All errors are caught, logged, and written to strategy.error_log.
@@ -233,6 +234,137 @@ def _process_implemented_strategies() -> int:
     # No separate "done" processing needed here — strategies reach "done" already summarised.
 
 
+def _process_failed_strategies() -> int:
+    """
+    Inspect recently-failed strategies and attempt automatic recovery.
+
+    Error classes and responses:
+      quality_rejection  → leave as failed (legitimate pipeline gate)
+      infrastructure     → auto-retry: reset to "implemented", redispatch to Modal
+      code_bug           → run code_fixer LLM, update backtest_code, redispatch
+      unknown            → retry once without code change if retry_count < 2
+
+    Hard limits:
+      - retry_count >= 3  → give up (avoid infinite loops)
+      - No backtest_code  → can't fix code, give up
+    Returns number of strategies acted on.
+    """
+    from agents.code_fixer import classify_error, fix_strategy_code
+    from agents.utils import add_pipeline_note
+
+    MAX_AUTO_RETRIES = 3
+
+    # Only look at strategies that recently failed and still have code
+    sb = db.get_client()
+    result = (
+        sb.table("strategies")
+        .select("id, name, status, error_log, backtest_code, hypothesis, "
+                "entry_logic, retry_count, auto_fix_count")
+        .eq("status", "failed")
+        .order("updated_at", desc=True)
+        .limit(20)
+        .execute()
+    )
+    # Filter in Python: only those with backtest_code set
+    failed = [s for s in (result.data or []) if s.get("backtest_code")]
+
+    acted = 0
+    for strategy in failed:
+        strategy_id = strategy["id"]
+        error_log   = strategy.get("error_log") or ""
+        retry_count = strategy.get("retry_count") or 0
+        fix_count   = strategy.get("auto_fix_count") or 0
+        code        = strategy.get("backtest_code") or ""
+
+        if retry_count >= MAX_AUTO_RETRIES:
+            continue  # already retried enough
+
+        error_class = classify_error(error_log)
+
+        if error_class == "quality_rejection":
+            continue  # legitimate failure, leave it
+
+        try:
+            if error_class == "infrastructure":
+                # Transient infra error — just reset and redispatch, no code change
+                db.update_strategy(strategy_id, {
+                    "status":      "implemented",
+                    "error_log":   None,
+                    "retry_count": retry_count + 1,
+                })
+                add_pipeline_note(
+                    strategy_id,
+                    f"Auto-retry #{retry_count + 1}: infrastructure error detected "
+                    f"({error_log[:120]}). Redispatching to Modal."
+                )
+                _dispatch_backtest_job(strategy_id)
+                log.info("auto_retry_infra", strategy_id=strategy_id,
+                         retry_count=retry_count + 1)
+                acted += 1
+
+            elif error_class == "code_bug":
+                try:
+                    check_budget("code_fixer")
+                except BudgetExceeded as be:
+                    log.warning("budget_exceeded_code_fixer",
+                                strategy_id=strategy_id, error=str(be))
+                    continue
+
+                description = strategy.get("hypothesis") or strategy.get("entry_logic") or ""
+                fixed_code = fix_strategy_code(
+                    code=code,
+                    error_log=error_log,
+                    strategy_description=description,
+                    strategy_id=strategy_id,
+                )
+                if not fixed_code:
+                    log.warning("code_fixer_no_fix", strategy_id=strategy_id)
+                    db.update_strategy(strategy_id, {
+                        "error_log": f"[auto-fix attempted but LLM produced no valid code] {error_log}",
+                        "retry_count": retry_count + 1,
+                    })
+                    continue
+
+                db.update_strategy(strategy_id, {
+                    "status":         "implemented",
+                    "backtest_code":  fixed_code,
+                    "error_log":      None,
+                    "retry_count":    retry_count + 1,
+                    "auto_fix_count": fix_count + 1,
+                })
+                add_pipeline_note(
+                    strategy_id,
+                    f"Auto code-fix #{fix_count + 1}: detected Python error in strategy code. "
+                    f"LLM fix applied — redispatching to Modal backtest.\n"
+                    f"Original error: {error_log[:200]}"
+                )
+                _dispatch_backtest_job(strategy_id)
+                log.info("auto_fix_dispatched", strategy_id=strategy_id,
+                         fix_count=fix_count + 1)
+                acted += 1
+
+            else:  # unknown
+                if retry_count < 2:
+                    db.update_strategy(strategy_id, {
+                        "status":      "implemented",
+                        "error_log":   None,
+                        "retry_count": retry_count + 1,
+                    })
+                    add_pipeline_note(
+                        strategy_id,
+                        f"Auto-retry #{retry_count + 1}: unknown error, retrying once. "
+                        f"Error was: {error_log[:150]}"
+                    )
+                    _dispatch_backtest_job(strategy_id)
+                    log.info("auto_retry_unknown", strategy_id=strategy_id)
+                    acted += 1
+
+        except Exception as exc:
+            log.error("auto_fix_failed", strategy_id=strategy_id, error=str(exc))
+
+    return acted
+
+
 # ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
@@ -245,17 +377,19 @@ def process_queue() -> None:
       1. User ideas
       2. Filtered strategies (ready for implementation)
       3. Implemented/validating strategies (Modal job status check)
-      4. Done strategies (summarise + learn)
+      4. Failed strategies (auto-fix code bugs, retry infra errors)
     """
     log.info("queue_worker_start")
 
-    ideas_processed     = _process_user_ideas()
-    filtered_processed  = _process_filtered_strategies()
+    ideas_processed       = _process_user_ideas()
+    filtered_processed    = _process_filtered_strategies()
     validating_dispatched = _process_implemented_strategies()
+    auto_fixed            = _process_failed_strategies()
 
     log.info(
         "queue_worker_done",
         ideas_processed=ideas_processed,
         filtered_processed=filtered_processed,
         validating_dispatched=validating_dispatched,
+        auto_fixed=auto_fixed,
     )

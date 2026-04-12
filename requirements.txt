@@ -2,6 +2,7 @@
 anthropic
 supabase
 python-dotenv
+psycopg2-binary   # direct Postgres connection for DB migrations
 
 # Data
 pandas

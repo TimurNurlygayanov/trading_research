@@ -16,7 +16,13 @@ Pipeline:
 Uses Modal for parallelism: 8 CPUs, 8 GB RAM, 20 min timeout.
 OHLCV data cached in Modal Volume — only downloaded once per symbol/timeframe.
 """
+import os as _os
 import modal
+
+# Mount the project root (parent of modal_jobs/) into /root so that
+# `db`, `agents`, `backtest`, etc. are all importable inside the container.
+_PROJECT_ROOT = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+_project_mount = modal.Mount.from_local_dir(_PROJECT_ROOT, remote_path="/root")
 
 app = modal.App("trading-research-backtest")
 
@@ -48,6 +54,7 @@ CACHE_DIR = "/ohlcv_cache"
     timeout=1200,  # 20 minutes — enough headroom with caching + fewer trials
     secrets=[modal.Secret.from_name("trading-research-secrets")],
     volumes={CACHE_DIR: ohlcv_cache},
+    mounts=[_project_mount],
 )
 def run_backtest_pipeline(strategy_id: str) -> dict:
     """
