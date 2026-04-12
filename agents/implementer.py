@@ -44,11 +44,15 @@ def run_implementer(strategy_id: str) -> dict[str, Any]:
     # Parse pre_filter_notes for context passed from pre-filter agent
     pre_filter_data = _parse_pre_filter_notes(strategy.get("pre_filter_notes", ""))
 
+    def _esc(s: str) -> str:
+        """Escape curly braces in user content so str.format() doesn't choke on {self} etc."""
+        return s.replace("{", "{{").replace("}", "}}")
+
     user_msg = IMPLEMENTER_USER_TEMPLATE.format(
-        title=strategy.get("name", ""),
-        description=full_description(strategy),
-        notes=strategy.get("entry_logic", ""),
-        pre_filter_notes=pre_filter_data.get("notes", ""),
+        title=_esc(strategy.get("name", "")),
+        description=_esc(full_description(strategy)),
+        notes=_esc(strategy.get("entry_logic", "")),
+        pre_filter_notes=_esc(pre_filter_data.get("notes", "")),
         indicators=", ".join(pre_filter_data.get("suggested_indicators", [])),
         timeframes=", ".join(pre_filter_data.get("suggested_timeframes", ["1h", "4h"])),
         symbols=", ".join(pre_filter_data.get("suggested_symbols", ["EURUSD", "GBPUSD"])),

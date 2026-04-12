@@ -36,11 +36,15 @@ def run_pre_filter(strategy_id: str) -> dict[str, Any]:
     knowledge = db.get_knowledge_summary(limit=30)
     knowledge_text = _format_knowledge(knowledge)
 
+    def _esc(s: str) -> str:
+        """Escape curly braces in user content so str.format() doesn't choke on {self} etc."""
+        return s.replace("{", "{{").replace("}", "}}")
+
     user_msg = PRE_FILTER_USER_TEMPLATE.format(
-        title=strategy.get("name", ""),
-        description=full_description(strategy),
-        notes=strategy.get("entry_logic", ""),
-        source=strategy.get("source", ""),
+        title=_esc(strategy.get("name", "")),
+        description=_esc(full_description(strategy)),
+        notes=_esc(strategy.get("entry_logic", "")),
+        source=_esc(strategy.get("source", "")),
         knowledge_base_context=knowledge_text,
     )
 
