@@ -100,32 +100,28 @@ def _process_user_ideas() -> int:
     for idea in ideas:
         idea_id = idea.get("id")
         try:
-            # Create a new strategy record from the idea
-            strategy_data = {
+            # Create strategy record — insert_strategy returns a dict, extract the id
+            strategy_record = db.insert_strategy({
                 "source": "user",
                 "status": "idea",
                 "name": idea.get("title", "Untitled Idea"),
                 "hypothesis": idea.get("description", ""),
-            }
-            strategy_id = db.insert_strategy(strategy_data)
+            })
+            strategy_id = strategy_record["id"]
+
+            # Mark idea as picked_up immediately so it is never re-processed,
+            # even if pre_filter fails below
             db.mark_idea_picked_up(idea_id, strategy_id)
 
-            log.info(
-                "idea_picked_up",
-                idea_id=idea_id,
-                strategy_id=strategy_id,
-                title=idea.get("title"),
-            )
+            log.info("idea_picked_up", idea_id=idea_id,
+                     strategy_id=strategy_id, title=idea.get("title"))
 
-            # Pre-filter is an LLM call -> guard budget first
+            # Pre-filter: guard budget first
             try:
                 check_budget("pre_filter")
             except BudgetExceeded as budget_err:
-                log.warning(
-                    "budget_exceeded_pre_filter",
-                    strategy_id=strategy_id,
-                    error=str(budget_err),
-                )
+                log.warning("budget_exceeded_pre_filter",
+                            strategy_id=strategy_id, error=str(budget_err))
                 db.update_strategy(strategy_id, {
                     "status": "failed",
                     "error_log": str(budget_err),
@@ -138,11 +134,8 @@ def _process_user_ideas() -> int:
                 run_pre_filter(strategy_id)
                 log.info("pre_filter_complete", strategy_id=strategy_id)
             except Exception as exc:
-                log.error(
-                    "pre_filter_failed",
-                    strategy_id=strategy_id,
-                    error=str(exc),
-                )
+                log.error("pre_filter_failed",
+                          strategy_id=strategy_id, error=str(exc))
                 db.update_strategy(strategy_id, {
                     "status": "failed",
                     "error_log": f"pre_filter error: {type(exc).__name__}: {exc}",
@@ -151,11 +144,7 @@ def _process_user_ideas() -> int:
             processed += 1
 
         except Exception as exc:
-            log.error(
-                "idea_processing_failed",
-                idea_id=idea_id,
-                error=str(exc),
-            )
+            log.error("idea_processing_failed", idea_id=idea_id, error=str(exc))
 
     return processed
 
@@ -245,84 +234,8 @@ def _process_implemented_strategies() -> int:
     return dispatched
 
 
-def _process_done_strategies() -> int:
-    """
-    Run summariser and learner on strategies that have completed validation.
-    Returns number of strategies processed.
-    """
-    done_strategies = db.get_strategies_by_status("done", limit=5)
-    if not done_strategies:
-        return 0
-
-    processed = 0
-    for strategy in done_strategies:
-        strategy_id = strategy.get("id")
-        try:
-            # Summariser is an LLM call
-            try:
-                check_budget("summariser")
-            except BudgetExceeded as budget_err:
-                log.warning(
-                    "budget_exceeded_summariser",
-                    strategy_id=strategy_id,
-                    error=str(budget_err),
-                )
-                continue
-
-            from agents.summariser import run_summariser
-            try:
-                run_summariser(strategy_id)
-                log.info("summariser_complete", strategy_id=strategy_id)
-            except Exception as exc:
-                log.error(
-                    "summariser_failed",
-                    strategy_id=strategy_id,
-                    error=str(exc),
-                )
-                db.update_strategy(strategy_id, {
-                    "status": "failed",
-                    "error_log": f"summariser error: {type(exc).__name__}: {exc}",
-                })
-                processed += 1
-                continue
-
-            # Learner is an LLM call
-            try:
-                check_budget("learner")
-            except BudgetExceeded as budget_err:
-                log.warning(
-                    "budget_exceeded_learner",
-                    strategy_id=strategy_id,
-                    error=str(budget_err),
-                )
-                processed += 1
-                continue
-
-            from agents.learner import run_learner
-            try:
-                run_learner(strategy_id)
-                log.info("learner_complete", strategy_id=strategy_id)
-            except Exception as exc:
-                log.error(
-                    "learner_failed",
-                    strategy_id=strategy_id,
-                    error=str(exc),
-                )
-                db.update_strategy(strategy_id, {
-                    "status": "failed",
-                    "error_log": f"learner error: {type(exc).__name__}: {exc}",
-                })
-
-            processed += 1
-
-        except Exception as exc:
-            log.error(
-                "done_processing_failed",
-                strategy_id=strategy_id,
-                error=str(exc),
-            )
-
-    return processed
+    # NOTE: summariser + learner run inside the Modal validator_job after backtesting.
+    # No separate "done" processing needed here — strategies reach "done" already summarised.
 
 
 # ---------------------------------------------------------------------------
@@ -341,15 +254,13 @@ def process_queue() -> None:
     """
     log.info("queue_worker_start")
 
-    ideas_processed = _process_user_ideas()
-    filtered_processed = _process_filtered_strategies()
-    validating_processed = _process_implemented_strategies()
-    done_processed = _process_done_strategies()
+    ideas_processed     = _process_user_ideas()
+    filtered_processed  = _process_filtered_strategies()
+    validating_dispatched = _process_implemented_strategies()
 
     log.info(
         "queue_worker_done",
         ideas_processed=ideas_processed,
         filtered_processed=filtered_processed,
-        validating_dispatched=validating_processed,
-        done_processed=done_processed,
+        validating_dispatched=validating_dispatched,
     )

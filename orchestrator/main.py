@@ -19,8 +19,8 @@ import traceback
 import structlog
 import uvicorn
 from apscheduler.schedulers.background import BackgroundScheduler
-from fastapi import FastAPI, Form, Query, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi import BackgroundTasks, FastAPI, Form, Query, Request
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
 from db import supabase_client as db
 from orchestrator.budget_guard import get_remaining_budget
@@ -676,22 +676,28 @@ def _render_ideas_page(flash: str = "", flash_type: str = "") -> str:
 
 
 @app.get("/ideas", response_class=HTMLResponse)
-def ideas_page() -> HTMLResponse:
+def ideas_page(submitted: str = "") -> HTMLResponse:
+    if submitted:
+        return HTMLResponse(_render_ideas_page(
+            "Idea submitted! It will be picked up within 10 minutes.", "success"
+        ))
     return HTMLResponse(_render_ideas_page())
 
 
-@app.post("/ideas", response_class=HTMLResponse)
+@app.post("/ideas")
 def submit_idea(
+    background_tasks: BackgroundTasks,
     title: str = Form(...),
     description: str = Form(...),
     notes: str = Form(""),
     priority: int = Form(5),
-) -> HTMLResponse:
+):
     title = title.strip()
     description = description.strip()
     notes = notes.strip()
 
     if not title or not description:
+        # Can't redirect on validation error — return the form with message
         return HTMLResponse(_render_ideas_page("Title and description are required.", "error"))
 
     try:
@@ -705,12 +711,10 @@ def submit_idea(
         }).execute()
         idea_id = result.data[0]["id"] if result.data else "?"
         log.info("idea_submitted", idea_id=idea_id, title=title)
-        return HTMLResponse(
-            _render_ideas_page(
-                f"Idea submitted! It will be picked up within 10 minutes. (ID: {idea_id[:8]}…)",
-                "success",
-            )
-        )
+        # Process immediately in background instead of waiting for the 10-min scheduler
+        background_tasks.add_task(_scheduled_queue_worker)
+        # POST → redirect → GET prevents double-submit on refresh
+        return RedirectResponse(url="/ideas?submitted=1", status_code=303)
     except Exception as exc:
         log.error("idea_submit_failed", error=str(exc))
         return HTMLResponse(_render_ideas_page(f"Error saving idea: {exc}", "error"))
