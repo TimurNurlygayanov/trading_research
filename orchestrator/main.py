@@ -17,6 +17,7 @@ import traceback  # noqa: F401  (used in scheduled job wrappers)
 from contextlib import asynccontextmanager
 
 import structlog
+import traceback as _traceback
 import uvicorn
 from apscheduler.schedulers.background import BackgroundScheduler
 from fastapi import BackgroundTasks, FastAPI, Form, Query, Request
@@ -130,6 +131,7 @@ def api_stats() -> JSONResponse:
         today_spend = db.get_daily_spend()
         remaining = get_remaining_budget()
     except Exception as exc:
+        log.error("api_stats_error", error=str(exc), traceback=_traceback.format_exc())
         return JSONResponse({"error": str(exc)}, status_code=500)
 
     return JSONResponse({
@@ -179,6 +181,34 @@ def api_retry_strategy(strategy_id: str, background_tasks: BackgroundTasks) -> J
         background_tasks.add_task(_scheduled_queue_worker)
         return JSONResponse({"ok": True, "retry_status": retry_status})
     except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+@app.get("/api/strategy/{strategy_id}/modal-status")
+def api_modal_status(strategy_id: str) -> JSONResponse:
+    """Check whether the Modal job for this strategy is still running, done, or failed."""
+    try:
+        strategy = db.get_strategy(strategy_id)
+        if not strategy:
+            return JSONResponse({"error": "not found"}, status_code=404)
+
+        job_id = strategy.get("modal_job_id")
+        if not job_id:
+            return JSONResponse({"status": "no_job", "message": "No Modal job ID recorded yet."})
+
+        import modal
+        call = modal.FunctionCall.from_id(job_id)
+        try:
+            result = call.get(timeout=0)   # non-blocking: raises if still running
+            return JSONResponse({"status": "done", "result": str(result)[:500]})
+        except TimeoutError:
+            return JSONResponse({"status": "running", "job_id": job_id})
+        except Exception as poll_exc:
+            return JSONResponse({"status": "unknown", "error": str(poll_exc), "job_id": job_id})
+
+    except Exception as exc:
+        log.error("modal_status_check_error", strategy_id=strategy_id,
+                  error=str(exc), traceback=_traceback.format_exc())
         return JSONResponse({"error": str(exc)}, status_code=500)
 
 
@@ -277,14 +307,15 @@ def api_strategies(
             "backtest_sharpe, backtest_calmar, max_drawdown, win_rate, "
             "signals_per_year, total_signals, leakage_score, profit_factor, "
             "oos_sharpe, oos_win_rate, oos_total_trades, monte_carlo_pvalue, "
-            "walk_forward_scores, hypothesis, hyperparams, best_session_hours, "
-            "error_log, report_url, tags, comments, created_at, updated_at"
+            "walk_forward_scores, hypothesis, entry_logic, hyperparams, best_session_hours, "
+            "error_log, report_url, tags, comments, modal_job_id, created_at, updated_at"
         )
         if status != "all":
             q = q.eq("status", status)
         result = q.order("updated_at", desc=True).range(offset, offset + limit - 1).execute()
         return JSONResponse({"strategies": result.data or [], "offset": offset, "limit": limit})
     except Exception as exc:
+        log.error("api_strategies_error", error=str(exc), traceback=_traceback.format_exc())
         return JSONResponse({"error": str(exc)}, status_code=500)
 
 
@@ -298,6 +329,74 @@ def api_strategy_detail(strategy_id: str) -> JSONResponse:
         return JSONResponse(strategy)
     except Exception as exc:
         return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+# ---------------------------------------------------------------------------
+# Generated-ideas API (Research page)
+# ---------------------------------------------------------------------------
+
+@app.get("/api/generated-ideas")
+def api_generated_ideas(
+    status: str = Query("pending"),
+    limit: int = Query(50, ge=1, le=200),
+) -> JSONResponse:
+    try:
+        ideas = db.get_generated_ideas(status=status, limit=limit)
+        return JSONResponse({"ideas": ideas})
+    except Exception as exc:
+        log.error("api_generated_ideas_error", error=str(exc), traceback=_traceback.format_exc())
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+@app.post("/api/generated-ideas/{idea_id}/approve")
+def api_approve_generated_idea(
+    idea_id: str, background_tasks: BackgroundTasks
+) -> JSONResponse:
+    """Approve a generated idea: mark as approved and insert into user_ideas queue."""
+    try:
+        sb = db.get_client()
+        result = sb.table("generated_ideas").select("*").eq("id", idea_id).execute()
+        if not result.data:
+            return JSONResponse({"error": "not found"}, status_code=404)
+        idea = result.data[0]
+
+        # Insert into user_ideas pipeline
+        inserted = sb.table("user_ideas").insert({
+            "title":       idea["title"],
+            "description": idea["summary"],
+            "notes":       f"Source: {idea.get('source_title', '')} ({idea.get('source_type', '')})\n{idea.get('source_url', '')}",
+            "status":      "pending",
+        }).execute()
+        user_idea_id = inserted.data[0]["id"] if inserted.data else None
+
+        update_data: dict = {"status": "approved"}
+        if user_idea_id:
+            update_data["user_idea_id"] = user_idea_id
+        db.update_generated_idea(idea_id, update_data)
+        log.info("generated_idea_approved", idea_id=idea_id, user_idea_id=user_idea_id)
+
+        # Kick the queue immediately
+        background_tasks.add_task(_scheduled_queue_worker)
+        return JSONResponse({"ok": True, "user_idea_id": user_idea_id})
+    except Exception as exc:
+        log.error("api_approve_idea_error", error=str(exc), traceback=_traceback.format_exc())
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+@app.post("/api/generated-ideas/{idea_id}/dismiss")
+def api_dismiss_generated_idea(idea_id: str) -> JSONResponse:
+    try:
+        db.update_generated_idea(idea_id, {"status": "dismissed"})
+        return JSONResponse({"ok": True})
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+@app.post("/api/generated-ideas/refresh")
+def api_refresh_generated_ideas(background_tasks: BackgroundTasks) -> JSONResponse:
+    """Trigger a manual idea-generation cycle (runs in background)."""
+    background_tasks.add_task(_scheduled_research_cycle)
+    return JSONResponse({"ok": True, "message": "Research cycle started in background."})
 
 
 # ---------------------------------------------------------------------------
@@ -427,6 +526,8 @@ _DASHBOARD_HTML = r"""<!DOCTYPE html>
   .empty { text-align: center; padding: 60px 0; color: #475569; font-size: 0.9rem; }
   .loading { text-align: center; padding: 40px 0; color: #475569; }
   .tag-pill { background:#1e293b;border-radius:99px;padding:3px 10px;font-size:.75rem;color:#93c5fd; }
+  details summary::-webkit-details-marker { display:none; }
+  details[open] summary { color: #94a3b8; }
 </style>
 </head>
 <body>
@@ -435,6 +536,7 @@ _DASHBOARD_HTML = r"""<!DOCTYPE html>
   <div class="nav-logo">Trading Research</div>
   <a href="/dashboard" class="active">Dashboard</a>
   <a href="/ideas">Ideas</a>
+  <a href="/research">Research</a>
   <a href="/health">Health</a>
   <div class="nav-right">
     <div class="budget-pill">Today: <span id="spend">…</span> / <span id="limit">$8.00</span></div>
@@ -623,14 +725,56 @@ function renderPanel(s) {
   let paramsHtml = '';
   if (s.hyperparams) {
     const p = typeof s.hyperparams === 'string' ? JSON.parse(s.hyperparams) : s.hyperparams;
-    paramsHtml = `<div class="panel-section"><h3>Best Hyperparameters</h3>
-      <pre class="params">${JSON.stringify(p, null, 2)}</pre></div>`;
+    paramsHtml = `<div class="panel-section">
+      <details>
+        <summary style="cursor:pointer;font-size:.72rem;font-weight:600;text-transform:uppercase;
+                        letter-spacing:.07em;color:#475569;list-style:none;display:flex;
+                        align-items:center;gap:6px;user-select:none"
+                 onclick="this.parentElement.open ? this.querySelector('.arr').textContent='▶' : this.querySelector('.arr').textContent='▼'">
+          <span class="arr" style="font-size:.9rem">▶</span> Best Hyperparameters
+        </summary>
+        <pre class="params" style="margin-top:8px">${JSON.stringify(p, null, 2)}</pre>
+      </details>
+    </div>`;
   }
 
   let errHtml = '';
   if (s.error_log) {
     errHtml = `<div class="panel-section"><h3>Error Log</h3>
       <div class="error-box">${esc(s.error_log)}</div></div>`;
+  }
+
+  // Modal job status block for in-progress strategies
+  let modalHtml = '';
+  const IN_PROGRESS = ['implemented','backtesting','validating'];
+  if (IN_PROGRESS.includes(s.status)) {
+    const elapsed = s.updated_at ? elapsedSince(s.updated_at) : '?';
+    modalHtml = `
+    <div class="panel-section" style="background:#0d1a2d;border:1px solid #1e3a5f;
+                border-radius:10px;padding:14px 16px">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px">
+        <span style="font-size:.72rem;font-weight:600;text-transform:uppercase;
+                     letter-spacing:.07em;color:#475569">Modal Job</span>
+        <span style="font-size:.75rem;color:#64748b">Running for ${elapsed}</span>
+      </div>
+      ${s.modal_job_id ? `<div style="font-size:.72rem;color:#374151;margin-bottom:10px;
+            font-family:monospace;word-break:break-all">${s.modal_job_id}</div>` : ''}
+      <div style="display:flex;gap:8px;flex-wrap:wrap">
+        <button onclick="checkModalStatus('${s.id}')"
+          style="background:#1e2533;border:1px solid #374151;border-radius:8px;
+                 color:#93c5fd;padding:6px 14px;font-size:.8rem;cursor:pointer"
+          id="modal-check-btn-${s.id}">
+          ↻ Check status
+        </button>
+        <a href="https://modal.com/apps" target="_blank"
+          style="background:#1e2533;border:1px solid #374151;border-radius:8px;
+                 color:#64748b;padding:6px 14px;font-size:.8rem;text-decoration:none;
+                 display:inline-block">
+          ↗ Open Modal Dashboard
+        </a>
+      </div>
+      <div id="modal-status-result-${s.id}" style="margin-top:10px;font-size:.8rem;color:#64748b"></div>
+    </div>`;
   }
 
   let actionsHtml = '';
@@ -704,6 +848,15 @@ function renderPanel(s) {
     <div style="margin-bottom:12px"><span class="badge ${badgeCls}">${statusLabel(s.status)}</span>
       <span style="color:#475569;font-size:.78rem;margin-left:8px">
         ${s.source || 'user'} · ${(s.created_at||'').slice(0,10)}</span></div>
+    ${s.entry_logic && s.entry_logic !== s.hypothesis ? `
+    <div style="margin-bottom:14px">
+      <div style="font-size:.68rem;font-weight:600;text-transform:uppercase;letter-spacing:.06em;color:#475569;margin-bottom:5px">Original Idea</div>
+      <div style="background:#0a0f1a;border-left:3px solid #374151;border-radius:0 8px 8px 0;
+                  padding:10px 14px;font-size:.82rem;color:#64748b;line-height:1.55;white-space:pre-wrap">${esc(s.entry_logic)}</div>
+    </div>` : ''}
+    <div style="font-size:.68rem;font-weight:600;text-transform:uppercase;letter-spacing:.06em;color:#475569;margin-bottom:5px">
+      ${s.entry_logic && s.entry_logic !== s.hypothesis ? 'Refined Description' : 'Description'}
+    </div>
     <p class="panel-hyp">${esc(s.hypothesis || '')}</p>
 
     <div class="panel-section">
@@ -731,7 +884,7 @@ function renderPanel(s) {
       </div>
     </div>
 
-    ${actionsHtml}${wfHtml}${paramsHtml}${errHtml}${reportHtml}
+    ${modalHtml}${actionsHtml}${wfHtml}${paramsHtml}${errHtml}${reportHtml}
     <div class="panel-section" style="border-top:1px solid #1f2937;padding-top:16px;margin-top:4px">
       <h3>Comments</h3>
       <div id="comments-list-${s.id}" style="margin-bottom:10px">
@@ -774,6 +927,43 @@ function renderPanel(s) {
         Delete strategy
       </button>
     </div>`;
+}
+
+function elapsedSince(ts) {
+  const diff = Math.floor((Date.now() - new Date(ts + 'Z')) / 1000);
+  if (diff < 60) return diff + 's';
+  if (diff < 3600) return Math.floor(diff/60) + 'm ' + (diff%60) + 's';
+  return Math.floor(diff/3600) + 'h ' + Math.floor((diff%3600)/60) + 'm';
+}
+
+async function checkModalStatus(id) {
+  const btn = document.getElementById(`modal-check-btn-${id}`);
+  const out = document.getElementById(`modal-status-result-${id}`);
+  btn.textContent = 'Checking…';
+  btn.disabled = true;
+  try {
+    const r = await fetch(`/api/strategy/${id}/modal-status`);
+    const d = await r.json();
+    if (d.status === 'running') {
+      out.style.color = '#fcd34d';
+      out.textContent = '⚙ Job is still running on Modal.';
+    } else if (d.status === 'done') {
+      out.style.color = '#4ade80';
+      out.textContent = '✓ Job finished. Refreshing…';
+      setTimeout(() => { loadAll(); openPanel(id); }, 1500);
+    } else if (d.status === 'no_job') {
+      out.style.color = '#64748b';
+      out.textContent = 'No job ID recorded yet — job may still be starting.';
+    } else {
+      out.style.color = '#f87171';
+      out.textContent = '? ' + (d.error || d.message || d.status);
+    }
+  } catch(e) {
+    out.style.color = '#f87171';
+    out.textContent = 'Network error.';
+  }
+  btn.textContent = '↻ Check status';
+  btn.disabled = false;
 }
 
 function renderComments(comments) {
@@ -1098,6 +1288,301 @@ def submit_idea(
 
 
 # ---------------------------------------------------------------------------
+# Research page — AI-generated strategy ideas from scientific papers
+# ---------------------------------------------------------------------------
+
+_RESEARCH_HTML = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Research — Trading Research</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+         background: #0a0d14; color: #e2e8f0; min-height: 100vh; }
+
+  .nav { display: flex; align-items: center; gap: 0; background: #111827;
+         border-bottom: 1px solid #1f2937; padding: 0 24px; }
+  .nav-logo { font-weight: 700; font-size: 0.95rem; color: #f8fafc;
+              padding: 14px 0; margin-right: 32px; letter-spacing: -.01em; }
+  .nav a { display: block; padding: 14px 16px; font-size: 0.85rem; color: #94a3b8;
+           text-decoration: none; border-bottom: 2px solid transparent; transition: color .15s; }
+  .nav a:hover, .nav a.active { color: #f1f5f9; border-bottom-color: #6366f1; }
+  .nav-right { margin-left: auto; display: flex; align-items: center; gap: 12px; }
+
+  .page { max-width: 1100px; margin: 0 auto; padding: 32px 24px; }
+  .page-header { display: flex; align-items: flex-start; justify-content: space-between;
+                 margin-bottom: 28px; flex-wrap: wrap; gap: 14px; }
+  .page-title { font-size: 1.4rem; font-weight: 700; color: #f8fafc; margin-bottom: 4px; }
+  .page-sub { font-size: 0.85rem; color: #64748b; }
+
+  .refresh-btn { background: #6366f1; border: none; border-radius: 8px;
+                 color: #fff; font-size: 0.85rem; font-weight: 600;
+                 padding: 9px 18px; cursor: pointer; }
+  .refresh-btn:hover { background: #4f46e5; }
+  .refresh-btn:disabled { opacity: .5; cursor: default; }
+
+  .tabs { display: flex; gap: 4px; margin-bottom: 20px; }
+  .tab { padding: 6px 16px; border-radius: 99px; font-size: 0.8rem; font-weight: 500;
+         border: 1px solid #1f2937; background: transparent; color: #64748b; cursor: pointer; }
+  .tab:hover  { color: #f1f5f9; border-color: #374151; }
+  .tab.active { background: #6366f1; border-color: #6366f1; color: #fff; }
+  .tab .cnt   { background: rgba(255,255,255,.15); border-radius: 99px;
+                padding: 1px 7px; font-size: 0.72rem; margin-left: 6px; }
+
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 16px; }
+
+  .idea-card { background: #111827; border: 1px solid #1f2937; border-radius: 14px;
+               padding: 20px; display: flex; flex-direction: column; gap: 14px;
+               transition: border-color .15s; }
+  .idea-card:hover { border-color: #374151; }
+  .idea-card.approved  { border-color: #14532d; opacity: .7; }
+  .idea-card.dismissed { border-color: #1f2937; opacity: .45; }
+
+  .card-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; }
+  .card-title { font-size: 0.95rem; font-weight: 600; color: #f1f5f9; line-height: 1.4; flex: 1; }
+  .confidence { display: inline-block; padding: 2px 8px; border-radius: 99px;
+                font-size: 0.68rem; font-weight: 700; text-transform: uppercase;
+                letter-spacing: .05em; white-space: nowrap; flex-shrink: 0; }
+  .conf-high   { background: #14532d; color: #86efac; }
+  .conf-medium { background: #3b2f00; color: #fcd34d; }
+  .conf-low    { background: #1e293b; color: #94a3b8; }
+
+  .card-summary { font-size: 0.84rem; color: #94a3b8; line-height: 1.6; flex: 1; }
+
+  .card-meta { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .source-badge { background: #1e293b; border-radius: 99px; padding: 3px 10px;
+                  font-size: 0.72rem; color: #64748b; }
+  .asset-badge  { background: #1c2a3f; border-radius: 99px; padding: 3px 10px;
+                  font-size: 0.72rem; color: #7dd3fc; }
+  .source-link  { font-size: 0.75rem; color: #818cf8; text-decoration: none;
+                  margin-left: auto; }
+  .source-link:hover { text-decoration: underline; }
+
+  .card-actions { display: flex; gap: 8px; }
+  .btn-approve  { flex: 1; background: #059669; border: none; border-radius: 8px;
+                  color: #fff; font-size: 0.82rem; font-weight: 600; padding: 8px 14px;
+                  cursor: pointer; }
+  .btn-approve:hover  { background: #047857; }
+  .btn-approve:disabled { opacity: .5; cursor: default; }
+  .btn-dismiss  { background: #1e2533; border: 1px solid #374151; border-radius: 8px;
+                  color: #64748b; font-size: 0.82rem; padding: 8px 14px; cursor: pointer; }
+  .btn-dismiss:hover { color: #f87171; border-color: #7f1d1d; }
+  .btn-dismiss:disabled { opacity: .5; cursor: default; }
+
+  .status-chip { display: inline-block; padding: 3px 10px; border-radius: 99px;
+                 font-size: 0.72rem; font-weight: 600; }
+  .chip-approved  { background: #14532d; color: #86efac; }
+  .chip-dismissed { background: #1e293b; color: #64748b; }
+
+  .empty { text-align: center; padding: 80px 0; color: #475569; font-size: 0.9rem; }
+  .loading { text-align: center; padding: 60px 0; color: #475569; }
+  .toast { position: fixed; bottom: 24px; right: 24px; background: #059669;
+           color: #fff; border-radius: 10px; padding: 12px 20px;
+           font-size: 0.85rem; font-weight: 600; z-index: 999;
+           opacity: 0; transition: opacity .3s; pointer-events: none; }
+  .toast.show { opacity: 1; }
+  .toast.error { background: #dc2626; }
+</style>
+</head>
+<body>
+<nav class="nav">
+  <div class="nav-logo">Trading Research</div>
+  <a href="/dashboard">Dashboard</a>
+  <a href="/ideas">Ideas</a>
+  <a href="/research" class="active">Research</a>
+  <a href="/health">Health</a>
+  <div class="nav-right">
+    <button class="refresh-btn" id="refresh-btn" onclick="triggerRefresh()">
+      + Fetch new papers
+    </button>
+  </div>
+</nav>
+
+<div class="page">
+  <div class="page-header">
+    <div>
+      <div class="page-title">Research Feed</div>
+      <div class="page-sub">AI-extracted strategy ideas from arXiv and Semantic Scholar. Click "Use this idea" to send to the pipeline.</div>
+    </div>
+  </div>
+
+  <div class="tabs">
+    <button class="tab active" onclick="switchTab('pending',this)">Pending <span class="cnt" id="cnt-pending">…</span></button>
+    <button class="tab" onclick="switchTab('approved',this)">Approved <span class="cnt" id="cnt-approved">…</span></button>
+    <button class="tab" onclick="switchTab('dismissed',this)">Dismissed <span class="cnt" id="cnt-dismissed">…</span></button>
+    <button class="tab" onclick="switchTab('all',this)">All <span class="cnt" id="cnt-all">…</span></button>
+  </div>
+
+  <div id="grid-container" class="loading">Loading…</div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+let currentTab = 'pending';
+
+async function loadIdeas(status) {
+  document.getElementById('grid-container').innerHTML = '<div class="loading">Loading…</div>';
+  try {
+    const r = await fetch('/api/generated-ideas?status=' + status + '&limit=100');
+    const data = await r.json();
+    renderGrid(data.ideas || []);
+    loadCounts();
+  } catch(e) {
+    document.getElementById('grid-container').innerHTML = '<div class="empty">Failed to load ideas.</div>';
+  }
+}
+
+async function loadCounts() {
+  const statuses = ['pending', 'approved', 'dismissed', 'all'];
+  for (const s of statuses) {
+    try {
+      const r = await fetch('/api/generated-ideas?status=' + s + '&limit=200');
+      const d = await r.json();
+      const el = document.getElementById('cnt-' + s);
+      if (el) el.textContent = (d.ideas || []).length;
+    } catch(e) {}
+  }
+}
+
+function switchTab(status, btn) {
+  currentTab = status;
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  btn.classList.add('active');
+  loadIdeas(status);
+}
+
+function renderGrid(ideas) {
+  const container = document.getElementById('grid-container');
+  if (!ideas.length) {
+    container.innerHTML = '<div class="empty">No ideas in this category yet.<br>Click "+ Fetch new papers" to generate ideas from recent research.</div>';
+    return;
+  }
+  container.className = 'grid';
+  container.innerHTML = ideas.map(idea => renderCard(idea)).join('');
+}
+
+function renderCard(idea) {
+  const confCls = 'conf-' + (idea.confidence || 'medium');
+  const confLabel = (idea.confidence || 'medium').toUpperCase();
+  const sourceLabel = (idea.source_type || '').replace('_', ' ').toUpperCase();
+  const assetLabel = (idea.asset_class || 'multi').toUpperCase();
+  const ts = (idea.created_at || '').slice(0, 10);
+  const isPending   = idea.status === 'pending';
+  const isApproved  = idea.status === 'approved';
+  const isDismissed = idea.status === 'dismissed';
+
+  const cardCls = isApproved ? 'idea-card approved' : isDismissed ? 'idea-card dismissed' : 'idea-card';
+  const statusChip = isApproved
+    ? '<span class="status-chip chip-approved">✓ Queued</span>'
+    : isDismissed
+    ? '<span class="status-chip chip-dismissed">✕ Dismissed</span>'
+    : '';
+
+  const actions = isPending ? `
+    <div class="card-actions">
+      <button class="btn-approve" onclick="approveIdea('${idea.id}', this)">
+        Use this idea →
+      </button>
+      <button class="btn-dismiss" onclick="dismissIdea('${idea.id}', this)" title="Dismiss">✕</button>
+    </div>` : `<div style="display:flex;align-items:center;gap:8px">${statusChip}</div>`;
+
+  return `
+  <div class="idea-card ${cardCls}" id="card-${idea.id}">
+    <div class="card-header">
+      <div class="card-title">${esc(idea.title)}</div>
+      <span class="confidence ${confCls}">${confLabel}</span>
+    </div>
+    <div class="card-summary">${esc(idea.summary)}</div>
+    <div class="card-meta">
+      <span class="source-badge">${sourceLabel}</span>
+      <span class="asset-badge">${assetLabel}</span>
+      <span style="font-size:.72rem;color:#374151">${ts}</span>
+      ${idea.source_url ? `<a class="source-link" href="${esc(idea.source_url)}" target="_blank">↗ Paper</a>` : ''}
+    </div>
+    ${actions}
+  </div>`;
+}
+
+async function approveIdea(id, btn) {
+  btn.disabled = true;
+  btn.textContent = 'Queuing…';
+  try {
+    const r = await fetch('/api/generated-ideas/' + id + '/approve', {method: 'POST'});
+    const d = await r.json();
+    if (d.ok) {
+      showToast('Idea queued for analysis!');
+      setTimeout(() => loadIdeas(currentTab), 800);
+    } else {
+      showToast('Error: ' + (d.error || 'unknown'), true);
+      btn.disabled = false;
+      btn.textContent = 'Use this idea →';
+    }
+  } catch(e) {
+    showToast('Network error', true);
+    btn.disabled = false;
+    btn.textContent = 'Use this idea →';
+  }
+}
+
+async function dismissIdea(id, btn) {
+  btn.disabled = true;
+  try {
+    await fetch('/api/generated-ideas/' + id + '/dismiss', {method: 'POST'});
+    const card = document.getElementById('card-' + id);
+    if (card) card.style.opacity = '0.3';
+    setTimeout(() => loadIdeas(currentTab), 500);
+  } catch(e) {
+    btn.disabled = false;
+  }
+}
+
+async function triggerRefresh() {
+  const btn = document.getElementById('refresh-btn');
+  btn.disabled = true;
+  btn.textContent = 'Fetching papers…';
+  try {
+    const r = await fetch('/api/generated-ideas/refresh', {method: 'POST'});
+    const d = await r.json();
+    showToast('Fetching papers in background — check back in ~30 seconds.');
+    setTimeout(() => {
+      btn.disabled = false;
+      btn.textContent = '+ Fetch new papers';
+      loadIdeas(currentTab);
+    }, 30000);
+  } catch(e) {
+    showToast('Failed to trigger refresh', true);
+    btn.disabled = false;
+    btn.textContent = '+ Fetch new papers';
+  }
+}
+
+function showToast(msg, isError) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.className = 'toast' + (isError ? ' error' : '') + ' show';
+  setTimeout(() => { t.className = 'toast' + (isError ? ' error' : ''); }, 3500);
+}
+
+function esc(s) {
+  if (!s) return '';
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+loadIdeas('pending');
+</script>
+</body>
+</html>"""
+
+
+@app.get("/research", response_class=HTMLResponse)
+def research_page() -> HTMLResponse:
+    return HTMLResponse(_RESEARCH_HTML)
+
+
+# ---------------------------------------------------------------------------
 # Scheduled jobs
 # ---------------------------------------------------------------------------
 
@@ -1110,8 +1595,13 @@ def _scheduled_queue_worker() -> None:
 
 
 def _scheduled_research_cycle() -> None:
-    """Placeholder for the future autonomous researcher agent."""
-    log.info("research_cycle", msg="Research cycle tick — researcher agent not yet implemented.")
+    """Fetch new papers from arXiv / Semantic Scholar and extract strategy ideas."""
+    try:
+        from agents.idea_generator import run_idea_generator
+        inserted = run_idea_generator()
+        log.info("research_cycle_complete", new_ideas=len(inserted))
+    except Exception:
+        log.error("research_cycle_failed", traceback=traceback.format_exc())
 
 
 def _scheduled_budget_log() -> None:

@@ -76,6 +76,7 @@ OUTPUT FORMAT (JSON only, no other text):
   "suggested_timeframes": ["1h", "4h"],
   "suggested_symbols": ["EURUSD", "GBPUSD"],
   "strategy_name": "<concise 4-8 word title for this strategy, e.g. 'RSI Divergence VWAP Bounce 1H'>",
+  "refined_description": "<rewrite the strategy description incorporating your suggestions: make entry/exit rules precise and quantifiable, add missing details like stop-loss type, TP target, session filter. Keep the user's original intent. 2-4 sentences max.>",
   "notes": "<any important considerations for the Implementer agent>"
 }}
 

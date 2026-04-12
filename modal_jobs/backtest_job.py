@@ -1,27 +1,25 @@
 """
 Modal job: runs the full backtest pipeline for a strategy.
-Called by the Render orchestrator via HTTP when a strategy is ready for backtesting.
 
 Pipeline:
 1. Load strategy code from DB
-2. Fetch OHLCV data (all available history)
+2. Fetch OHLCV data — served from Modal Volume cache after first download
 3. Split train/OOS
 4. Leakage check on code
 5. Dynamic code execution: exec() the strategy class into a local namespace
-6. Optimize with Optuna on train data (50 trials, 4 CPUs)
-7. Walk-forward validation on train data
+6. Optimize with Optuna on train data (25 trials, 8 CPUs)
+7. Walk-forward validation: 3 folds × 10 trials
 8. Run final backtest on full train data with best params
 9. Run OOS backtest (2026+) with best params
 10. Update DB with all results
-11. Return results dict
 
-Uses Modal for parallelism: 4 CPUs, 8 GB RAM, 30 min timeout.
+Uses Modal for parallelism: 8 CPUs, 8 GB RAM, 20 min timeout.
+OHLCV data cached in Modal Volume — only downloaded once per symbol/timeframe.
 """
 import modal
 
 app = modal.App("trading-research-backtest")
 
-# Define the Modal image with all required packages
 image = (
     modal.Image.debian_slim(python_version="3.13")
     .pip_install(
@@ -35,15 +33,21 @@ image = (
         "supabase==2.9.1",
         "python-dotenv==1.0.1",
         "scipy==1.14.1",
+        "pyarrow",   # for parquet cache
     )
 )
 
+# Persistent volume — OHLCV data cached here across runs
+ohlcv_cache = modal.Volume.from_name("trading-research-ohlcv-cache", create_if_missing=True)
+CACHE_DIR = "/ohlcv_cache"
+
 @app.function(
     image=image,
-    cpu=4,
+    cpu=8,
     memory=8192,
-    timeout=1800,  # 30 minutes
+    timeout=1200,  # 20 minutes — enough headroom with caching + fewer trials
     secrets=[modal.Secret.from_name("trading-research-secrets")],
+    volumes={CACHE_DIR: ohlcv_cache},
 )
 def run_backtest_pipeline(strategy_id: str) -> dict:
     """
@@ -71,7 +75,7 @@ def run_backtest_pipeline(strategy_id: str) -> dict:
         from backtest.engine import run_backtest
         from backtest.leakage_detector import check_leakage
         from backtest.optimizer import optimize_strategy
-        from backtest.walk_forward import walk_forward_validation
+        from backtest.walk_forward import walk_forward
         from backtest.monte_carlo import run_monte_carlo
 
         # 1. Load strategy
@@ -99,7 +103,7 @@ def run_backtest_pipeline(strategy_id: str) -> dict:
 
         add_pipeline_note(strategy_id, f"Backtest job started on Modal — symbol={symbol}, timeframe={timeframe}.")
 
-        # 2. Leakage check
+        # 2. Leakage check (fast — before any data work)
         leakage_result = check_leakage(code)
         if not leakage_result.passed:
             db.update_strategy(strategy_id, {
@@ -111,20 +115,35 @@ def run_backtest_pipeline(strategy_id: str) -> dict:
             add_pipeline_note(strategy_id, f"Backtest FAILED leakage check — score {leakage_result.score}/10. Issues: {'; '.join(leakage_result.issues[:3])}")
             return {"passed": False, "reason": "leakage_check_failed", "issues": leakage_result.issues}
 
-        # 3. Fetch data
-        df = fetch_ohlcv(symbol, timeframe, start="2015-01-01", end="2026-12-31")
+        # 3. Fetch data — use Volume cache to avoid re-downloading on every run
+        import os as _os
+        cache_file = f"{CACHE_DIR}/{symbol}_{timeframe}.parquet"
+        if _os.path.exists(cache_file):
+            df = pd.read_parquet(cache_file)
+            add_pipeline_note(strategy_id, f"Data loaded from cache ({len(df)} bars).")
+        else:
+            df = fetch_ohlcv(symbol, timeframe, start="2015-01-01", end="2026-12-31")
+            _os.makedirs(CACHE_DIR, exist_ok=True)
+            df.to_parquet(cache_file)
+            ohlcv_cache.commit()  # flush to Modal Volume
+            add_pipeline_note(strategy_id, f"Data downloaded and cached ({len(df)} bars).")
         train_df, oos_df = split_train_oos(df)
 
         # 4. Execute the strategy class from code string
         namespace: dict = {}
         exec(compile(code, "<strategy>", "exec"), namespace)
-        strategy_classes = [
-            v for v in namespace.values()
+        strategy_classes = {
+            v.__name__: v for v in namespace.values()
             if isinstance(v, type) and issubclass(v, Strategy) and v is not Strategy
-        ]
+        }
         if not strategy_classes:
             raise ValueError("No Strategy subclass found in generated code")
-        strategy_class = strategy_classes[0]
+        # Prefer the class whose name matches what the Implementer recorded
+        expected_class_name = (strategy.get("indicators") or {}).get("strategy_class", "")
+        if expected_class_name and expected_class_name in strategy_classes:
+            strategy_class = strategy_classes[expected_class_name]
+        else:
+            strategy_class = next(iter(strategy_classes.values()))
 
         # 5. Optimize on training data
         # Convert param_space from JSON format to optimizer tuple format.
@@ -148,19 +167,60 @@ def run_backtest_pipeline(strategy_id: str) -> dict:
             strategy_class, train_df, opt_space, n_trials=50, n_jobs=4
         )
 
-        # 6. Walk-forward validation
-        wf_scores = walk_forward_validation(
-            strategy_class, train_df, opt_space, n_folds=5
-        )
+        # 5.5. Recent-data gate: quick sanity check on last 90 days of OOS data.
+        # Strategy must be non-negative (or have too few trades to judge) in recent history.
+        # This runs in < 5 seconds and saves the full walk-forward if the strategy is broken recently.
+        RECENT_CHECK_DAYS = 90
+        if len(oos_df) >= 50:
+            try:
+                recent_cutoff = oos_df.index[-1] - pd.Timedelta(days=RECENT_CHECK_DAYS)
+                recent_df = oos_df[oos_df.index >= recent_cutoff]
+                if len(recent_df) >= 30:
+                    recent_result = run_backtest(strategy_class, recent_df, params=best_params)
+                    add_pipeline_note(
+                        strategy_id,
+                        f"Recent {RECENT_CHECK_DAYS}-day check: "
+                        f"Sharpe={recent_result.sharpe:.3f}, trades={recent_result.total_trades}."
+                    )
+                    if recent_result.total_trades >= 3 and recent_result.sharpe < -0.3:
+                        reason = (
+                            f"Strategy unprofitable in recent {RECENT_CHECK_DAYS} days: "
+                            f"Sharpe={recent_result.sharpe:.3f}, trades={recent_result.total_trades}. "
+                            "Possible regime change or curve-fitting."
+                        )
+                        db.update_strategy(strategy_id, {
+                            "status": "failed",
+                            "error_log": reason,
+                            "hyperparams": best_params,
+                        })
+                        add_pipeline_note(strategy_id, f"Recent data gate FAILED — {reason}")
+                        return {"passed": False, "reason": reason}
+            except Exception as _rce:
+                add_pipeline_note(strategy_id, f"Recent data check skipped (error: {_rce}).")
 
-        # 7. Final backtest on full training data
-        train_result = run_backtest(strategy_class, train_df, params=best_params)
+        # 6. Walk-forward validation
+        wf_result = walk_forward(strategy_class, train_df, opt_space, n_folds=3, n_trials=10)
+        wf_scores = wf_result.oos_sharpes  # list of OOS Sharpe per fold
 
         add_pipeline_note(
             strategy_id,
-            f"Optuna done — best params: {best_params}. "
-            f"Walk-forward scores: {[round(s,3) for s in (wf_scores or [])]}."
+            f"Optuna done — best params: {best_params}.\n"
+            f"Walk-forward OOS Sharpes: {[round(s,3) for s in wf_scores]}. "
+            f"Mean={wf_result.mean_oos_sharpe:.3f}, overfit ratio={wf_result.overfitting_ratio:.1f}x."
         )
+
+        if not wf_result.passed:
+            db.update_strategy(strategy_id, {
+                "status": "failed",
+                "walk_forward_scores": wf_scores,
+                "hyperparams": best_params,
+                "error_log": wf_result.reject_reason,
+            })
+            add_pipeline_note(strategy_id, f"Walk-forward FAILED — {wf_result.reject_reason}")
+            return {"passed": False, "reason": wf_result.reject_reason}
+
+        # 7. Final backtest on full training data
+        train_result = run_backtest(strategy_class, train_df, params=best_params)
 
         if not train_result.passed:
             db.update_strategy(strategy_id, {
@@ -177,11 +237,42 @@ def run_backtest_pipeline(strategy_id: str) -> dict:
         # 8. OOS backtest
         oos_result = run_backtest(strategy_class, oos_df, params=best_params)
 
-        # 9. Monte Carlo test on training trades
+        # OOS degradation gate: OOS Sharpe must be at least 40% of train Sharpe
+        # and must be positive. A strategy with train=2.0 / OOS=0.1 is curve-fitted.
+        if oos_result and train_result.sharpe > 0:
+            min_oos_sharpe = max(0.6, 0.5 * train_result.sharpe)
+            if oos_result.sharpe < min_oos_sharpe:
+                reason = (
+                    f"OOS degradation too severe: train Sharpe={train_result.sharpe:.3f}, "
+                    f"OOS Sharpe={oos_result.sharpe:.3f} "
+                    f"(minimum required={min_oos_sharpe:.3f} — floor 0.6 or 50% of train)."
+                )
+                db.update_strategy(strategy_id, {
+                    "status": "failed",
+                    "backtest_sharpe": train_result.sharpe,
+                    "oos_sharpe": oos_result.sharpe,
+                    "error_log": reason,
+                    "hyperparams": best_params,
+                })
+                add_pipeline_note(strategy_id, f"OOS degradation FAILED — {reason}")
+                return {"passed": False, "reason": reason}
+
+        # 9. Monte Carlo test (requires enough trades for meaningful p-value)
         mc_pvalue = None
-        if train_result.trades is not None and not train_result.trades.empty:
+        MIN_TRADES_FOR_MC = 30
+        if (
+            train_result.trades is not None
+            and not train_result.trades.empty
+            and len(train_result.trades) >= MIN_TRADES_FOR_MC
+        ):
             mc_result = run_monte_carlo(train_result.trades, train_result.sharpe)
             mc_pvalue = mc_result.p_value
+        elif train_result.trades is not None:
+            add_pipeline_note(
+                strategy_id,
+                f"Monte Carlo skipped — only {len(train_result.trades)} trades "
+                f"(minimum {MIN_TRADES_FOR_MC} required for reliable p-value)."
+            )
 
         # 10. Update DB with full results
         db.update_strategy(strategy_id, {

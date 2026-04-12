@@ -31,9 +31,9 @@ services:
       - key: MAX_DAILY_SPEND_USD
         value: "8.0"
       - key: BACKTEST_MIN_SHARPE
-        value: "0.8"
+        value: "1.2"
       - key: BACKTEST_MIN_CALMAR
-        value: "0.5"
+        value: "0.6"
       - key: BACKTEST_MIN_SIGNALS_TOTAL
         value: "100"
       - key: BACKTEST_MIN_SIGNALS_PER_YEAR

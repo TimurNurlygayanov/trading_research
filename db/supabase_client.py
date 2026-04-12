@@ -133,6 +133,34 @@ def log_spend(
     }).execute()
 
 
+# ── generated_ideas ──────────────────────────────────────────────────────────
+
+def insert_generated_idea(data: dict[str, Any]) -> dict[str, Any]:
+    sb = get_client()
+    result = sb.table("generated_ideas").insert(data).execute()
+    return result.data[0]
+
+
+def get_generated_ideas(status: str = "pending", limit: int = 50) -> list[dict[str, Any]]:
+    sb = get_client()
+    q = sb.table("generated_ideas").select("*")
+    if status != "all":
+        q = q.eq("status", status)
+    result = q.order("created_at", desc=True).limit(limit).execute()
+    return result.data
+
+
+def get_generated_idea_urls() -> set[str]:
+    sb = get_client()
+    result = sb.table("generated_ideas").select("source_url").execute()
+    return {r["source_url"] for r in result.data if r.get("source_url")}
+
+
+def update_generated_idea(idea_id: str, updates: dict[str, Any]) -> None:
+    sb = get_client()
+    sb.table("generated_ideas").update(updates).eq("id", idea_id).execute()
+
+
 def get_daily_spend(for_date: date | None = None) -> float:
     sb = get_client()
     target = (for_date or date.today()).isoformat()

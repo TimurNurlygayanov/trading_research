@@ -97,11 +97,19 @@ def run_validator_pipeline(strategy_id: str) -> dict:
                     f"Re-dispatching to backtest with fixed code."
                 )
                 # Re-dispatch to Modal backtest job
-                import modal as _modal
-                backtest_fn = _modal.Function.from_name(
-                    "trading-research-backtest", "run_backtest_pipeline"
-                )
-                backtest_fn.spawn(strategy_id)
+                try:
+                    import modal as _modal
+                    backtest_fn = _modal.Function.from_name(
+                        "trading-research-backtest", "run_backtest_pipeline"
+                    )
+                    backtest_fn.spawn(strategy_id)
+                except Exception as dispatch_exc:
+                    db.update_strategy(strategy_id, {
+                        "status": "failed",
+                        "error_log": f"Validator correction re-dispatch failed: {dispatch_exc}",
+                    })
+                    add_pipeline_note(strategy_id, f"Validator: corrections applied but re-dispatch to backtest failed — {dispatch_exc}")
+                    return {"passed": False, "strategy_id": strategy_id, "reason": str(dispatch_exc)}
                 return {
                     "passed": False,
                     "strategy_id": strategy_id,
@@ -150,15 +158,20 @@ def run_validator_pipeline(strategy_id: str) -> dict:
         # ----------------------------------------------------------------
         from agents.learner import run_learner
 
-        try:
-            run_learner(strategy_id)
-        except Exception as exc:
-            # Learner failure is non-fatal: the strategy is still valid.
-            # Log the error but do not block promotion to "live".
-            tb = traceback.format_exc()
-            db.update_strategy(strategy_id, {
-                "error_log": f"learner error (non-fatal): {type(exc).__name__}: {exc}\n{tb[:400]}",
-            })
+        learner_ok = False
+        for _attempt in range(2):  # retry once on failure
+            try:
+                run_learner(strategy_id)
+                learner_ok = True
+                break
+            except Exception as exc:
+                tb = traceback.format_exc()
+                if _attempt == 1:
+                    # Non-fatal after retry: strategy is still valid, log and continue
+                    db.update_strategy(strategy_id, {
+                        "error_log": f"learner error (non-fatal, retried): {type(exc).__name__}: {exc}\n{tb[:400]}",
+                    })
+                    add_pipeline_note(strategy_id, f"Learner failed after retry — knowledge not extracted: {exc}")
 
         # ----------------------------------------------------------------
         # 4. Mark strategy as live

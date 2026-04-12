@@ -279,5 +279,6 @@ def select_robust_params(result: WalkForwardResult) -> dict[str, Any]:
         return {}
 
     oos_arr = np.array(result.oos_sharpes)
-    median_idx = int(np.argsort(oos_arr)[len(oos_arr) // 2])
+    sorted_indices = np.argsort(oos_arr)
+    median_idx = int(sorted_indices[(len(sorted_indices) - 1) // 2])
     return result.best_params_per_fold[median_idx]

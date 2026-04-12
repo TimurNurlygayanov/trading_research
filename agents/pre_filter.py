@@ -84,6 +84,10 @@ def run_pre_filter(strategy_id: str) -> dict[str, Any]:
     }
     if result.get("strategy_name"):
         updates["name"] = result["strategy_name"].strip()
+    # Overwrite hypothesis with the refined description so the Implementer
+    # gets a precise, actionable spec. The original text is preserved in entry_logic.
+    if result.get("refined_description"):
+        updates["hypothesis"] = result["refined_description"].strip()
     db.update_strategy(strategy_id, updates)
 
     log.info(f"Pre-filter: strategy={strategy_id} score={score} verdict={verdict} → {new_status}")

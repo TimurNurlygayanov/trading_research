@@ -132,7 +132,7 @@ def _upload_to_r2(strategy_id: str, report_text: str) -> str | None:
     bucket     = os.environ.get("R2_BUCKET_NAME")
     # Support both naming conventions
     access_key = os.environ.get("R2_ACCESS_KEY_ID") or os.environ.get("R2_API_KEY")
-    secret_key = os.environ.get("R2_SECRET_ACCESS_KEY") or os.environ.get("R2_API_KEY")
+    secret_key = os.environ.get("R2_SECRET_ACCESS_KEY")
 
     if not all([account_id, access_key, secret_key, bucket]):
         log.warning("R2 credentials incomplete — skipping report upload. "

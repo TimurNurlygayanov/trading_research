@@ -27,14 +27,15 @@ log = structlog.get_logger(__name__)
 def _dispatch_backtest_job(strategy_id: str) -> None:
     """
     Dispatch a strategy to Modal for the full backtest pipeline.
-    Uses modal.Function.lookup() so the app must be deployed first:
-      modal deploy modal_jobs/backtest_job.py
+    Stores the Modal call ID so the dashboard can check job status.
     """
     try:
         import modal
         fn = modal.Function.from_name("trading-research-backtest", "run_backtest_pipeline")
-        fn.spawn(strategy_id)
-        log.info("modal_backtest_dispatched", strategy_id=strategy_id)
+        call = fn.spawn(strategy_id)
+        job_id = getattr(call, "object_id", None)
+        db.update_strategy(strategy_id, {"modal_job_id": job_id})
+        log.info("modal_backtest_dispatched", strategy_id=strategy_id, job_id=job_id)
     except ImportError:
         log.warning("modal_not_installed", strategy_id=strategy_id)
     except Exception as exc:
@@ -48,14 +49,15 @@ def _dispatch_backtest_job(strategy_id: str) -> None:
 def _dispatch_validator_job(strategy_id: str) -> None:
     """
     Dispatch a strategy to Modal for validation / summarise / learn.
-    Uses modal.Function.lookup() — requires deployed app:
-      modal deploy modal_jobs/validator_job.py
+    Stores the Modal call ID so the dashboard can check job status.
     """
     try:
         import modal
         fn = modal.Function.from_name("trading-research-validator", "run_validator_pipeline")
-        fn.spawn(strategy_id)
-        log.info("modal_validator_dispatched", strategy_id=strategy_id)
+        call = fn.spawn(strategy_id)
+        job_id = getattr(call, "object_id", None)
+        db.update_strategy(strategy_id, {"modal_job_id": job_id})
+        log.info("modal_validator_dispatched", strategy_id=strategy_id, job_id=job_id)
     except ImportError:
         log.warning("modal_not_installed", strategy_id=strategy_id)
     except Exception as exc:
@@ -89,6 +91,9 @@ def _process_user_ideas() -> int:
                 "status": "idea",
                 "name": idea.get("title", "Untitled Idea"),
                 "hypothesis": idea.get("description", ""),
+                # entry_logic preserves the original user text forever —
+                # hypothesis may be refined by pre-filter / implementer
+                "entry_logic": idea.get("description", ""),
             })
             strategy_id = strategy_record["id"]
 
@@ -116,6 +121,7 @@ def _process_user_ideas() -> int:
             try:
                 run_pre_filter(strategy_id)
                 log.info("pre_filter_complete", strategy_id=strategy_id)
+                db.mark_idea_done(idea_id)
             except Exception as exc:
                 log.error("pre_filter_failed",
                           strategy_id=strategy_id, error=str(exc))
@@ -123,6 +129,7 @@ def _process_user_ideas() -> int:
                     "status": "failed",
                     "error_log": f"pre_filter error: {type(exc).__name__}: {exc}",
                 })
+                db.mark_idea_failed(idea_id, str(exc))
 
             processed += 1
 

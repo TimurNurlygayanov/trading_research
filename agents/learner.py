@@ -172,7 +172,7 @@ def _validate_entry(entry: dict) -> bool:
         log.warning(f"Learner: unknown category '{entry['category']}' — defaulting to 'partial'")
         entry["category"] = "partial"
     # summary must be non-trivial
-    if len(entry["summary"].strip()) < 10:
+    if len(entry["summary"].strip()) < 5:
         return False
     return True
 

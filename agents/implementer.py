@@ -130,12 +130,16 @@ def run_implementer(strategy_id: str) -> dict[str, Any]:
             messages.append({"role": "assistant", "content": raw_text})
             messages.append({"role": "user", "content": fix_request})
         else:
-            # Retries exhausted — save what we have with a warning
-            log.warning(
-                f"Implementer: leakage score {leakage_result.score} below threshold after "
-                f"{MAX_RETRIES} retries — saving with warning for strategy={strategy_id}"
+            # Retries exhausted and still leaky — reject rather than waste Modal compute
+            issues_text = "; ".join(leakage_result.issues[:3])
+            reason = (
+                f"Leakage score {leakage_result.score}/10 still below {MIN_LEAKAGE_SCORE} "
+                f"after {MAX_RETRIES} retries. Issues: {issues_text}"
             )
-            result = parsed
+            log.warning(f"Implementer: {reason} — marking failed for strategy={strategy_id}")
+            _mark_failed(strategy_id, reason)
+            _log_spend(strategy_id, total_input_tokens, total_output_tokens)
+            raise RuntimeError(reason)
 
     # Save total spend
     cost = _estimate_cost(MODEL, total_input_tokens, total_output_tokens)
