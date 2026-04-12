@@ -103,15 +103,17 @@ def preload_ohlcv_data(
                 first_date = df.index[0].isoformat()
                 last_date  = df.index[-1].isoformat()
 
-                # Completeness estimate (trading weekdays only)
+                # Completeness: actual bars vs maximum possible (24h × calendar days).
+                # FX data can include weekends and late-Sunday opens, so calendar days
+                # (not business days) gives the correct denominator.
+                # A healthy EURUSD dataset is typically 85–95% (gaps = weekends/holidays).
                 bpd = cfg.get("bars_per_day")
                 completeness_pct: float | None = None
                 if bpd:
-                    trading_days = pd.bdate_range(
-                        df.index[0].date(), df.index[-1].date()
-                    ).shape[0]
-                    expected = trading_days * bpd
-                    completeness_pct = round(bar_count / expected * 100, 1) if expected else None
+                    calendar_days = (df.index[-1].date() - df.index[0].date()).days + 1
+                    expected = calendar_days * bpd
+                    if expected:
+                        completeness_pct = min(round(bar_count / expected * 100, 1), 100.0)
 
                 # Recent 500 bars for chart display
                 recent = df.tail(500)
