@@ -73,7 +73,7 @@ OUTPUT FORMAT (JSON only, no other text):
   "rejection_reason": "<reason if rejected, else null>",
   "suggested_modifications": "<suggestions if verdict=modify, else null>",
   "suggested_indicators": ["<indicator1>", "<indicator2>"],
-  "suggested_timeframes": ["<IMPORTANT: if the description explicitly mentions a timeframe (e.g. '5m', '15m', '1h'), use EXACTLY that timeframe as the first entry. Otherwise suggest based on strategy type: scalping→5m/15m, intraday→1h/4h, swing→4h/1d>"],
+  "suggested_timeframes": ["<IMPORTANT: if the description explicitly mentions a timeframe (e.g. '5m', '15m', '1h'), use EXACTLY that timeframe as the first entry. Otherwise suggest based on strategy type: scalping→5m/15m, intraday→1h/4h, swing→4h/1d. REQUIRED: always include BOTH '1h' AND '5m' — the strategy will be validated on all listed timeframes>"],
   "suggested_symbols": ["EURUSD", "GBPUSD"],
   "strategy_name": "<concise 4-8 word title for this strategy, e.g. 'RSI Divergence VWAP Bounce 1H'>",
   "refined_description": "<rewrite the strategy description incorporating your suggestions: make entry/exit rules precise and quantifiable, add missing details like stop-loss type, TP target, session filter. Keep the user's original intent. 2-4 sentences max.>",
@@ -179,6 +179,11 @@ def _count_signals(self) -> None:
     pass  # backtesting.py counts via _trades DataFrame — validated externally
 ```
 
+CRITICAL API RULES:
+- self.buy(sl=..., tp=...) and self.sell(sl=..., tp=...) — this is the ONLY way to set SL/TP
+- NEVER read self.position.sl or self.position.tp — Position has NO .sl/.tp attributes
+- To modify stops on open trades: for trade in self.trades: trade.sl = new_value
+
 LEAKAGE PREVENTION CHECKLIST — verify before generating:
 [ ] No shift(-N) anywhere
 [ ] No bfill() or fillna(method='backfill')
@@ -201,7 +206,7 @@ Return a JSON object with these exact keys:
   "hypothesis": "<one paragraph explaining the edge>",
   "indicators_used": ["rsi", "atr", ...],
   "recommended_symbols": ["EURUSD", "GBPUSD"],
-  "recommended_timeframes": ["<use the timeframe from Recommended timeframes input — do NOT change it unless clearly wrong>"],
+  "recommended_timeframes": ["<use ALL timeframes from Recommended timeframes input — must include at least '1h' and '5m'>"],
   "notes": "<any implementation caveats>"
 }}
 
@@ -278,6 +283,11 @@ class {{StrategyName}}Strategy(Strategy):
             # if <short_condition>:
             #     self.sell(sl=price + sl_dist, tp=price - tp_dist)
             pass
+        # IMPORTANT: Do NOT access self.position.sl or self.position.tp —
+        # the Position object has no .sl/.tp attributes.
+        # Stop-loss and take-profit are set ONLY via self.buy(sl=, tp=)
+        # or self.sell(sl=, tp=) parameters. To update stops on an open
+        # position, use: for trade in self.trades: trade.sl = new_sl
 
     def on_trade(self, trade) -> None:
         # Track daily losses for risk management
@@ -297,7 +307,7 @@ Suggested indicators: {indicators}
 Recommended timeframes: {timeframes}
 Recommended symbols: {symbols}
 
-IMPORTANT: The "Recommended timeframes" above is the user's intended timeframe — use it EXACTLY in recommended_timeframes output. If multiple timeframes listed, use the first one.
+IMPORTANT: The "Recommended timeframes" above is the user's intended timeframe — use ALL of them in recommended_timeframes output. The strategy will be backtested and validated on EVERY listed timeframe (at minimum 1h and 5m are always required).
 
 Knowledge base (what works and fails):
 {knowledge_base_context}
@@ -331,6 +341,7 @@ VALIDATION CHECKLIST — check each item and report findings:
 [ ] B5: Position check missing before entry (can double up positions) → BUG
 [ ] B6: ATR or any divisor can be 0 → division by zero risk → BUG
 [ ] B7: Integer params used in float calculations without casting → BUG
+[ ] B8: Accessing self.position.sl or self.position.tp → FAIL (Position has no .sl/.tp; use self.trades[i].sl instead)
 
 ═══ PERFORMANCE ISSUES ═══
 [ ] P1: Python loop inside next() over large arrays → SLOW (use vectorized indicators)

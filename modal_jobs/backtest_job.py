@@ -108,11 +108,17 @@ def run_backtest_pipeline(strategy_id: str) -> dict:
         symbol = symbols[0] if symbols else "EURUSD"
 
         timeframes = strategy.get("timeframes") or ["1h"]
-        timeframe = timeframes[0]
+        # ── REQUIRED: every strategy must be validated on both 1h and 5m ──
+        REQUIRED_TIMEFRAMES = ["1h", "5m"]
+        for rtf in REQUIRED_TIMEFRAMES:
+            if rtf not in timeframes:
+                timeframes.append(rtf)
+        # Primary timeframe is the first one (used for optimization)
+        primary_tf = timeframes[0]
 
         db.update_strategy(strategy_id, {"status": "backtesting"})
 
-        add_pipeline_note(strategy_id, f"Backtest job started on Modal — symbol={symbol}, timeframe={timeframe}.")
+        add_pipeline_note(strategy_id, f"Backtest job started on Modal — symbol={symbol}, timeframes={timeframes} (primary={primary_tf}).")
 
         # 2. Leakage check (fast — before any data work)
         leakage_result = check_leakage(code)
@@ -126,18 +132,18 @@ def run_backtest_pipeline(strategy_id: str) -> dict:
             add_pipeline_note(strategy_id, f"Backtest FAILED leakage check — score {leakage_result.score}/10. Issues: {'; '.join(leakage_result.issues[:3])}")
             return {"passed": False, "reason": "leakage_check_failed", "issues": leakage_result.issues}
 
-        # 3. Fetch data — use Volume cache to avoid re-downloading on every run
+        # 3. Fetch data for primary timeframe
         import os as _os
-        cache_file = f"{CACHE_DIR}/{symbol}_{timeframe}.parquet"
+        cache_file = f"{CACHE_DIR}/{symbol}_{primary_tf}.parquet"
         if _os.path.exists(cache_file):
             df = pd.read_parquet(cache_file)
-            add_pipeline_note(strategy_id, f"Data loaded from cache ({len(df)} bars).")
+            add_pipeline_note(strategy_id, f"Data loaded from cache for {primary_tf} ({len(df)} bars).")
         else:
-            df = fetch_ohlcv(symbol, timeframe, start="2015-01-01", end="2026-12-31")
+            df = fetch_ohlcv(symbol, primary_tf, start="2015-01-01", end="2026-12-31")
             _os.makedirs(CACHE_DIR, exist_ok=True)
             df.to_parquet(cache_file)
-            ohlcv_cache.commit()  # flush to Modal Volume
-            add_pipeline_note(strategy_id, f"Data downloaded and cached ({len(df)} bars).")
+            ohlcv_cache.commit()
+            add_pipeline_note(strategy_id, f"Data downloaded and cached for {primary_tf} ({len(df)} bars).")
         train_df, oos_df = split_train_oos(df)
 
         # 4. Execute the strategy class from code string

@@ -46,6 +46,7 @@ _QUALITY_KEYWORDS = [
     "mean oos sharpe",
     "curve-fitted",
     "below minimum",
+    "multi-timeframe validation failed",
 ]
 
 # These are transient infra errors — retry without code change
@@ -125,6 +126,9 @@ Rules you MUST follow:
 - No shift(-N), no bfill(), no fitting on full dataset
 - The Strategy subclass must be at module level (not nested)
 - Use backtesting.py Strategy API: self.buy(), self.sell(), self.position
+- NEVER access self.position.sl or self.position.tp — Position has no .sl/.tp attributes.
+  Set SL/TP only via self.buy(sl=, tp=) or self.sell(sl=, tp=).
+  To modify stops on open trades: for trade in self.trades: trade.sl = new_value
 - Preserve the original strategy logic — only fix the bug, don't redesign"""
 
 
