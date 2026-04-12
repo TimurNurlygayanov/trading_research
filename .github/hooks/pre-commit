@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# Pre-commit hook: block commits that contain obvious secrets.
+# Install: cp .github/hooks/pre-commit .git/hooks/pre-commit && chmod +x .git/hooks/pre-commit
+
+set -euo pipefail
+
+BLOCKED_PATTERNS=(
+    "sk-ant-"            # Anthropic API key
+    "eyJ"                # Supabase JWT (anon key starts with eyJ)
+    "lin_api_"           # Linear API key
+    "ak-[a-zA-Z0-9]"    # Modal token ID
+    "as-[a-zA-Z0-9]"    # Modal token secret
+    "AKIA"               # AWS access key
+    "r2\\.cloudflarestorage" # R2 credentials in URLs
+)
+
+STAGED=$(git diff --cached --name-only --diff-filter=ACM)
+
+if [ -z "$STAGED" ]; then
+    exit 0
+fi
+
+FOUND=0
+for pattern in "${BLOCKED_PATTERNS[@]}"; do
+    matches=$(git diff --cached -U0 | grep "^+" | grep -v "^+++" | grep -iE "$pattern" || true)
+    if [ -n "$matches" ]; then
+        echo "❌ SECRET DETECTED in staged changes (pattern: $pattern):"
+        echo "$matches" | head -5
+        FOUND=1
+    fi
+done
+
+# Also block .env files from being staged
+for file in $STAGED; do
+    basename=$(basename "$file")
+    if [[ "$basename" == ".env" || "$basename" == ".env."* || "$basename" == *".env" ]]; then
+        echo "❌ Blocked: attempting to commit env file: $file"
+        FOUND=1
+    fi
+done
+
+if [ "$FOUND" -eq 1 ]; then
+    echo ""
+    echo "Commit blocked. Remove secrets from staged files."
+    echo "Secrets belong in .env (local) or Render/Modal environment variables — never in git."
+    exit 1
+fi
+
+exit 0

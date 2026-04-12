@@ -1,0 +1,44 @@
+services:
+  - type: web
+    name: trading-research-orchestrator
+    runtime: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: python orchestrator/main.py
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.13.0
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_ANON_KEY
+        sync: false
+      - key: MARKET_DATA_API_KEY
+        sync: false
+      - key: R2_ACCOUNT_ID
+        sync: false
+      - key: R2_ACCESS_KEY_ID
+        sync: false
+      - key: R2_SECRET_ACCESS_KEY
+        sync: false
+      - key: R2_BUCKET_NAME
+        sync: false
+      - key: MODAL_TOKEN_ID
+        sync: false
+      - key: MODAL_TOKEN_SECRET
+        sync: false
+      - key: MAX_DAILY_SPEND_USD
+        value: "8.0"
+      - key: BACKTEST_MIN_SHARPE
+        value: "0.8"
+      - key: BACKTEST_MIN_CALMAR
+        value: "0.5"
+      - key: BACKTEST_MIN_SIGNALS_TOTAL
+        value: "100"
+      - key: BACKTEST_MIN_SIGNALS_PER_YEAR
+        value: "100"
+      - key: OOS_START_DATE
+        value: "2026-01-01"
+      - key: RESEARCH_INTERVAL_HOURS
+        value: "4"

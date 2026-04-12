@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(del \"C:/Users/Тимур/Documents/GitHub/trading_research/.gitignore.txt\")"
+    ]
+  }
+}

@@ -1,0 +1,122 @@
+"""
+Agent 2: Pre-Filter
+Evaluates strategy ideas and scores them. Score >= 6 → proceed to Implementer.
+User-submitted ideas get +2 bonus and are processed immediately.
+"""
+from __future__ import annotations
+
+import json
+import logging
+import os
+from typing import Any
+
+import anthropic
+from dotenv import load_dotenv
+
+from db import supabase_client as db
+from agents.prompts import PRE_FILTER_SYSTEM, PRE_FILTER_USER_TEMPLATE
+
+load_dotenv()
+log = logging.getLogger(__name__)
+
+MODEL = "claude-haiku-4-5-20251001"  # Light agent — use Haiku for cost efficiency
+MIN_SCORE_TO_PROCEED = 6.0
+
+
+def run_pre_filter(strategy_id: str) -> dict[str, Any]:
+    """
+    Score a strategy idea. Updates strategy status in DB.
+    Returns the parsed scoring result.
+    """
+    strategy = db.get_strategy(strategy_id)
+    if not strategy:
+        raise ValueError(f"Strategy {strategy_id} not found")
+
+    knowledge = db.get_knowledge_summary(limit=30)
+    knowledge_text = _format_knowledge(knowledge)
+
+    user_msg = PRE_FILTER_USER_TEMPLATE.format(
+        title=strategy.get("name", ""),
+        description=strategy.get("hypothesis", ""),
+        notes=strategy.get("entry_logic", ""),
+        source=strategy.get("source", ""),
+        knowledge_base_context=knowledge_text,
+    )
+
+    client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+    response = client.messages.create(
+        model=MODEL,
+        max_tokens=1024,
+        system=PRE_FILTER_SYSTEM,
+        messages=[{"role": "user", "content": user_msg}],
+    )
+
+    # Track spend
+    usage = response.usage
+    cost = _estimate_cost(MODEL, usage.input_tokens, usage.output_tokens)
+    db.log_spend("pre_filter", MODEL, usage.input_tokens, usage.output_tokens, cost, strategy_id)
+
+    # Parse response
+    raw_text = response.content[0].text.strip()
+    result = _parse_json_response(raw_text, strategy_id)
+
+    # Apply user bonus
+    if strategy.get("source") == "user":
+        result["score"] = min(10.0, result.get("score", 0) + 2.0)
+        result["score_breakdown"]["user_bonus"] = 2
+
+    score = float(result.get("score", 0))
+    verdict = result.get("verdict", "reject")
+
+    if verdict == "proceed" and score >= MIN_SCORE_TO_PROCEED:
+        new_status = "filtered"
+    elif verdict == "modify":
+        new_status = "filtered"  # Proceed with modifications noted
+    else:
+        new_status = "failed"
+
+    db.update_strategy(strategy_id, {
+        "status": new_status,
+        "pre_filter_score": score,
+        "pre_filter_notes": json.dumps(result),
+        "error_log": result.get("rejection_reason") if new_status == "failed" else None,
+    })
+
+    log.info(f"Pre-filter: strategy={strategy_id} score={score} verdict={verdict} → {new_status}")
+    return result
+
+
+def _format_knowledge(entries: list[dict]) -> str:
+    if not entries:
+        return "No knowledge base entries yet."
+    lines = []
+    for e in entries[:20]:  # Limit context
+        lines.append(
+            f"[{e['category']}] {e.get('indicator', '?')} on {e.get('timeframe', '?')} "
+            f"({e.get('asset', '?')}): {e['summary']}"
+        )
+    return "\n".join(lines)
+
+
+def _parse_json_response(text: str, strategy_id: str) -> dict:
+    # Strip markdown code blocks if present
+    if "```json" in text:
+        text = text.split("```json")[1].split("```")[0].strip()
+    elif "```" in text:
+        text = text.split("```")[1].split("```")[0].strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as e:
+        log.error(f"Failed to parse pre-filter response for {strategy_id}: {e}\nText: {text[:200]}")
+        return {"score": 0, "verdict": "reject", "rejection_reason": f"Parse error: {e}"}
+
+
+def _estimate_cost(model: str, input_tokens: int, output_tokens: int) -> float:
+    # Pricing as of early 2026 (update if needed)
+    prices = {
+        "claude-haiku-4-5-20251001": (0.00025, 0.00125),      # per 1K tokens in/out
+        "claude-sonnet-4-6": (0.003, 0.015),
+        "claude-opus-4-6": (0.015, 0.075),
+    }
+    in_price, out_price = prices.get(model, (0.003, 0.015))
+    return (input_tokens * in_price + output_tokens * out_price) / 1000

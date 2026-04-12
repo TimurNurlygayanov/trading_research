@@ -1,0 +1,54 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Environment — NEVER commit secrets
+.env
+.env.local
+.env.*
+*.env
+secrets.json
+secrets.yaml
+secrets.yml
+*_secret*
+*_secrets*
+*credentials*
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Data (keep out of git — use R2)
+data/
+*.csv
+*.parquet
+*.h5
+*.pkl
+
+# Reports
+reports/
+*.html
+
+# Modal
+.modal.toml
+
+# OS
+.DS_Store
+Thumbs.db
