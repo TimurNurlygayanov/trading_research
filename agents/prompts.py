@@ -81,7 +81,7 @@ OUTPUT FORMAT (JSON only, no other text):
 }}
 
 Threshold: score >= 6 → proceed, score 4-5 → modify (suggest improvements), score < 4 → reject.
-""".format(shared_constraints=SHARED_CONSTRAINTS)
+""".replace("{shared_constraints}", SHARED_CONSTRAINTS)
 
 
 PRE_FILTER_USER_TEMPLATE = """Evaluate this trading strategy idea:
@@ -284,7 +284,7 @@ class {{StrategyName}}Strategy(Strategy):
         if hasattr(trade, 'pl') and trade.pl < 0:
             self._daily_losses += 1
 ```
-""".format(shared_constraints=SHARED_CONSTRAINTS)
+""".replace("{shared_constraints}", SHARED_CONSTRAINTS)
 
 
 IMPLEMENTER_USER_TEMPLATE = """Implement this trading strategy:
@@ -362,7 +362,7 @@ Rules:
 - If there are logic bugs that would corrupt results: passed=false, provide corrected_code
 - If only warnings or performance issues: passed=true, document in notes, provide corrected_code with fixes
 - Be conservative: if uncertain, flag as issue and fix it
-""".format(shared_constraints=SHARED_CONSTRAINTS)
+""".replace("{shared_constraints}", SHARED_CONSTRAINTS)
 
 
 VALIDATOR_USER_TEMPLATE = """Review this strategy code for bugs and data leakage:
