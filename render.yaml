@@ -42,3 +42,5 @@ services:
         value: "2026-01-01"
       - key: RESEARCH_INTERVAL_HOURS
         value: "4"
+      - key: DATABASE_URL
+        sync: false

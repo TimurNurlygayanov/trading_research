@@ -49,7 +49,7 @@ def run_migrations() -> list[str]:
     try:
         conn = _get_conn()
     except Exception as exc:
-        log.error("migration_db_connect_failed", error=str(exc))
+        log.error("migration_db_connect_failed: %s", exc)
         # Don't crash the server over a missing DATABASE_URL — just skip.
         # Migrations can still be run manually via the Supabase SQL editor.
         return []
@@ -92,7 +92,7 @@ def run_migrations() -> list[str]:
                     log.info("migration_applied", file=path.name)
 
     except Exception as exc:
-        log.error("migration_failed", error=str(exc))
+        log.error("migration_failed: %s", exc)
         raise
     finally:
         conn.close()
