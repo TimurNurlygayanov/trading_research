@@ -155,6 +155,39 @@ def api_stats() -> JSONResponse:
     })
 
 
+@app.post("/api/strategy/{strategy_id}/restart")
+def api_restart_strategy(strategy_id: str, background_tasks: BackgroundTasks) -> JSONResponse:
+    """
+    Force-redispatch a stuck in-progress strategy to Modal.
+    Works for: implemented, backtesting, validating.
+      implemented / backtesting → reset to implemented → redispatch backtest job
+      validating                → redispatch validator job (keep status)
+    """
+    try:
+        from orchestrator.queue_worker import _dispatch_backtest_job, _dispatch_validator_job
+        strategy = db.get_strategy(strategy_id)
+        if not strategy:
+            return JSONResponse({"error": "not found"}, status_code=404)
+
+        status = strategy.get("status")
+        if status in ("implemented", "backtesting"):
+            db.update_strategy(strategy_id, {"status": "implemented", "error_log": None})
+            background_tasks.add_task(_dispatch_backtest_job, strategy_id)
+            log.info("strategy_restarted_backtest", strategy_id=strategy_id)
+            return JSONResponse({"ok": True, "dispatched_to": "backtest"})
+        elif status == "validating":
+            background_tasks.add_task(_dispatch_validator_job, strategy_id)
+            log.info("strategy_restarted_validator", strategy_id=strategy_id)
+            return JSONResponse({"ok": True, "dispatched_to": "validator"})
+        else:
+            return JSONResponse(
+                {"error": f"restart only available for implemented/backtesting/validating (current: {status})"},
+                status_code=400,
+            )
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
 @app.post("/api/strategy/{strategy_id}/retry")
 def api_retry_strategy(strategy_id: str, background_tasks: BackgroundTasks) -> JSONResponse:
     """
@@ -747,6 +780,25 @@ function renderPanel(s) {
     </div>`;
   }
 
+  let codeHtml = '';
+  if (s.backtest_code) {
+    codeHtml = `<div class="panel-section">
+      <details>
+        <summary style="cursor:pointer;font-size:.72rem;font-weight:600;text-transform:uppercase;
+                        letter-spacing:.07em;color:#475569;list-style:none;display:flex;
+                        align-items:center;gap:6px;user-select:none"
+                 onclick="this.parentElement.open ? this.querySelector('.arr').textContent='▶' : this.querySelector('.arr').textContent='▼'">
+          <span class="arr" style="font-size:.9rem">▶</span> Strategy Source Code
+          <span style="font-size:.68rem;color:#374151;font-weight:400;text-transform:none;letter-spacing:0;margin-left:4px">(${s.backtest_code.split('\n').length} lines)</span>
+        </summary>
+        <pre style="margin-top:8px;background:#0a0f1a;border:1px solid #1e2d3d;border-radius:8px;
+                    padding:14px;font-size:.75rem;color:#7dd3fc;overflow-x:auto;
+                    max-height:500px;overflow-y:auto;line-height:1.55;
+                    font-family:'SF Mono','Fira Code',monospace">${esc(s.backtest_code)}</pre>
+      </details>
+    </div>`;
+  }
+
   let errHtml = '';
   if (s.error_log) {
     errHtml = `<div class="panel-section"><h3>Error Log</h3>
@@ -775,11 +827,17 @@ function renderPanel(s) {
           id="modal-check-btn-${s.id}">
           ↻ Check status
         </button>
+        <button onclick="restartStrategy('${s.id}')"
+          style="background:#7c3aed;border:none;border-radius:8px;
+                 color:#fff;padding:6px 14px;font-size:.8rem;font-weight:600;cursor:pointer"
+          id="modal-restart-btn-${s.id}">
+          ⟳ Restart job
+        </button>
         <a href="https://modal.com/apps" target="_blank"
           style="background:#1e2533;border:1px solid #374151;border-radius:8px;
                  color:#64748b;padding:6px 14px;font-size:.8rem;text-decoration:none;
                  display:inline-block">
-          ↗ Open Modal Dashboard
+          ↗ Modal Dashboard
         </a>
       </div>
       <div id="modal-status-result-${s.id}" style="margin-top:10px;font-size:.8rem;color:#64748b"></div>
@@ -893,7 +951,7 @@ function renderPanel(s) {
       </div>
     </div>
 
-    ${modalHtml}${actionsHtml}${wfHtml}${paramsHtml}${errHtml}${reportHtml}
+    ${modalHtml}${actionsHtml}${wfHtml}${paramsHtml}${codeHtml}${errHtml}${reportHtml}
     <div class="panel-section" style="border-top:1px solid #1f2937;padding-top:16px;margin-top:4px">
       <h3>Comments</h3>
       <div id="comments-list-${s.id}" style="margin-bottom:10px">
@@ -1046,6 +1104,32 @@ async function deleteStrategy(id, name) {
   const data = await r.json();
   if (data.ok) { closePanel(); loadAll(); }
   else alert('Delete failed: ' + (data.error || 'unknown error'));
+}
+
+async function restartStrategy(id) {
+  const btn = document.getElementById(`modal-restart-btn-${id}`);
+  const out = document.getElementById(`modal-status-result-${id}`);
+  btn.disabled = true;
+  btn.textContent = 'Restarting…';
+  try {
+    const r = await fetch(`/api/strategy/${id}/restart`, {method: 'POST'});
+    const d = await r.json();
+    if (d.ok) {
+      out.style.color = '#a78bfa';
+      out.textContent = `⟳ Redispatched to ${d.dispatched_to} job. Refreshing…`;
+      setTimeout(() => { loadAll(); openPanel(id); }, 2000);
+    } else {
+      out.style.color = '#f87171';
+      out.textContent = '✗ ' + (d.error || 'Error');
+      btn.disabled = false;
+      btn.textContent = '⟳ Restart job';
+    }
+  } catch(e) {
+    out.style.color = '#f87171';
+    out.textContent = 'Network error.';
+    btn.disabled = false;
+    btn.textContent = '⟳ Restart job';
+  }
 }
 
 async function retryStrategy(id) {
