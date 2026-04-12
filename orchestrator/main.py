@@ -1804,6 +1804,20 @@ _DATA_HTML = r"""<!DOCTYPE html>
                        border-radius: 8px; color: #fff; font-size: 0.82rem;
                        font-weight: 600; padding: 7px 16px; cursor: pointer; }
 
+  .coverage-section { padding: 12px 18px; border-top: 1px solid #1f2937; }
+  .coverage-label { font-size: 0.68rem; text-transform: uppercase; letter-spacing: .06em;
+                    color: #475569; margin-bottom: 8px; }
+  .coverage-bars { display: flex; gap: 3px; align-items: flex-end; height: 36px; }
+  .cbar { flex: 1; border-radius: 2px 2px 0 0; min-width: 4px; position: relative;
+          cursor: default; }
+  .cbar:hover::after { content: attr(data-tip); position: absolute; bottom: 100%;
+    left: 50%; transform: translateX(-50%); background: #1e2533; border: 1px solid #374151;
+    border-radius: 6px; padding: 4px 8px; font-size: .7rem; white-space: nowrap;
+    color: #e2e8f0; z-index: 10; pointer-events: none; margin-bottom: 4px; }
+  .year-labels { display: flex; gap: 3px; margin-top: 3px; }
+  .year-label  { flex: 1; font-size: 0.6rem; color: #374151; text-align: center;
+                 overflow: hidden; min-width: 4px; }
+
   .loading { text-align: center; padding: 80px 0; color: #475569; }
 </style>
 </head>
@@ -1893,6 +1907,24 @@ function renderCard(ds) {
   const sizeMb = meta.file_size_mb ? meta.file_size_mb.toFixed(1) + ' MB' : '—';
   const compl  = meta.completeness_pct != null ? meta.completeness_pct.toFixed(1) + '%' : '—';
   const complCls = meta.completeness_pct >= 90 ? 'good' : meta.completeness_pct >= 70 ? 'warn' : 'bad';
+
+  // Warn if actual start date is more than 60 days later than expected
+  let startWarn = '';
+  if (meta.expected_start && meta.first_date) {
+    const expectedMs = new Date(meta.expected_start).getTime();
+    const actualMs   = new Date(meta.first_date).getTime();
+    const driftDays  = Math.round((actualMs - expectedMs) / 86400000);
+    if (driftDays > 60) {
+      startWarn = `<div style="background:#1a1500;border:1px solid #3b2f00;border-radius:8px;
+                               padding:8px 12px;font-size:.78rem;color:#fcd34d;margin:0 18px 12px">
+        ⚠ Expected data from <b>${meta.expected_start}</b> but earliest bar is <b>${first}</b>
+        (${driftDays} days gap). API may not have full history at this timeframe.
+        <button onclick="preloadOne('${meta.symbol}','${meta.timeframe}',this)"
+          style="margin-left:10px;background:#3b2f00;border:1px solid #fbbf24;border-radius:6px;
+                 color:#fcd34d;font-size:.75rem;padding:3px 10px;cursor:pointer">↻ Retry fetch</button>
+      </div>`;
+    }
+  }
   const mean   = meta.price_mean ? meta.price_mean.toFixed(5) : '—';
   const vol    = meta.avg_volume ? meta.avg_volume.toFixed(2) : '—';
   const cachedTs = meta.cached_at ? meta.cached_at.slice(0,16).replace('T',' ') + ' UTC' : '—';
@@ -1906,6 +1938,7 @@ function renderCard(ds) {
     <div class="chart-area">
       <canvas class="price-chart" id="chart-${key}" width="700" height="80"></canvas>
     </div>
+    ${startWarn}
     <div class="ds-stats">
       <div class="stat"><div class="stat-label">Bars</div><div class="stat-val">${bars}</div></div>
       <div class="stat"><div class="stat-label">Size</div><div class="stat-val">${sizeMb}</div></div>
@@ -1918,10 +1951,43 @@ function renderCard(ds) {
       <div class="stat"><div class="stat-label">Std Dev</div><div class="stat-val">${meta.price_std ? meta.price_std.toFixed(5) : '—'}</div></div>
       <div class="stat"><div class="stat-label">Avg Volume</div><div class="stat-val">${vol}</div></div>
     </div>
+    ${renderCoverage(meta.bars_by_year, meta.bar_count, ds.timeframe)}
     <div class="ds-footer">
       <span class="cached-ts">Cached: ${cachedTs}</span>
       <button class="btn-refresh" onclick="preloadOne('${ds.symbol}','${ds.timeframe}',this)">↻ Refresh</button>
     </div>
+  </div>`;
+}
+
+// Expected bars per year per timeframe for FX (5 trading days × 52 weeks × bars_per_day)
+const EXPECTED_PER_YEAR = {'1m': 374400, '5m': 74880, '1h': 6240, '4h': 1560, '1d': 260};
+
+function renderCoverage(barsByYear, totalBars, timeframe) {
+  if (!barsByYear || typeof barsByYear !== 'object') return '';
+  const years = Object.keys(barsByYear).sort();
+  if (!years.length) return '';
+
+  const expected = EXPECTED_PER_YEAR[timeframe] || 6240;
+  const maxBars  = Math.max(...Object.values(barsByYear), expected * 0.1);
+
+  const cbars = years.map(y => {
+    const n    = barsByYear[y];
+    const pct  = Math.min(n / expected * 100, 100);
+    const h    = Math.max(Math.round((n / maxBars) * 32), 2);
+    const col  = pct >= 70 ? '#22d3ee' : pct >= 30 ? '#fbbf24' : '#f87171';
+    const tip  = `${y}: ${n.toLocaleString()} bars (${pct.toFixed(0)}% of expected)`;
+    return `<div class="cbar" style="height:${h}px;background:${col}" data-tip="${tip}"></div>`;
+  }).join('');
+
+  const labels = years.map(y =>
+    `<div class="year-label">${y.slice(2)}</div>`
+  ).join('');
+
+  return `
+  <div class="coverage-section">
+    <div class="coverage-label">Data coverage by year</div>
+    <div class="coverage-bars">${cbars}</div>
+    <div class="year-labels">${labels}</div>
   </div>`;
 }
 

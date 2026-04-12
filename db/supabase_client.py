@@ -176,7 +176,7 @@ def get_data_cache(symbol: str | None = None) -> list[dict[str, Any]]:
     q = sb.table("data_cache").select(
         "symbol, timeframe, bar_count, first_date, last_date, "
         "file_size_mb, price_min, price_max, price_mean, price_std, "
-        "avg_volume, completeness_pct, cached_at"
+        "avg_volume, completeness_pct, bars_by_year, expected_start, cached_at"
     ).order("symbol").order("timeframe")
     if symbol:
         q = q.eq("symbol", symbol)

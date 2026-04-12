@@ -16,6 +16,7 @@ CREATE TABLE IF NOT EXISTS data_cache (
     price_std        float,
     avg_volume       float,
     completeness_pct float,
+    bars_by_year     jsonb,
     recent_bars      jsonb,
     cached_at        timestamptz  NOT NULL DEFAULT now(),
     UNIQUE (symbol, timeframe)

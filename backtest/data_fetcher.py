@@ -112,18 +112,31 @@ def fetch_ohlcv(
 
     client = RESTClient(api_key=api_key)
 
-    # Massive/Polygon returns at most 50,000 bars per call.
-    # For long date ranges on minute data we need to paginate by year.
+    # Massive/Polygon returns at most 50,000 bars per API call.
+    # We chunk the date range so each chunk stays well under that limit.
+    # Safe chunk sizes (targeting ~30k bars max per call):
+    #   1m  → 20 days  (1m × 1440/day × 20 = 28,800)
+    #   5m  → 100 days (5m ×  288/day × 100 = 28,800)
+    #   1h  → 365 days (1h ×   24/day × 365 =  8,760)
+    #   4h+ → 365 days
+    _BARS_PER_DAY = {
+        "minute": multiplier * 1440,  # e.g. 1m=1440, 5m=288
+        "hour":   multiplier * 24,
+        "day":    multiplier,
+    }
+    bars_per_day = _BARS_PER_DAY.get(timespan, 24)
+    # Keep each chunk under 30k bars; minimum 1 day, maximum 365 days
+    chunk_days = max(1, min(365, 30_000 // max(bars_per_day, 1)))
+
     all_bars: list[dict] = []
 
     start_dt = date.fromisoformat(start)
     end_dt = date.fromisoformat(end)
 
-    # Chunk into 1-year windows to avoid hitting the 50k bar limit
     chunk_start = start_dt
     while chunk_start <= end_dt:
         chunk_end = min(
-            date(chunk_start.year, 12, 31),
+            chunk_start + timedelta(days=chunk_days - 1),
             end_dt,
         )
 
@@ -154,9 +167,7 @@ def fetch_ohlcv(
                 "Volume": float(bar.volume) if bar.volume is not None else 0.0,
             })
 
-        chunk_start = date(chunk_end.year + (1 if chunk_end.month == 12 else 0),
-                           1 if chunk_end.month == 12 else chunk_end.month + 1,
-                           1)
+        chunk_start = chunk_end + timedelta(days=1)
 
     if not all_bars:
         raise ValueError(

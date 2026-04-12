@@ -115,6 +115,13 @@ def preload_ohlcv_data(
                     if expected:
                         completeness_pct = min(round(bar_count / expected * 100, 1), 100.0)
 
+                # Bars-per-year breakdown — shows which years have good data coverage
+                bars_by_year: dict = {}
+                for ts in df.index:
+                    y = str(ts.year)
+                    bars_by_year[y] = bars_by_year.get(y, 0) + 1
+                print(f"[preload] {key} coverage by year: {bars_by_year}")
+
                 # Recent 500 bars for chart display
                 recent = df.tail(500)
                 recent_bars = [
@@ -135,6 +142,7 @@ def preload_ohlcv_data(
                     "bar_count":        bar_count,
                     "first_date":       first_date,
                     "last_date":        last_date,
+                    "expected_start":   start_date,
                     "file_size_mb":     file_size_mb,
                     "price_min":        round(float(df["Close"].min()), 5),
                     "price_max":        round(float(df["Close"].max()), 5),
@@ -142,6 +150,7 @@ def preload_ohlcv_data(
                     "price_std":        round(float(df["Close"].std()),  5),
                     "avg_volume":       round(float(df["Volume"].mean()), 2),
                     "completeness_pct": completeness_pct,
+                    "bars_by_year":     bars_by_year,
                     "recent_bars":      recent_bars,
                 })
 
