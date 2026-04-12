@@ -191,28 +191,33 @@ def _process_filtered_strategies() -> int:
 
 def _process_implemented_strategies() -> int:
     """
-    Check strategies that have been submitted to Modal for backtesting.
-    Strategies in "backtesting" status are being processed by Modal.
-    Strategies that Modal has moved to "validating" are dispatched to the
-    Modal validator job.
-    Returns number of strategies acted on.
+    Two sub-steps:
+      1. Dispatch "implemented" strategies to Modal backtest job.
+         (Covers both fresh implementations and retries reset to "implemented".)
+      2. Dispatch "validating" strategies (backtest done) to Modal validator job.
+    Returns total number of strategies dispatched.
     """
-    validating = db.get_strategies_by_status("validating", limit=10)
-    if not validating:
-        return 0
-
     dispatched = 0
+
+    # Step 1: implemented → Modal backtest
+    implemented = db.get_strategies_by_status("implemented", limit=5)
+    for strategy in implemented:
+        strategy_id = strategy.get("id")
+        try:
+            _dispatch_backtest_job(strategy_id)
+            dispatched += 1
+        except Exception as exc:
+            log.error("backtest_dispatch_failed", strategy_id=strategy_id, error=str(exc))
+
+    # Step 2: validating → Modal validator
+    validating = db.get_strategies_by_status("validating", limit=10)
     for strategy in validating:
         strategy_id = strategy.get("id")
         try:
             _dispatch_validator_job(strategy_id)
             dispatched += 1
         except Exception as exc:
-            log.error(
-                "validator_dispatch_failed",
-                strategy_id=strategy_id,
-                error=str(exc),
-            )
+            log.error("validator_dispatch_failed", strategy_id=strategy_id, error=str(exc))
 
     return dispatched
 

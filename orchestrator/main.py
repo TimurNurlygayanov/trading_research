@@ -209,6 +209,28 @@ async def api_update_strategy(strategy_id: str, request: Request,
         return JSONResponse({"error": str(exc)}, status_code=500)
 
 
+@app.delete("/api/strategy/{strategy_id}")
+def api_delete_strategy(strategy_id: str) -> JSONResponse:
+    try:
+        sb = db.get_client()
+        sb.table("strategies").delete().eq("id", strategy_id).execute()
+        log.info("strategy_deleted", strategy_id=strategy_id)
+        return JSONResponse({"ok": True})
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+@app.post("/api/strategy/{strategy_id}/tags")
+async def api_update_tags(strategy_id: str, request: Request) -> JSONResponse:
+    try:
+        body = await request.json()
+        tags = [t.strip() for t in body.get("tags", []) if t.strip()]
+        db.update_strategy(strategy_id, {"tags": tags})
+        return JSONResponse({"ok": True, "tags": tags})
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
 @app.get("/api/strategies")
 def api_strategies(
     status: str = Query("all"),
@@ -224,7 +246,7 @@ def api_strategies(
             "signals_per_year, total_signals, leakage_score, profit_factor, "
             "oos_sharpe, oos_win_rate, oos_total_trades, monte_carlo_pvalue, "
             "walk_forward_scores, hypothesis, hyperparams, best_session_hours, "
-            "error_log, report_url, created_at, updated_at"
+            "error_log, report_url, tags, created_at, updated_at"
         )
         if status != "all":
             q = q.eq("status", status)
@@ -356,6 +378,7 @@ _DASHBOARD_HTML = r"""<!DOCTYPE html>
                font-size: 0.78rem; color: #a5b4fc; overflow-x: auto; }
   .empty { text-align: center; padding: 60px 0; color: #475569; font-size: 0.9rem; }
   .loading { text-align: center; padding: 40px 0; color: #475569; }
+  .tag-pill { background:#1e293b;border-radius:99px;padding:3px 10px;font-size:.75rem;color:#93c5fd; }
 </style>
 </head>
 <body>
@@ -388,6 +411,7 @@ _DASHBOARD_HTML = r"""<!DOCTYPE html>
         <tr>
           <th>Strategy</th>
           <th>Status</th>
+          <th>Tags</th>
           <th>Sharpe</th>
           <th>OOS Sharpe</th>
           <th>Drawdown</th>
@@ -397,7 +421,7 @@ _DASHBOARD_HTML = r"""<!DOCTYPE html>
           <th>Updated</th>
         </tr>
       </thead>
-      <tbody id="tbody"><tr><td colspan="9" class="loading">Loading…</td></tr></tbody>
+      <tbody id="tbody"><tr><td colspan="10" class="loading">Loading…</td></tr></tbody>
     </table>
   </div>
 </div>
@@ -459,7 +483,7 @@ function switchTab(s) {
 function renderTable(rows) {
   const tbody = document.getElementById('tbody');
   if (!rows.length) {
-    tbody.innerHTML = '<tr><td colspan="9" class="empty">No strategies yet in this status.</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="10" class="empty">No strategies yet in this status.</td></tr>';
     return;
   }
   tbody.innerHTML = rows.map(r => {
@@ -474,9 +498,14 @@ function renderTable(rows) {
     const oosCls    = r.oos_sharpe > 0.8 ? 'pos' : r.oos_sharpe > 0 ? 'neu' : 'neg';
     const updated   = r.updated_at ? r.updated_at.slice(0,16).replace('T',' ') : '—';
     const badgeCls  = 's-' + (r.status || 'idea').replace(/_/g,'-');
+    const tagsHtml  = (r.tags || []).map(t =>
+      `<span style="background:#1e293b;border-radius:99px;padding:1px 8px;font-size:.7rem;
+                    color:#93c5fd;margin-right:3px;white-space:nowrap">${esc(t)}</span>`
+    ).join('');
     return `<tr class="data-row" onclick="openPanel('${r.id}')">
-      <td style="max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(r.name)}">${esc(r.name)}</td>
+      <td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(r.name)}">${esc(r.name)}</td>
       <td><span class="badge ${badgeCls}">${r.status}</span></td>
+      <td style="max-width:140px">${tagsHtml || '<span style="color:#374151">—</span>'}</td>
       <td class="metric ${sharpeCls}">${sharpe}</td>
       <td class="metric ${oosCls}">${oosSharpe}</td>
       <td class="metric">${dd}</td>
@@ -640,13 +669,63 @@ function renderPanel(s) {
       </div>
     </div>
 
-    ${actionsHtml}${wfHtml}${paramsHtml}${errHtml}${reportHtml}`;
+    ${actionsHtml}${wfHtml}${paramsHtml}${errHtml}${reportHtml}
+    <div class="panel-section" style="border-top:1px solid #1f2937;padding-top:16px;margin-top:4px">
+      <h3>Tags</h3>
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:10px" id="tag-display-${s.id}">
+        ${(s.tags||[]).map(t=>`<span class="tag-pill">${esc(t)}</span>`).join('')}
+        ${!(s.tags||[]).length ? '<span style="color:#475569;font-size:.8rem">No tags yet</span>' : ''}
+      </div>
+      <div style="display:flex;gap:8px">
+        <input id="tag-input-${s.id}" type="text" placeholder="Add tags (comma separated)"
+          value="${esc((s.tags||[]).join(', '))}"
+          style="flex:1;background:#0f1623;border:1px solid #374151;border-radius:8px;
+                 color:#f1f5f9;padding:7px 12px;font-size:.85rem;outline:none">
+        <button onclick="saveTags('${s.id}')"
+          style="background:#1e2533;border:1px solid #374151;border-radius:8px;
+                 color:#94a3b8;padding:7px 14px;font-size:.82rem;cursor:pointer;white-space:nowrap">
+          Save tags
+        </button>
+      </div>
+    </div>
+    <div style="padding-top:12px;text-align:right">
+      <button onclick="deleteStrategy('${s.id}', '${esc(s.name)}')"
+        style="background:none;border:1px solid #7f1d1d;border-radius:8px;color:#f87171;
+               padding:7px 16px;font-size:.82rem;cursor:pointer">
+        Delete strategy
+      </button>
+    </div>`;
 }
 
 function fmtNum(v) { return v != null ? parseFloat(v).toFixed(3) : '—'; }
 function esc(s) {
   if (!s) return '';
   return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+async function saveTags(id) {
+  const raw = document.getElementById(`tag-input-${id}`).value;
+  const tags = raw.split(',').map(t=>t.trim()).filter(Boolean);
+  const r = await fetch(`/api/strategy/${id}/tags`, {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({tags}),
+  });
+  const data = await r.json();
+  if (data.ok) {
+    const disp = document.getElementById(`tag-display-${id}`);
+    disp.innerHTML = tags.length
+      ? tags.map(t=>`<span class="tag-pill">${esc(t)}</span>`).join('')
+      : '<span style="color:#475569;font-size:.8rem">No tags yet</span>';
+    loadAll(); // refresh table
+  }
+}
+
+async function deleteStrategy(id, name) {
+  if (!confirm(`Delete "${name}"?\nThis cannot be undone.`)) return;
+  const r = await fetch(`/api/strategy/${id}`, {method:'DELETE'});
+  const data = await r.json();
+  if (data.ok) { closePanel(); loadAll(); }
+  else alert('Delete failed: ' + (data.error || 'unknown error'));
 }
 
 async function retryStrategy(id) {
