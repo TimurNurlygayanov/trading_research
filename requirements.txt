@@ -6,14 +6,13 @@ python-dotenv==1.0.1
 # Data
 pandas==2.2.3
 pandas_ta
-numpy==2.1.3
+numpy
 requests==2.32.3
 httpx==0.27.2
-massive>=1.0.0          # Polygon.io Python client rebranded — pip install -U massive
+massive>=1.0.0
 
 # Backtesting
 backtesting==0.3.3
-vectorbt==0.26.2
 
 # Optimization
 optuna==3.6.1
@@ -24,18 +23,16 @@ xgboost==2.1.1
 fastapi==0.115.0
 uvicorn[standard]==0.32.0
 jinja2==3.1.4
-python-multipart==0.0.12   # required for FastAPI form parsing
+python-multipart==0.0.12
 
 # Scheduling & async
 apscheduler==3.10.4
-asyncio-throttle==1.0.2
 
 # Modal (cloud compute)
 modal==0.64.0
 
 # Storage
 boto3==1.35.0
-cloudpathlib[s3]==0.19.0
 
 # Stats
 scipy==1.14.1
