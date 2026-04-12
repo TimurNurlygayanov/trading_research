@@ -624,7 +624,7 @@ _DASHBOARD_HTML = r"""<!DOCTYPE html>
   <a href="/ideas">Ideas</a>
   <a href="/research">Research</a>
   <a href="/data">Data</a>
-  <a href="/health">Health</a>
+
   <div class="nav-right">
     <div class="budget-pill">Today: <span id="spend">…</span> / <span id="limit">$8.00</span></div>
     <button class="refresh-btn" onclick="loadAll()">↻ Refresh</button>
@@ -1331,7 +1331,7 @@ button[type=submit] {
   <a href="/ideas" class="active">Ideas</a>
   <a href="/research">Research</a>
   <a href="/data">Data</a>
-  <a href="/health">Health</a>
+
 </nav>
 
 <div class="page">
@@ -1549,7 +1549,7 @@ _RESEARCH_HTML = r"""<!DOCTYPE html>
   <a href="/ideas">Ideas</a>
   <a href="/research" class="active">Research</a>
   <a href="/data">Data</a>
-  <a href="/health">Health</a>
+
   <div class="nav-right">
     <button class="refresh-btn" id="refresh-btn" onclick="triggerRefresh()">
       + Fetch new papers
@@ -1844,7 +1844,7 @@ _DATA_HTML = r"""<!DOCTYPE html>
   <a href="/ideas">Ideas</a>
   <a href="/research">Research</a>
   <a href="/data" class="active">Data</a>
-  <a href="/health">Health</a>
+
   <div class="nav-right">
     <button class="btn-primary" id="preload-btn" onclick="preloadAll()">
       ↓ Preload all data
