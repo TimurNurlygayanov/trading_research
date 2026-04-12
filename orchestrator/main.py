@@ -141,7 +141,7 @@ def api_strategy_detail(strategy_id: str) -> JSONResponse:
 # Dashboard UI
 # ---------------------------------------------------------------------------
 
-_DASHBOARD_HTML = """<!DOCTYPE html>
+_DASHBOARD_HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
@@ -672,7 +672,7 @@ def _render_ideas_page(flash: str = "", flash_type: str = "") -> str:
     except Exception:
         pass
 
-    return _IDEAS_HTML.format(flash=flash_html, ideas_section=ideas_html)
+    return _IDEAS_HTML.replace("{flash}", flash_html).replace("{ideas_section}", ideas_html)
 
 
 @app.get("/ideas", response_class=HTMLResponse)
