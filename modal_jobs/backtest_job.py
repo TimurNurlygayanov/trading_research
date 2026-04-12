@@ -25,7 +25,7 @@ app = modal.App("trading-research-backtest")
 image = (
     modal.Image.debian_slim(python_version="3.13")
     .pip_install(
-        "pandas==2.2.3",
+        "pandas>=2.3.2",
         "pandas_ta==0.4.71b0",
         "numpy",
         "backtesting==0.3.3",

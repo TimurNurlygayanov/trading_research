@@ -213,8 +213,10 @@ async def api_update_strategy(strategy_id: str, request: Request,
 def api_delete_strategy(strategy_id: str) -> JSONResponse:
     try:
         sb = db.get_client()
-        # Clear FK reference in user_ideas before deleting
+        # Clear all FK references before deleting
         sb.table("user_ideas").update({"strategy_id": None}).eq("strategy_id", strategy_id).execute()
+        sb.table("spend_log").delete().eq("strategy_id", strategy_id).execute()
+        sb.table("knowledge_base").delete().eq("strategy_id", strategy_id).execute()
         sb.table("strategies").delete().eq("id", strategy_id).execute()
         log.info("strategy_deleted", strategy_id=strategy_id)
         return JSONResponse({"ok": True})

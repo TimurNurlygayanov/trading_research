@@ -32,7 +32,7 @@ def _dispatch_backtest_job(strategy_id: str) -> None:
     """
     try:
         import modal
-        fn = modal.Function.lookup("trading-research-backtest", "run_backtest_pipeline")
+        fn = modal.Function.from_name("trading-research-backtest", "run_backtest_pipeline")
         fn.spawn(strategy_id)
         log.info("modal_backtest_dispatched", strategy_id=strategy_id)
     except ImportError:
@@ -53,7 +53,7 @@ def _dispatch_validator_job(strategy_id: str) -> None:
     """
     try:
         import modal
-        fn = modal.Function.lookup("trading-research-validator", "run_validator_pipeline")
+        fn = modal.Function.from_name("trading-research-validator", "run_validator_pipeline")
         fn.spawn(strategy_id)
         log.info("modal_validator_dispatched", strategy_id=strategy_id)
     except ImportError:
