@@ -56,22 +56,25 @@ CACHE_DIR = "/ohlcv_cache"
 @app.function(
     image=image,
     cpu=2,
-    memory=4096,
-    timeout=300,  # 5 minutes — just one run, no optimization
+    memory=8192,
+    timeout=900,  # 15 minutes — tests all timeframes sequentially
     secrets=[modal.Secret.from_name("trading-research-secrets")],
     volumes={CACHE_DIR: ohlcv_cache},
 )
 def run_quick_backtest(strategy_id: str) -> dict:
     """
-    Quick backtest: run strategy code with default class-level params, no optimization.
-    Goal: confirm the strategy logic works and get a first read on results in ~2 min.
-    Stores quick_test_* metrics and sets status to 'quick_tested'.
-    The full optimization pipeline runs separately after this.
+    Multi-timeframe quick test: run strategy with default params on every standard timeframe
+    and pick the best one. Goal: don't discard a good strategy just because it was tested
+    on the wrong timeframe. Stores best_timeframe + quick_test_* metrics, sets 'quick_tested'.
     """
     import os
     import traceback
     import pandas as pd
     from backtesting import Strategy
+
+    # Test all standard timeframes — ordered fastest→slowest so partial results
+    # are useful if the job times out near the end.
+    QUICK_TEST_TIMEFRAMES = ["4h", "1h", "15m", "5m", "1m"]
 
     try:
         from db import supabase_client as db
@@ -94,16 +97,10 @@ def run_quick_backtest(strategy_id: str) -> dict:
             symbols = [symbols]
         symbol = symbols[0] if symbols else "EURUSD"
 
-        timeframes = (
-            indicators_meta.get("timeframes")
-            or strategy.get("timeframes")
-            or ["1h"]
-        )
-        primary_tf = timeframes[0] if isinstance(timeframes, list) and timeframes else "1h"
-
         db.update_strategy(strategy_id, {"status": "quick_testing"})
         add_pipeline_note(strategy_id,
-            f"Quick test started — {symbol} {primary_tf}, default params, no optimization.")
+            f"Quick test started — {symbol}, testing all timeframes: "
+            f"{QUICK_TEST_TIMEFRAMES}, default params, no optimization.")
 
         # Leakage check (fast, before any data work)
         leakage_result = check_leakage(code)
@@ -123,22 +120,7 @@ def run_quick_backtest(strategy_id: str) -> dict:
             return {"passed": False, "reason": "leakage_check_failed",
                     "issues": leakage_result.issues}
 
-        # Load data (from cache if available)
-        cache_file = f"{CACHE_DIR}/{symbol}_{primary_tf}.parquet"
-        if os.path.exists(cache_file):
-            df = pd.read_parquet(cache_file)
-            add_pipeline_note(strategy_id,
-                f"Data loaded from cache ({len(df)} bars).")
-        else:
-            df = fetch_ohlcv(symbol, primary_tf, start="2015-01-01", end="2026-12-31")
-            os.makedirs(CACHE_DIR, exist_ok=True)
-            df.to_parquet(cache_file)
-            ohlcv_cache.commit()
-            add_pipeline_note(strategy_id,
-                f"Data downloaded and cached ({len(df)} bars).")
-        train_df, _ = split_train_oos(df)
-
-        # Execute the strategy class
+        # Execute the strategy class once (shared across all timeframe runs)
         namespace: dict = {}
         exec(compile(code, "<strategy>", "exec"), namespace)
         strategy_classes = {
@@ -153,48 +135,121 @@ def run_quick_backtest(strategy_id: str) -> dict:
         else:
             strategy_class = next(iter(strategy_classes.values()))
 
-        # Run with default class-level params — no optimization, enforce_gates=False
-        # so we see actual metrics even if they don't pass quality gates yet.
-        # generate_html=True produces an interactive Bokeh equity-curve report.
-        result = run_backtest(strategy_class, train_df, params={},
-                              enforce_gates=False, generate_html=True)
+        # ── Run backtest on each timeframe ────────────────────────────────────
+        tf_results: dict = {}   # tf -> metrics dict
+        cache_committed = False
 
-        # Save quick test results and advance pipeline regardless of metric quality.
-        # The full optimization may find much better params.
+        for tf in QUICK_TEST_TIMEFRAMES:
+            try:
+                cache_file = f"{CACHE_DIR}/{symbol}_{tf}.parquet"
+                if os.path.exists(cache_file):
+                    df = pd.read_parquet(cache_file)
+                else:
+                    df = fetch_ohlcv(symbol, tf, start="2015-01-01", end="2026-12-31")
+                    os.makedirs(CACHE_DIR, exist_ok=True)
+                    df.to_parquet(cache_file)
+                    cache_committed = False  # will commit after all downloads
+
+                train_df, _ = split_train_oos(df)
+                result = run_backtest(strategy_class, train_df, params={},
+                                      enforce_gates=False)
+
+                tf_results[tf] = {
+                    "sharpe":          round(result.sharpe, 4),
+                    "equity_sharpe":   round(result.equity_sharpe, 4),
+                    "trades":          result.total_trades,
+                    "win_rate":        round(result.win_rate, 4),
+                    "drawdown":        round(result.max_drawdown, 4),
+                    "profit_factor":   round(result.profit_factor, 3),
+                    "signals_per_year": round(result.signals_per_year, 1),
+                    "bars":            len(train_df),
+                }
+            except Exception as tf_err:
+                tf_results[tf] = {"error": str(tf_err)[:200], "sharpe": -999.0}
+
+        if not cache_committed:
+            try:
+                ohlcv_cache.commit()
+            except Exception:
+                pass
+
+        # ── Pick the best timeframe ───────────────────────────────────────────
+        # Require at least 10 trades to be considered valid; prefer by Sharpe.
+        valid = {tf: m for tf, m in tf_results.items()
+                 if "error" not in m and m.get("trades", 0) >= 10}
+        if valid:
+            best_tf = max(valid, key=lambda tf: valid[tf]["sharpe"])
+        else:
+            # No valid timeframe — pick whichever had the most trades (even if 0)
+            best_tf = max(
+                (tf for tf in tf_results if "error" not in tf_results[tf]),
+                key=lambda tf: tf_results[tf].get("trades", 0),
+                default=QUICK_TEST_TIMEFRAMES[1],  # fallback: 1h
+            )
+
+        best = tf_results.get(best_tf, {})
+
+        # Build a compact one-line summary per timeframe for the pipeline note
+        tf_lines = []
+        for tf in QUICK_TEST_TIMEFRAMES:
+            m = tf_results.get(tf, {})
+            if "error" in m:
+                tf_lines.append(f"  {tf:>4s}: ERROR — {m['error'][:60]}")
+            else:
+                marker = " ◀ best" if tf == best_tf else ""
+                tf_lines.append(
+                    f"  {tf:>4s}: Sharpe={m['sharpe']:+.4f}  "
+                    f"trades={m['trades']}  win={m['win_rate']:.0%}  "
+                    f"dd={m['drawdown']:.1%}{marker}"
+                )
+
+        add_pipeline_note(strategy_id,
+            f"Multi-timeframe quick test complete — best: {best_tf} "
+            f"(Sharpe={best.get('sharpe', 0):+.4f}, "
+            f"trades={best.get('trades', 0)}, "
+            f"win={best.get('win_rate', 0):.0%}, "
+            f"pf={best.get('profit_factor', 0):.3f}, "
+            f"dd={best.get('drawdown', 0):.1%})\n"
+            + "\n".join(tf_lines))
+
+        # Generate HTML report for best timeframe (optional, non-blocking)
+        html_report = None
+        try:
+            cache_file = f"{CACHE_DIR}/{symbol}_{best_tf}.parquet"
+            best_df = pd.read_parquet(cache_file) if os.path.exists(cache_file) else None
+            if best_df is not None:
+                train_df, _ = split_train_oos(best_df)
+                html_result = run_backtest(strategy_class, train_df, params={},
+                                           enforce_gates=False, generate_html=True)
+                html_report = html_result.html_report
+        except Exception:
+            pass
+
+        # Save results — quick_test_* fields reflect the best timeframe
         db.update_strategy(strategy_id, {
-            "status": "quick_tested",
-            "modal_job_id": None,
-            "quick_test_sharpe": result.sharpe,
-            "quick_test_calmar": result.calmar,
-            "quick_test_drawdown": result.max_drawdown,
-            "quick_test_trades": result.total_trades,
-            "quick_test_win_rate": result.win_rate,
-            "quick_test_signals_per_year": result.signals_per_year,
-            "leakage_score": leakage_result.score,
-            "leakage_issues": leakage_result.issues,
-            # Store equity-curve HTML report so user can inspect the strategy visually
-            "report_text": result.html_report,
-            "error_log": None,
+            "status":                      "quick_tested",
+            "modal_job_id":                None,
+            "best_timeframe":              best_tf,
+            "quick_test_all_timeframes":   tf_results,
+            "quick_test_sharpe":           best.get("sharpe"),
+            "quick_test_calmar":           None,
+            "quick_test_drawdown":         best.get("drawdown"),
+            "quick_test_trades":           best.get("trades"),
+            "quick_test_win_rate":         best.get("win_rate"),
+            "quick_test_signals_per_year": best.get("signals_per_year"),
+            "leakage_score":               leakage_result.score,
+            "leakage_issues":              leakage_result.issues,
+            "report_text":                 html_report,
+            "error_log":                   None,
         })
 
-        trade_note = (
-            f"Sharpe={result.sharpe:.4f} (equity_sharpe={result.equity_sharpe:.4f}), "
-            f"trades={result.total_trades}, "
-            f"win={result.win_rate:.0%}, "
-            f"pf={result.profit_factor:.3f}, "
-            f"drawdown={result.max_drawdown:.1%}"
-        )
-        if result.total_trades == 0:
-            trade_note += " — ⚠️ NO TRADES with default params (optimizer may still find signal)"
-        add_pipeline_note(strategy_id,
-            f"Quick test done — {trade_note}. Proceeding to full optimization.")
-
         return {
-            "passed": True,
-            "strategy_id": strategy_id,
-            "quick_sharpe": result.sharpe,
-            "quick_trades": result.total_trades,
-            "quick_win_rate": result.win_rate,
+            "passed":        True,
+            "strategy_id":   strategy_id,
+            "best_timeframe": best_tf,
+            "best_sharpe":   best.get("sharpe"),
+            "best_trades":   best.get("trades"),
+            "all_timeframes": tf_results,
         }
 
     except Exception as e:
@@ -265,10 +320,13 @@ def run_backtest_pipeline(strategy_id: str) -> dict:
             symbols = [symbols]
         symbol = symbols[0] if symbols else "EURUSD"
 
+        # Use the best timeframe discovered by the multi-TF quick test.
+        # Falls back to the implementer's suggestion, then 1h.
+        best_timeframe = strategy.get("best_timeframe")
         timeframes = strategy.get("timeframes") or ["1h"]
-        # Primary timeframe drives data loading, optimization and walk-forward.
-        # Multi-timeframe strategies list additional timeframes after the primary.
-        primary_tf = timeframes[0] if isinstance(timeframes, list) else timeframes
+        if isinstance(timeframes, str):
+            timeframes = [timeframes]
+        primary_tf = best_timeframe or (timeframes[0] if timeframes else "1h")
 
         db.update_strategy(strategy_id, {"status": "backtesting"})
 

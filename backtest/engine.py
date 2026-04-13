@@ -86,14 +86,19 @@ def run_backtest(
     """
     params = params or {}
 
-    # Apply params to strategy class (backtesting.py convention)
-    for k, v in params.items():
-        if hasattr(strategy_class, k):
-            setattr(strategy_class, k, v)
+    # Create a throw-away subclass with the params baked in as class attributes.
+    # NEVER use setattr on strategy_class directly: it mutates the shared class object,
+    # causing race conditions when Optuna runs n_jobs > 1 (parallel trials all writing
+    # to the same class simultaneously → non-deterministic results).
+    parameterized = type(
+        strategy_class.__name__,
+        (strategy_class,),
+        {k: v for k, v in params.items() if hasattr(strategy_class, k)},
+    )
 
     bt = Backtest(
         df,
-        strategy_class,
+        parameterized,
         cash=cash,
         commission=commission,
         exclusive_orders=exclusive_orders,

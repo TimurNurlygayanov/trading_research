@@ -139,12 +139,15 @@ ALTER TABLE strategies ADD COLUMN IF NOT EXISTS equity_curve_url       text;
 ALTER TABLE strategies ADD COLUMN IF NOT EXISTS exit_logic             text;
 
 -- Quick test results (raw run with default params, no optimization)
-ALTER TABLE strategies ADD COLUMN IF NOT EXISTS quick_test_sharpe        float8;
-ALTER TABLE strategies ADD COLUMN IF NOT EXISTS quick_test_calmar        float8;
-ALTER TABLE strategies ADD COLUMN IF NOT EXISTS quick_test_drawdown      float8;
-ALTER TABLE strategies ADD COLUMN IF NOT EXISTS quick_test_trades        int;
-ALTER TABLE strategies ADD COLUMN IF NOT EXISTS quick_test_win_rate      float8;
-ALTER TABLE strategies ADD COLUMN IF NOT EXISTS quick_test_signals_per_year float8;
+ALTER TABLE strategies ADD COLUMN IF NOT EXISTS quick_test_sharpe              float8;
+ALTER TABLE strategies ADD COLUMN IF NOT EXISTS quick_test_calmar              float8;
+ALTER TABLE strategies ADD COLUMN IF NOT EXISTS quick_test_drawdown            float8;
+ALTER TABLE strategies ADD COLUMN IF NOT EXISTS quick_test_trades              int;
+ALTER TABLE strategies ADD COLUMN IF NOT EXISTS quick_test_win_rate            float8;
+ALTER TABLE strategies ADD COLUMN IF NOT EXISTS quick_test_signals_per_year    float8;
+-- Multi-timeframe quick test: best timeframe found and per-TF metrics dict
+ALTER TABLE strategies ADD COLUMN IF NOT EXISTS best_timeframe                 text;
+ALTER TABLE strategies ADD COLUMN IF NOT EXISTS quick_test_all_timeframes      jsonb;
 
 -- Research task IDs blocking this strategy (set when awaiting research results)
 ALTER TABLE strategies ADD COLUMN IF NOT EXISTS pending_research_ids     jsonb DEFAULT '[]'::jsonb;

@@ -366,6 +366,7 @@ def api_strategies(
             "walk_forward_scores, hypothesis, entry_logic, hyperparams, best_session_hours, "
             "quick_test_sharpe, quick_test_trades, quick_test_win_rate, "
             "quick_test_drawdown, quick_test_signals_per_year, "
+            "best_timeframe, quick_test_all_timeframes, "
             "error_log, report_url, tags, comments, modal_job_id, created_at, updated_at"
         )
         if status != "all":
@@ -830,26 +831,67 @@ function renderPanel(s) {
   const dd = s.max_drawdown != null ? (s.max_drawdown * 100).toFixed(2) + '%' : '—';
   const wr = s.win_rate != null ? (s.win_rate * 100).toFixed(1) + '%' : '—';
 
-  // Quick test results block (shown when quick_test data is available)
+  // Quick test results block — multi-timeframe table
   let quickTestHtml = '';
-  if (s.quick_test_trades != null || s.quick_test_sharpe != null) {
-    const qt_sharpe = s.quick_test_sharpe != null ? s.quick_test_sharpe.toFixed(4) : '—';
-    const qt_trades = s.quick_test_trades != null ? s.quick_test_trades : '—';
-    const qt_wr     = s.quick_test_win_rate != null ? (s.quick_test_win_rate*100).toFixed(1)+'%' : '—';
-    const qt_dd     = s.quick_test_drawdown != null ? (s.quick_test_drawdown*100).toFixed(1)+'%' : '—';
-    const qt_spy    = s.quick_test_signals_per_year != null ? Math.round(s.quick_test_signals_per_year) : '—';
-    const qt_cls    = s.quick_test_sharpe > 1 ? 'good' : s.quick_test_sharpe > 0 ? '' : 'bad';
+  if (s.quick_test_trades != null || s.quick_test_sharpe != null || s.quick_test_all_timeframes) {
+    const bestTf   = s.best_timeframe || '—';
+    const allTf    = s.quick_test_all_timeframes || {};
+    const TF_ORDER = ['4h','1h','15m','5m','1m'];
+
+    // Build rows for the per-TF table
+    let tfRows = '';
+    for (const tf of TF_ORDER) {
+      if (!(tf in allTf)) continue;
+      const m = allTf[tf];
+      const isBest = tf === bestTf;
+      const rowStyle = isBest ? 'background:#172554;font-weight:600' : '';
+      if (m.error) {
+        tfRows += `<tr style="${rowStyle}">
+          <td>${isBest ? '▶ ' : ''}${tf}</td>
+          <td colspan="6" style="color:#f87171;font-size:.75rem">${m.error.slice(0,80)}</td>
+        </tr>`;
+      } else {
+        const sh  = m.sharpe   != null ? (m.sharpe >= 0 ? '+' : '') + m.sharpe.toFixed(4) : '—';
+        const shCls = m.sharpe > 1 ? 'color:#34d399' : m.sharpe > 0 ? 'color:#94a3b8' : 'color:#f87171';
+        const wr  = m.win_rate != null ? (m.win_rate*100).toFixed(1)+'%' : '—';
+        const dd  = m.drawdown != null ? (m.drawdown*100).toFixed(1)+'%' : '—';
+        const pf  = m.profit_factor != null ? m.profit_factor.toFixed(2) : '—';
+        const spy = m.signals_per_year != null ? Math.round(m.signals_per_year) : '—';
+        tfRows += `<tr style="${rowStyle}">
+          <td style="font-weight:600">${isBest ? '▶ ' : ''}${tf}</td>
+          <td style="${shCls}">${sh}</td>
+          <td>${m.trades ?? '—'}</td>
+          <td>${wr}</td>
+          <td>${pf}</td>
+          <td>${dd}</td>
+          <td style="color:#64748b">${spy}</td>
+        </tr>`;
+      }
+    }
+
+    const tableStyle = 'width:100%;border-collapse:collapse;font-size:.8rem;margin-top:10px';
+    const thStyle    = 'text-align:left;padding:4px 8px;border-bottom:1px solid #334155;color:#94a3b8;font-weight:400';
+    const tdStyle    = 'padding:4px 8px;border-bottom:1px solid #1e293b';
+
     quickTestHtml = `<div class="panel-section">
-      <h3>Quick Test Results <span style="font-size:.7rem;font-weight:400;color:#64748b">(default params, no optimization)</span></h3>
-      <div style="display:flex;gap:12px;flex-wrap:wrap">
-        <div class="kv"><div class="kv-label">Sharpe</div><div class="kv-val ${qt_cls}">${qt_sharpe}</div></div>
-        <div class="kv"><div class="kv-label">Trades</div><div class="kv-val">${qt_trades}</div></div>
-        <div class="kv"><div class="kv-label">Win Rate</div><div class="kv-val">${qt_wr}</div></div>
-        <div class="kv"><div class="kv-label">Drawdown</div><div class="kv-val">${qt_dd}</div></div>
-        <div class="kv"><div class="kv-label">Sig/Year</div><div class="kv-val">${qt_spy}</div></div>
+      <h3>Multi-Timeframe Quick Test <span style="font-size:.7rem;font-weight:400;color:#64748b">(default params — best: <b style="color:#38bdf8">${bestTf}</b>)</span></h3>
+      <style>
+        .tf-table td { ${tdStyle} }
+        .tf-table th { ${thStyle} }
+        .tf-table tr:hover td { background:#1e293b }
+      </style>
+      <table class="tf-table" style="${tableStyle}">
+        <thead><tr>
+          <th>TF</th><th>Sharpe</th><th>Trades</th><th>Win%</th><th>PF</th><th>DD</th><th>Sig/yr</th>
+        </tr></thead>
+        <tbody>${tfRows}</tbody>
+      </table>
+      <div style="font-size:.72rem;color:#64748b;margin-top:6px">
+        Sharpe = per-trade annualized. Full optimization will use <b>${bestTf}</b>.
       </div>
-      <div style="font-size:.75rem;color:#64748b;margin-top:6px">Sharpe = per-trade annualized (mean_pnl/std_pnl × √trades/yr). Equity-curve Sharpe shown in pipeline notes.</div>
-      ${s.quick_test_trades === 0 ? '<div style="color:#fb923c;font-size:.8rem;margin-top:8px">⚠ Zero trades with default params — optimizer may still find signal</div>' : ''}
+      ${(s.quick_test_trades === 0 || (allTf[bestTf] && allTf[bestTf].trades === 0))
+        ? '<div style="color:#fb923c;font-size:.8rem;margin-top:6px">⚠ Zero trades on best timeframe — optimizer may still find signal</div>'
+        : ''}
     </div>`;
   }
 

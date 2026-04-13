@@ -14,7 +14,7 @@ SHARED_CONSTRAINTS = """
 HARD CONSTRAINTS (non-negotiable, always apply):
 - Python 3.13, pandas 2.x, pandas_ta (ONLY library for indicators — do not implement RSI/ATR/etc. manually)
 - backtesting.py for all backtests (trade_on_close=False so entries are at next bar open)
-- Minimum 100 signals total AND 100 signals per year — REJECT if below
+- Minimum 100 signals total across the full training period — REJECT if below
 - OOS period starts 2026-01-01. Training: all data before 2026. Never use OOS data for parameter fitting.
 - No data leakage: no shift(-N), no bfill(), no fitting on full dataset, no pandas_ta calls inside next()
 - All indicators computed in init() using self.I() wrapper
@@ -73,7 +73,7 @@ OUTPUT FORMAT (JSON only, no other text):
   "rejection_reason": "<reason if rejected, else null>",
   "suggested_modifications": "<suggestions if verdict=modify, else null>",
   "suggested_indicators": ["<indicator1>", "<indicator2>"],
-  "suggested_timeframes": ["<IMPORTANT: if the description explicitly mentions a timeframe (e.g. '5m', '15m', '1h'), use EXACTLY that timeframe as the first entry. Otherwise suggest based on strategy type: scalping→5m/15m, intraday→1h/4h, swing→4h/1d. REQUIRED: always include BOTH '1h' AND '5m' — the strategy will be validated on all listed timeframes>"],
+  "suggested_timeframes": ["<Suggest 1–3 timeframes where this strategy is most likely to work. Base this on the strategy type: scalping/microstructure→1m/5m, intraday momentum→15m/1h, swing→4h/1d. If the description explicitly mentions a timeframe, put it first. The pipeline will automatically test ALL standard timeframes (1m,5m,15m,1h,4h) regardless — this field is just a hint for the implementer's default params.>"],
   "suggested_symbols": ["EURUSD", "GBPUSD"],
   "strategy_name": "<concise 4-8 word title for this strategy, e.g. 'RSI Divergence VWAP Bounce 1H'>",
   "refined_description": "<rewrite the strategy description incorporating your suggestions: make entry/exit rules precise and quantifiable, add missing details like stop-loss type, TP target, session filter. Keep the user's original intent. 2-4 sentences max.>",
