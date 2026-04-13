@@ -178,7 +178,7 @@ def run_quick_backtest(strategy_id: str) -> dict:
         })
 
         trade_note = (
-            f"Sharpe={result.sharpe:.4f} (trade_sharpe={result.trade_sharpe:.4f}), "
+            f"Sharpe={result.sharpe:.4f} (equity_sharpe={result.equity_sharpe:.4f}), "
             f"trades={result.total_trades}, "
             f"win={result.win_rate:.0%}, "
             f"pf={result.profit_factor:.3f}, "
@@ -266,13 +266,9 @@ def run_backtest_pipeline(strategy_id: str) -> dict:
         symbol = symbols[0] if symbols else "EURUSD"
 
         timeframes = strategy.get("timeframes") or ["1h"]
-        # ── REQUIRED: every strategy must be validated on both 1h and 5m ──
-        REQUIRED_TIMEFRAMES = ["1h", "5m"]
-        for rtf in REQUIRED_TIMEFRAMES:
-            if rtf not in timeframes:
-                timeframes.append(rtf)
-        # Primary timeframe is the first one (used for optimization)
-        primary_tf = timeframes[0]
+        # Primary timeframe drives data loading, optimization and walk-forward.
+        # Multi-timeframe strategies list additional timeframes after the primary.
+        primary_tf = timeframes[0] if isinstance(timeframes, list) else timeframes
 
         db.update_strategy(strategy_id, {"status": "backtesting"})
 

@@ -33,6 +33,10 @@ class BacktestResult:
     passed: bool
     reject_reason: str | None
 
+    # sharpe = per-trade annualized Sharpe (mean_pnl/std_pnl * sqrt(trades/year)).
+    # This is the PRIMARY metric used by optimizer, walk-forward, and quality gates.
+    # backtesting.py's equity-curve Sharpe is stored in equity_sharpe for diagnostics only
+    # — it is unreliable for intraday strategies because daily resampling flattens returns.
     sharpe: float
     calmar: float
     max_drawdown: float
@@ -48,8 +52,8 @@ class BacktestResult:
     # Raw stats dict from backtesting.py
     raw_stats: dict[str, Any]
 
-    # Per-trade Sharpe (annualized from trade P&L — more reliable for intraday)
-    trade_sharpe: float = 0.0
+    # backtesting.py equity-curve Sharpe (diagnostic only — near-zero for intraday)
+    equity_sharpe: float = 0.0
 
     # Trade-level DataFrame
     trades: pd.DataFrame | None = None
@@ -136,28 +140,29 @@ def run_backtest(
         signals_per_year = 0.0
 
     # ── Extract metrics ──────────────────────────────────────────────────────
-    sharpe     = _safe_float(stats.get("Sharpe Ratio"))
+    equity_sharpe = _safe_float(stats.get("Sharpe Ratio"))   # diagnostic only
     calmar     = _safe_float(stats.get("Calmar Ratio"))
     max_dd     = abs(_safe_float(stats.get("Max. Drawdown [%]"))) / 100
     win_rate   = _safe_float(stats.get("Win Rate [%]")) / 100
     profit_factor = _safe_profit_factor(trades_df)
-    avg_pnl    = float(trades_df["PnL"].mean()) if not trades_df.empty and "PnL" in trades_df else 0.0
+    avg_pnl    = float(trades_df["PnL"].mean()) if not trades_df.empty and "PnL" in trades_df.columns else 0.0
     equity_final = _safe_float(stats.get("Equity Final [$]"), default=cash)
     equity_peak  = _safe_float(stats.get("Equity Peak [$]"), default=cash)
     return_pct   = _safe_float(stats.get("Return [%]"))
 
     # Per-trade Sharpe: annualized using trade P&L directly.
-    # More reliable than the equity-curve Sharpe for intraday strategies
-    # where backtesting.py's daily resample can flatten out intraday returns.
-    trade_sharpe = _compute_trade_sharpe(trades_df, signals_per_year)
+    # This is the PRIMARY Sharpe used by optimizer, walk-forward, and quality gates.
+    # backtesting.py's daily-resampled Sharpe is ~0 for intraday strategies because
+    # trades that open and close within the same day leave the daily equity nearly flat.
+    sharpe = _compute_trade_sharpe(trades_df, signals_per_year)
 
     # ── Quality gates ────────────────────────────────────────────────────────
     reject_reason = None
     if enforce_gates:
         if sharpe < MIN_SHARPE:
-            reject_reason = f"Sharpe {sharpe:.2f} below minimum {MIN_SHARPE}"
+            reject_reason = f"Sharpe {sharpe:.3f} below minimum {MIN_SHARPE}"
         elif calmar < MIN_CALMAR:
-            reject_reason = f"Calmar {calmar:.2f} below minimum {MIN_CALMAR}"
+            reject_reason = f"Calmar {calmar:.3f} below minimum {MIN_CALMAR}"
         elif max_dd > MAX_DRAWDOWN:
             reject_reason = f"Max drawdown {max_dd:.1%} exceeds maximum {MAX_DRAWDOWN:.1%}"
 
@@ -175,7 +180,7 @@ def run_backtest(
         equity_final=equity_final,
         equity_peak=equity_peak,
         return_pct=return_pct,
-        trade_sharpe=trade_sharpe,
+        equity_sharpe=equity_sharpe,
         raw_stats=dict(stats),
         trades=trades_df,
     )

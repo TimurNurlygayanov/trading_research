@@ -842,13 +842,13 @@ function renderPanel(s) {
     quickTestHtml = `<div class="panel-section">
       <h3>Quick Test Results <span style="font-size:.7rem;font-weight:400;color:#64748b">(default params, no optimization)</span></h3>
       <div style="display:flex;gap:12px;flex-wrap:wrap">
-        <div class="kv"><div class="kv-label">Sharpe (equity)</div><div class="kv-val ${qt_cls}">${qt_sharpe}</div></div>
+        <div class="kv"><div class="kv-label">Sharpe</div><div class="kv-val ${qt_cls}">${qt_sharpe}</div></div>
         <div class="kv"><div class="kv-label">Trades</div><div class="kv-val">${qt_trades}</div></div>
         <div class="kv"><div class="kv-label">Win Rate</div><div class="kv-val">${qt_wr}</div></div>
         <div class="kv"><div class="kv-label">Drawdown</div><div class="kv-val">${qt_dd}</div></div>
         <div class="kv"><div class="kv-label">Sig/Year</div><div class="kv-val">${qt_spy}</div></div>
       </div>
-      <div style="font-size:.75rem;color:#64748b;margin-top:6px">Per-trade Sharpe (more reliable for intraday) shown in pipeline notes.</div>
+      <div style="font-size:.75rem;color:#64748b;margin-top:6px">Sharpe = per-trade annualized (mean_pnl/std_pnl × √trades/yr). Equity-curve Sharpe shown in pipeline notes.</div>
       ${s.quick_test_trades === 0 ? '<div style="color:#fb923c;font-size:.8rem;margin-top:8px">⚠ Zero trades with default params — optimizer may still find signal</div>' : ''}
     </div>`;
   }
