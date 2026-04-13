@@ -33,6 +33,7 @@ image = (
         "pandas_ta==0.4.71b0",
         "numpy",
         "backtesting==0.3.3",
+        "bokeh>=3.0",
         "optuna==3.6.1",
         "scikit-learn==1.5.2",
         "requests==2.32.3",
@@ -154,7 +155,9 @@ def run_quick_backtest(strategy_id: str) -> dict:
 
         # Run with default class-level params — no optimization, enforce_gates=False
         # so we see actual metrics even if they don't pass quality gates yet.
-        result = run_backtest(strategy_class, train_df, params={}, enforce_gates=False)
+        # generate_html=True produces an interactive Bokeh equity-curve report.
+        result = run_backtest(strategy_class, train_df, params={},
+                              enforce_gates=False, generate_html=True)
 
         # Save quick test results and advance pipeline regardless of metric quality.
         # The full optimization may find much better params.
@@ -169,13 +172,16 @@ def run_quick_backtest(strategy_id: str) -> dict:
             "quick_test_signals_per_year": result.signals_per_year,
             "leakage_score": leakage_result.score,
             "leakage_issues": leakage_result.issues,
+            # Store equity-curve HTML report so user can inspect the strategy visually
+            "report_text": result.html_report,
             "error_log": None,
         })
 
         trade_note = (
-            f"Sharpe={result.sharpe:.3f}, "
+            f"Sharpe={result.sharpe:.4f} (trade_sharpe={result.trade_sharpe:.4f}), "
             f"trades={result.total_trades}, "
             f"win={result.win_rate:.0%}, "
+            f"pf={result.profit_factor:.3f}, "
             f"drawdown={result.max_drawdown:.1%}"
         )
         if result.total_trades == 0:

@@ -172,14 +172,16 @@ def api_restart_strategy(strategy_id: str, background_tasks: BackgroundTasks) ->
             return JSONResponse({"error": "not found"}, status_code=404)
 
         status = strategy.get("status")
-        if status in ("implemented", "quick_testing", "quick_tested"):
+        if status in ("implemented", "quick_testing"):
+            # Re-run the quick test from scratch
             db.update_strategy(strategy_id, {
                 "status": "implemented", "error_log": None, "modal_job_id": None,
             })
             background_tasks.add_task(_dispatch_quick_backtest_job, strategy_id)
             log.info("strategy_restarted_quick_backtest", strategy_id=strategy_id)
             return JSONResponse({"ok": True, "dispatched_to": "quick_backtest"})
-        elif status == "backtesting":
+        elif status in ("quick_tested", "backtesting"):
+            # Skip quick test and go straight to full optimization
             db.update_strategy(strategy_id, {
                 "status": "quick_tested", "error_log": None, "modal_job_id": None,
             })
@@ -362,6 +364,8 @@ def api_strategies(
             "signals_per_year, total_signals, leakage_score, profit_factor, "
             "oos_sharpe, oos_win_rate, oos_total_trades, monte_carlo_pvalue, "
             "walk_forward_scores, hypothesis, entry_logic, hyperparams, best_session_hours, "
+            "quick_test_sharpe, quick_test_trades, quick_test_win_rate, "
+            "quick_test_drawdown, quick_test_signals_per_year, "
             "error_log, report_url, tags, comments, modal_job_id, created_at, updated_at"
         )
         if status != "all":
@@ -829,7 +833,7 @@ function renderPanel(s) {
   // Quick test results block (shown when quick_test data is available)
   let quickTestHtml = '';
   if (s.quick_test_trades != null || s.quick_test_sharpe != null) {
-    const qt_sharpe = s.quick_test_sharpe != null ? s.quick_test_sharpe.toFixed(3) : '—';
+    const qt_sharpe = s.quick_test_sharpe != null ? s.quick_test_sharpe.toFixed(4) : '—';
     const qt_trades = s.quick_test_trades != null ? s.quick_test_trades : '—';
     const qt_wr     = s.quick_test_win_rate != null ? (s.quick_test_win_rate*100).toFixed(1)+'%' : '—';
     const qt_dd     = s.quick_test_drawdown != null ? (s.quick_test_drawdown*100).toFixed(1)+'%' : '—';
@@ -838,12 +842,13 @@ function renderPanel(s) {
     quickTestHtml = `<div class="panel-section">
       <h3>Quick Test Results <span style="font-size:.7rem;font-weight:400;color:#64748b">(default params, no optimization)</span></h3>
       <div style="display:flex;gap:12px;flex-wrap:wrap">
-        <div class="kv"><div class="kv-label">Sharpe</div><div class="kv-val ${qt_cls}">${qt_sharpe}</div></div>
+        <div class="kv"><div class="kv-label">Sharpe (equity)</div><div class="kv-val ${qt_cls}">${qt_sharpe}</div></div>
         <div class="kv"><div class="kv-label">Trades</div><div class="kv-val">${qt_trades}</div></div>
         <div class="kv"><div class="kv-label">Win Rate</div><div class="kv-val">${qt_wr}</div></div>
         <div class="kv"><div class="kv-label">Drawdown</div><div class="kv-val">${qt_dd}</div></div>
         <div class="kv"><div class="kv-label">Sig/Year</div><div class="kv-val">${qt_spy}</div></div>
       </div>
+      <div style="font-size:.75rem;color:#64748b;margin-top:6px">Per-trade Sharpe (more reliable for intraday) shown in pipeline notes.</div>
       ${s.quick_test_trades === 0 ? '<div style="color:#fb923c;font-size:.8rem;margin-top:8px">⚠ Zero trades with default params — optimizer may still find signal</div>' : ''}
     </div>`;
   }
@@ -905,9 +910,36 @@ function renderPanel(s) {
       <div class="error-box">${esc(s.error_log)}</div></div>`;
   }
 
+  // "Run Full Optimization" action for quick_tested strategies
+  let quickOptimizeHtml = '';
+  if (s.status === 'quick_tested') {
+    quickOptimizeHtml = `
+    <div class="panel-section" style="background:#0d1f16;border:1px solid #166534;
+                border-radius:10px;padding:14px 16px">
+      <div style="font-size:.72rem;font-weight:600;text-transform:uppercase;
+                  letter-spacing:.07em;color:#4ade80;margin-bottom:10px">Ready for Full Optimization</div>
+      <div style="color:#94a3b8;font-size:.82rem;margin-bottom:12px">
+        Quick test complete. The optimizer (Optuna 50 trials + walk-forward + OOS) will now
+        search for the best parameters. This takes ~15–25 min on Modal.
+      </div>
+      <div style="display:flex;gap:10px;flex-wrap:wrap">
+        <button onclick="runFullOptimization('${s.id}')"
+          style="background:#16a34a;border:none;border-radius:8px;color:#fff;
+                 padding:9px 20px;font-size:.85rem;font-weight:600;cursor:pointer"
+          id="optimize-btn-${s.id}">
+          ▶ Run Full Optimization
+        </button>
+        <span style="font-size:.78rem;color:#4b5563;align-self:center">
+          or wait — auto-starts on next queue cycle (~10 min)
+        </span>
+      </div>
+      <div id="optimize-result-${s.id}" style="margin-top:8px;font-size:.8rem;color:#64748b"></div>
+    </div>`;
+  }
+
   // Modal job status block for in-progress strategies
   let modalHtml = '';
-  const IN_PROGRESS = ['implemented','backtesting','validating'];
+  const IN_PROGRESS = ['implemented','quick_testing','backtesting','validating'];
   if (IN_PROGRESS.includes(s.status)) {
     const elapsed = s.updated_at ? elapsedSince(s.updated_at) : '?';
     modalHtml = `
@@ -991,19 +1023,42 @@ function renderPanel(s) {
 
   let reportHtml = '';
   if (s.report_text) {
-    // Render markdown-ish text: bold, headers, lists
-    const md = esc(s.report_text)
-      .replace(/^#{3} (.+)$/gm, '<strong style="color:#94a3b8;font-size:.72rem;text-transform:uppercase;letter-spacing:.07em">$1</strong>')
-      .replace(/^#{1,2} (.+)$/gm, '<strong style="color:#f1f5f9;font-size:.95rem">$1</strong>')
-      .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
-      .replace(/\n/g, '<br>');
-    reportHtml = `<div class="panel-section">
-      <h3>Report</h3>
-      <div style="background:#0f1623;border-radius:8px;padding:16px;font-size:.82rem;
-                  line-height:1.65;color:#cbd5e1;max-height:360px;overflow-y:auto">${md}</div>
-      ${s.report_url ? `<a href="${s.report_url}" target="_blank"
-        style="display:inline-block;margin-top:8px;color:#818cf8;font-size:.8rem;">↗ Raw file (R2)</a>` : ''}
-    </div>`;
+    const isHtmlReport = s.report_text.trimStart().startsWith('<!') ||
+                         s.report_text.trimStart().toLowerCase().startsWith('<html');
+    if (isHtmlReport) {
+      // Bokeh interactive equity-curve report — render in sandboxed iframe via blob URL
+      const blobUrl = URL.createObjectURL(
+        new Blob([s.report_text], {type: 'text/html'})
+      );
+      reportHtml = `<div class="panel-section">
+        <h3>Equity Curve Report
+          <a href="${blobUrl}" target="_blank"
+            style="margin-left:10px;background:#1e2533;border:1px solid #374151;border-radius:6px;
+                   color:#93c5fd;padding:3px 10px;font-size:.72rem;text-decoration:none">
+            ↗ Fullscreen
+          </a>
+        </h3>
+        <iframe src="${blobUrl}"
+          style="width:100%;height:480px;border:none;border-radius:8px;background:#fff">
+        </iframe>
+        ${s.report_url ? `<a href="${s.report_url}" target="_blank"
+          style="display:inline-block;margin-top:6px;color:#818cf8;font-size:.8rem;">↗ Raw file (R2)</a>` : ''}
+      </div>`;
+    } else {
+      // Plain markdown report (from summariser agent after full validation)
+      const md = esc(s.report_text)
+        .replace(/^#{3} (.+)$/gm, '<strong style="color:#94a3b8;font-size:.72rem;text-transform:uppercase;letter-spacing:.07em">$1</strong>')
+        .replace(/^#{1,2} (.+)$/gm, '<strong style="color:#f1f5f9;font-size:.95rem">$1</strong>')
+        .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+        .replace(/\n/g, '<br>');
+      reportHtml = `<div class="panel-section">
+        <h3>Report</h3>
+        <div style="background:#0f1623;border-radius:8px;padding:16px;font-size:.82rem;
+                    line-height:1.65;color:#cbd5e1;max-height:360px;overflow-y:auto">${md}</div>
+        ${s.report_url ? `<a href="${s.report_url}" target="_blank"
+          style="display:inline-block;margin-top:8px;color:#818cf8;font-size:.8rem;">↗ Raw file (R2)</a>` : ''}
+      </div>`;
+    }
   } else if (s.report_url) {
     reportHtml = `<div class="panel-section">
       <a href="${s.report_url}" target="_blank"
@@ -1051,7 +1106,7 @@ function renderPanel(s) {
       </div>
     </div>
 
-    ${modalHtml}${actionsHtml}${quickTestHtml}${wfHtml}${paramsHtml}${codeHtml}${errHtml}${reportHtml}
+    ${quickOptimizeHtml}${modalHtml}${actionsHtml}${quickTestHtml}${wfHtml}${paramsHtml}${codeHtml}${errHtml}${reportHtml}
     <div class="panel-section" style="border-top:1px solid #1f2937;padding-top:16px;margin-top:4px">
       <h3>Comments</h3>
       <div id="comments-list-${s.id}" style="margin-bottom:10px">
@@ -1204,6 +1259,32 @@ async function deleteStrategy(id, name) {
   const data = await r.json();
   if (data.ok) { closePanel(); loadAll(); }
   else alert('Delete failed: ' + (data.error || 'unknown error'));
+}
+
+async function runFullOptimization(id) {
+  const btn = document.getElementById(`optimize-btn-${id}`);
+  const out = document.getElementById(`optimize-result-${id}`);
+  btn.disabled = true;
+  btn.textContent = 'Dispatching…';
+  try {
+    const r = await fetch(`/api/strategy/${id}/restart`, {method: 'POST'});
+    const d = await r.json();
+    if (d.ok) {
+      out.style.color = '#4ade80';
+      out.textContent = '✓ Dispatched to full optimization. Refreshing…';
+      setTimeout(() => { loadAll(); openPanel(id); }, 2000);
+    } else {
+      out.style.color = '#f87171';
+      out.textContent = '✗ ' + (d.error || 'Error');
+      btn.disabled = false;
+      btn.textContent = '▶ Run Full Optimization';
+    }
+  } catch(e) {
+    out.style.color = '#f87171';
+    out.textContent = 'Network error.';
+    btn.disabled = false;
+    btn.textContent = '▶ Run Full Optimization';
+  }
 }
 
 async function restartStrategy(id) {
