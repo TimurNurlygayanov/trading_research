@@ -240,27 +240,77 @@ def api_retry_strategy(strategy_id: str, background_tasks: BackgroundTasks) -> J
         return JSONResponse({"error": str(exc)}, status_code=500)
 
 
+# Statuses that mean the pipeline has moved on — no job is actively running
+_TERMINAL_STATUSES = {"quick_tested", "implemented", "backtesting", "validating",
+                      "validated", "live", "failed", "filtered", "idea"}
+# Max age before we consider an in-progress strategy stuck (minutes)
+_STUCK_MINUTES = 25
+
+
 @app.get("/api/strategy/{strategy_id}/modal-status")
 def api_modal_status(strategy_id: str) -> JSONResponse:
-    """Check whether the Modal job for this strategy is still running, done, or failed."""
+    """Check whether the Modal job for this strategy is still running, done, or stuck."""
     try:
         strategy = db.get_strategy(strategy_id)
         if not strategy:
             return JSONResponse({"error": "not found"}, status_code=404)
 
+        status = strategy.get("status", "")
         job_id = strategy.get("modal_job_id")
-        if not job_id:
-            return JSONResponse({"status": "no_job", "message": "No Modal job ID recorded yet."})
 
-        import modal
-        call = modal.FunctionCall.from_id(job_id)
+        # ── DB-first check: if status already advanced, job is done ──────────
+        # Modal's polling API (call.get) can report "running" for completed jobs.
+        # The authoritative source is the DB status set by the Modal function itself.
+        if status in _TERMINAL_STATUSES or not job_id:
+            return JSONResponse({"status": "done",
+                                 "message": f"Strategy is now '{status}' — job finished."})
+
+        # ── Stuck detection ──────────────────────────────────────────────────
+        # If the strategy has been in an in-progress state for > _STUCK_MINUTES
+        # with a job_id still set, the Modal job likely crashed/timed-out before
+        # it could update the DB.
+        updated_at_str = strategy.get("updated_at") or strategy.get("created_at") or ""
         try:
-            result = call.get(timeout=0)   # non-blocking: raises if still running
-            return JSONResponse({"status": "done", "result": str(result)[:500]})
-        except TimeoutError:
-            return JSONResponse({"status": "running", "job_id": job_id})
-        except Exception as poll_exc:
-            return JSONResponse({"status": "unknown", "error": str(poll_exc), "job_id": job_id})
+            import datetime as _dt
+            updated_at = _dt.datetime.fromisoformat(
+                updated_at_str.replace("Z", "+00:00").replace("+00:00+00:00", "+00:00")
+            )
+            age_minutes = (_dt.datetime.now(_dt.timezone.utc) - updated_at).total_seconds() / 60
+        except Exception:
+            age_minutes = 0
+
+        if age_minutes > _STUCK_MINUTES:
+            return JSONResponse({
+                "status": "stuck",
+                "age_minutes": round(age_minutes),
+                "job_id": job_id,
+                "message": (
+                    f"Job has been running for {round(age_minutes)} min "
+                    f"(limit: {_STUCK_MINUTES} min). "
+                    "It likely timed out or crashed without updating the database. "
+                    "Use 'Restart' to try again."
+                ),
+            })
+
+        # ── Poll Modal (only for genuinely recent jobs) ──────────────────────
+        try:
+            import modal
+            call = modal.FunctionCall.from_id(job_id)
+            try:
+                result = call.get(timeout=2)
+                return JSONResponse({"status": "done", "result": str(result)[:500]})
+            except TimeoutError:
+                return JSONResponse({"status": "running", "job_id": job_id,
+                                     "age_minutes": round(age_minutes)})
+            except Exception as poll_exc:
+                # Any non-timeout exception from Modal usually means job ended
+                # (succeeded, failed, or expired). Trust the DB status.
+                return JSONResponse({"status": "done",
+                                     "message": f"Modal poll error (job likely finished): {poll_exc}",
+                                     "job_id": job_id})
+        except Exception as modal_import_err:
+            return JSONResponse({"status": "unknown",
+                                 "error": f"Could not import modal: {modal_import_err}"})
 
     except Exception as exc:
         log.error("modal_status_check_error", strategy_id=strategy_id,
@@ -1213,14 +1263,19 @@ async function checkModalStatus(id) {
     const d = await r.json();
     if (d.status === 'running') {
       out.style.color = '#fcd34d';
-      out.textContent = '⚙ Job is still running on Modal.';
+      out.innerHTML = `⚙ Job running — ${d.age_minutes ?? '?'} min elapsed.`;
     } else if (d.status === 'done') {
       out.style.color = '#4ade80';
       out.textContent = '✓ Job finished. Refreshing…';
       setTimeout(() => { loadAll(); openPanel(id); }, 1500);
+    } else if (d.status === 'stuck') {
+      out.style.color = '#f87171';
+      out.innerHTML = `⚠ Job stuck (${d.age_minutes} min). Likely timed out without updating DB. `
+        + `<a href="#" style="color:#f87171;text-decoration:underline"
+             onclick="restartStrategy('${id}');return false">Force restart</a>`;
     } else if (d.status === 'no_job') {
       out.style.color = '#64748b';
-      out.textContent = 'No job ID recorded yet — job may still be starting.';
+      out.textContent = 'No job ID — job may still be starting.';
     } else {
       out.style.color = '#f87171';
       out.textContent = '? ' + (d.error || d.message || d.status);

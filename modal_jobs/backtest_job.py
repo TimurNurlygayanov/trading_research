@@ -189,6 +189,36 @@ def run_quick_backtest(strategy_id: str) -> dict:
 
         best = tf_results.get(best_tf, {})
 
+        # ── Hard fail: 0 trades on every timeframe ───────────────────────────
+        # This means the strategy code has a bug — session filter kills all signals,
+        # indicator init fails, or entry condition is never True on any bar.
+        # Proceeding to optimization is pointless; flag it now.
+        ran_ok = [m for m in tf_results.values() if "error" not in m]
+        total_trades_across_all = sum(m.get("trades", 0) for m in ran_ok)
+        if ran_ok and total_trades_across_all == 0:
+            tf_summary = "\n".join(
+                f"  {tf:>4s}: {tf_results[tf].get('error', '0 trades')}"
+                for tf in QUICK_TEST_TIMEFRAMES
+            )
+            reason = (
+                "Zero trades on ALL timeframes with default params. "
+                "Likely causes: session filter (start_hour/end_hour) blocks all bars, "
+                "indicator returns NaN for the entire series, or entry condition is never True. "
+                "Fix the strategy code before re-submitting."
+            )
+            db.update_strategy(strategy_id, {
+                "status": "failed",
+                "modal_job_id": None,
+                "quick_test_all_timeframes": tf_results,
+                "error_log": reason,
+                "leakage_score": leakage_result.score,
+                "leakage_issues": leakage_result.issues,
+            })
+            add_pipeline_note(strategy_id,
+                f"Quick test FAILED — 0 trades on all timeframes.\n{tf_summary}\n\n{reason}")
+            return {"passed": False, "reason": "zero_trades_all_timeframes",
+                    "tf_results": tf_results}
+
         # Build a compact one-line summary per timeframe for the pipeline note
         tf_lines = []
         for tf in QUICK_TEST_TIMEFRAMES:
@@ -212,8 +242,9 @@ def run_quick_backtest(strategy_id: str) -> dict:
             f"dd={best.get('drawdown', 0):.1%})\n"
             + "\n".join(tf_lines))
 
-        # Generate HTML report for best timeframe (optional, non-blocking)
+        # Generate HTML report for best timeframe + capture trades for analyzer
         html_report = None
+        trades_for_db = None
         try:
             cache_file = f"{CACHE_DIR}/{symbol}_{best_tf}.parquet"
             best_df = pd.read_parquet(cache_file) if os.path.exists(cache_file) else None
@@ -222,6 +253,17 @@ def run_quick_backtest(strategy_id: str) -> dict:
                 html_result = run_backtest(strategy_class, train_df, params={},
                                            enforce_gates=False, generate_html=True)
                 html_report = html_result.html_report
+
+                # Serialise essential trade columns for strategy_analyzer
+                if html_result.trades is not None and not html_result.trades.empty:
+                    keep = [c for c in ["EntryTime", "ExitTime", "PnL", "ReturnPct", "Size"]
+                            if c in html_result.trades.columns]
+                    if keep:
+                        t = html_result.trades[keep].copy()
+                        for col in ["EntryTime", "ExitTime"]:
+                            if col in t.columns:
+                                t[col] = t[col].astype(str)
+                        trades_for_db = t.to_dict("records")
         except Exception:
             pass
 
@@ -231,10 +273,12 @@ def run_quick_backtest(strategy_id: str) -> dict:
             "modal_job_id":                None,
             "best_timeframe":              best_tf,
             "quick_test_all_timeframes":   tf_results,
+            "quick_test_trade_records":    trades_for_db,   # JSONB trade list for strategy_analyzer
+            "analysis_done":               False,            # reset flag for analyzer
             "quick_test_sharpe":           best.get("sharpe"),
             "quick_test_calmar":           None,
             "quick_test_drawdown":         best.get("drawdown"),
-            "quick_test_trades":           best.get("trades"),
+            "quick_test_trades":           best.get("trades"),   # int count
             "quick_test_win_rate":         best.get("win_rate"),
             "quick_test_signals_per_year": best.get("signals_per_year"),
             "leakage_score":               leakage_result.score,
@@ -258,6 +302,7 @@ def run_quick_backtest(strategy_id: str) -> dict:
             from db import supabase_client as db2
             db2.update_strategy(strategy_id, {
                 "status": "failed",
+                "modal_job_id": None,   # always clear so UI doesn't show stuck job
                 "error_log": f"Quick backtest error: {type(e).__name__}: {e}\n{tb[:500]}",
             })
         except Exception:
@@ -549,6 +594,7 @@ def run_backtest_pipeline(strategy_id: str) -> dict:
             from db import supabase_client as db2
             db2.update_strategy(strategy_id, {
                 "status": "failed",
+                "modal_job_id": None,   # clear so UI doesn't show stuck job
                 "error_log": f"{type(e).__name__}: {e}\n{tb[:500]}",
                 "retry_count": (db2.get_strategy(strategy_id) or {}).get("retry_count", 0) + 1,
             })

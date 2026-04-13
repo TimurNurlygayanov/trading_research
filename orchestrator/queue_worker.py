@@ -424,31 +424,72 @@ def _process_implemented_strategies() -> int:
 
 def _process_quick_tested_strategies() -> int:
     """
-    Dispatch 'quick_tested' strategies to the full backtest pipeline
-    (Optuna optimization + walk-forward + Monte Carlo + OOS).
-    Returns number of strategies dispatched.
+    For each 'quick_tested' strategy:
+      1. If analysis_done=False and quick_test_trades exist → run strategy_analyzer
+         (finds better session hours, trade caps, and LLM code suggestions).
+         If the analyzer patches the code, status → 'implemented' for a new quick test.
+      2. If analysis_done=True (or no trade data) → dispatch full optimization.
+    Returns number of strategies acted on.
     """
+    from agents.strategy_analyzer import run_strategy_analyzer
+    from agents.utils import add_pipeline_note
+
     quick_tested = db.get_strategies_by_status("quick_tested", limit=5)
     if not quick_tested:
         return 0
 
-    dispatched = 0
+    acted = 0
     for strategy in quick_tested:
         strategy_id = strategy.get("id")
         if strategy.get("modal_job_id"):
             continue  # already dispatched
+
+        analysis_done  = strategy.get("analysis_done", False)
+        has_trades     = bool(strategy.get("quick_test_trades"))
+
+        # ── Step 1: run analyzer (first time only) ────────────────────────────
+        if not analysis_done and has_trades:
+            try:
+                check_budget("strategy_analyzer")
+            except BudgetExceeded as be:
+                log.warning("budget_exceeded_analyzer", strategy_id=strategy_id,
+                            error=str(be))
+                # Skip analyzer, go straight to optimization
+                db.update_strategy(strategy_id, {"analysis_done": True})
+            else:
+                try:
+                    result = run_strategy_analyzer(strategy_id)
+                    # Mark analysis done regardless of whether code was patched
+                    db.update_strategy(strategy_id, {"analysis_done": True})
+
+                    if result.get("code_patched"):
+                        # Analyzer improved the code → re-run quick test
+                        log.info("analyzer_code_patched_rerequick",
+                                 strategy_id=strategy_id)
+                        _dispatch_quick_backtest_job(strategy_id)
+                        acted += 1
+                        continue  # don't dispatch full backtest yet
+
+                    log.info("analyzer_done_no_code_change", strategy_id=strategy_id,
+                             improvements=result.get("improvements", []))
+                except Exception as exc:
+                    log.error("strategy_analyzer_failed", strategy_id=strategy_id,
+                              error=str(exc))
+                    # Don't block optimization if analyzer crashes
+                    db.update_strategy(strategy_id, {"analysis_done": True})
+
+        # ── Step 2: dispatch full optimization ────────────────────────────────
         try:
             _dispatch_backtest_job(strategy_id)
-            dispatched += 1
-            log.info("full_backtest_dispatched_after_quick",
+            acted += 1
+            log.info("full_backtest_dispatched_after_analysis",
                      strategy_id=strategy_id,
-                     quick_sharpe=strategy.get("quick_test_sharpe"),
-                     quick_trades=strategy.get("quick_test_trades"))
+                     quick_sharpe=strategy.get("quick_test_sharpe"))
         except Exception as exc:
             log.error("full_backtest_dispatch_failed",
                       strategy_id=strategy_id, error=str(exc))
 
-    return dispatched
+    return acted
 
 
 def _process_failed_strategies() -> int:
@@ -475,7 +516,7 @@ def _process_failed_strategies() -> int:
     result = (
         sb.table("strategies")
         .select("id, name, status, error_log, backtest_code, hypothesis, "
-                "entry_logic, retry_count, auto_fix_count")
+                "entry_logic, retry_count, auto_fix_count, quick_test_all_timeframes")
         .eq("status", "failed")
         .order("updated_at", desc=True)
         .limit(20)
@@ -528,11 +569,32 @@ def _process_failed_strategies() -> int:
                     continue
 
                 description = strategy.get("hypothesis") or strategy.get("entry_logic") or ""
+
+                # Build extra context: multi-TF test results are very useful for
+                # diagnosing zero-trades (shows which timeframes/signals are missing)
+                tf_data = strategy.get("quick_test_all_timeframes")
+                extra_ctx = None
+                if tf_data:
+                    import json as _json
+                    tf_summary = []
+                    for tf, m in (tf_data.items() if isinstance(tf_data, dict) else []):
+                        if "error" in m:
+                            tf_summary.append(f"  {tf}: ERROR — {m['error'][:80]}")
+                        else:
+                            tf_summary.append(
+                                f"  {tf}: trades={m.get('trades',0)}, "
+                                f"sharpe={m.get('sharpe',0):.4f}, "
+                                f"win={m.get('win_rate',0):.0%}"
+                            )
+                    if tf_summary:
+                        extra_ctx = "Multi-timeframe test results (default params):\n" + "\n".join(tf_summary)
+
                 fixed_code = fix_strategy_code(
                     code=code,
                     error_log=error_log,
                     strategy_description=description,
                     strategy_id=strategy_id,
+                    extra_context=extra_ctx,
                 )
                 if not fixed_code:
                     log.warning("code_fixer_no_fix", strategy_id=strategy_id)

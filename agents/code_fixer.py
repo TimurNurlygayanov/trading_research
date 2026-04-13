@@ -79,6 +79,10 @@ _CODE_BUG_PATTERNS = [
     r"strategy_classes",
     r"exec\(",
     r"compile\(",
+    # Zero trades — entry logic never fires, session filter kills everything, or indicators are all NaN
+    r"zero trades on all timeframes",
+    r"0 trades on all timeframes",
+    r"zero signals",
 ]
 
 
@@ -113,23 +117,61 @@ def classify_error(error_log: str) -> ErrorClass:
 _FIX_SYSTEM = """You are an expert Python developer specialising in backtesting.py trading strategies.
 
 You will be given:
-1. Broken strategy code (a backtesting.py Strategy subclass)
-2. The Python traceback / error message
-3. The strategy description
+1. Strategy code (a backtesting.py Strategy subclass)
+2. The error message or failure description
+3. The original strategy description
 
-Your task: return ONLY the fixed, complete Python code. No explanation, no markdown fences, no extra text — just the raw Python code starting with imports.
+Your task: return ONLY the fixed, complete Python code. No explanation, no markdown fences, no extra text.
 
-Rules you MUST follow:
-- Use pandas_ta for all indicators (no manual RSI/ATR/EMA implementations)
-- All indicator calls must be inside init() using self.I()
-- next() must only read pre-computed arrays via [-1] or [-2] indexing
+═══════════════════════════════════
+ZERO TRADES DIAGNOSIS CHECKLIST
+(check these FIRST if error says "zero trades on all timeframes")
+═══════════════════════════════════
+
+1. SESSION FILTER TOO RESTRICTIVE
+   Problem: `start_hour=7, end_hour=20` blocks too many bars on 4h/1d data,
+   or the condition uses `< end_hour` which excludes the end_hour bar itself.
+   Fix: Change defaults to `start_hour: int = 0` and `end_hour: int = 23` so the filter
+   is effectively disabled with default params. The optimizer will find good session windows.
+   The check in next() should be:
+     hour = self.data.index[-1].hour
+     if not (self.start_hour <= hour < self.end_hour): return
+
+2. INDICATOR ALL NaN
+   Problem: pandas_ta returns NaN for the first `length` bars, and if `length` is large
+   relative to the dataset, most bars are NaN. Common with large EMA periods.
+   Fix: Add a NaN guard before using any indicator in next():
+     if np.isnan(self.ema[-1]) or np.isnan(self.atr[-1]): return
+   Also reduce default periods (e.g. ema_period=50 not 200).
+
+3. WRONG PANDAS_TA COLUMN NAME
+   Problem: `_st["SUPERT_7_3.0"]` fails if the actual column is `SUPERT_7_3` (no trailing zero)
+   or the period/multiplier don't match.
+   Fix: Use dynamic column names built from the actual params:
+     _st_col = f"SUPERT_{self.st_period}_{float(self.st_mult)}"
+   Then verify the column exists: if _st_col not in _st.columns: raise KeyError(...)
+
+4. ENTRY CONDITION USES [-1] INSTEAD OF [-2]
+   Problem: using self.indicator[-1] (current unconfirmed bar) causes issues.
+   Fix: Always use [-2] for the confirmed previous bar in entry signals.
+
+5. LONG AND SHORT BOTH BLOCKED BY SAME CONDITION
+   Problem: if `self.st_dir[-2] == 1` for long AND `self.st_dir[-2] == -1` for short,
+   but the condition is never met because of a logic error.
+   Fix: Add `else: self.position.close()` or remove conflicting conditions.
+
+═══════════════════════════════════
+GENERAL RULES
+═══════════════════════════════════
+- pandas_ta for all indicators (no manual RSI/ATR/EMA)
+- All self.I() calls must be in init(), never in next()
+- next() reads pre-computed arrays only via [-1] or [-2]
 - No shift(-N), no bfill(), no fitting on full dataset
-- The Strategy subclass must be at module level (not nested)
-- Use backtesting.py Strategy API: self.buy(), self.sell(), self.position
-- NEVER access self.position.sl or self.position.tp — Position has no .sl/.tp attributes.
-  Set SL/TP only via self.buy(sl=, tp=) or self.sell(sl=, tp=).
-  To modify stops on open trades: for trade in self.trades: trade.sl = new_value
-- Preserve the original strategy logic — only fix the bug, don't redesign"""
+- NEVER access self.position.sl or self.position.tp (Position has no .sl/.tp)
+  Set SL/TP only via self.buy(sl=..., tp=...) or self.sell(sl=..., tp=...)
+  Modify open trade stops: for trade in self.trades: trade.sl = new_value
+- Preserve the original strategy logic — only fix the bug, don't redesign
+- Return 100% complete, runnable Python code"""
 
 
 def fix_strategy_code(
@@ -137,15 +179,20 @@ def fix_strategy_code(
     error_log: str,
     strategy_description: str,
     strategy_id: str | None = None,
+    extra_context: str | None = None,
 ) -> str | None:
     """
     Use Claude Sonnet to fix a broken strategy.
     Returns the corrected code string, or None if the LLM can't fix it.
+
+    extra_context: optional additional diagnostic info (e.g. multi-TF test results)
     """
+    context_block = f"\nADDITIONAL CONTEXT:\n{extra_context}\n" if extra_context else ""
     user_msg = (
-        f"STRATEGY DESCRIPTION:\n{strategy_description[:500]}\n\n"
-        f"ERROR:\n{error_log[:1000]}\n\n"
-        f"BROKEN CODE:\n{code}"
+        f"STRATEGY DESCRIPTION:\n{strategy_description[:600]}\n\n"
+        f"FAILURE REASON:\n{error_log[:1200]}\n"
+        f"{context_block}\n"
+        f"CODE TO FIX:\n{code}"
     )
 
     try:

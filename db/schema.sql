@@ -148,6 +148,12 @@ ALTER TABLE strategies ADD COLUMN IF NOT EXISTS quick_test_signals_per_year    f
 -- Multi-timeframe quick test: best timeframe found and per-TF metrics dict
 ALTER TABLE strategies ADD COLUMN IF NOT EXISTS best_timeframe                 text;
 ALTER TABLE strategies ADD COLUMN IF NOT EXISTS quick_test_all_timeframes      jsonb;
+-- Trade-level data from best-TF quick test (for strategy_analyzer)
+ALTER TABLE strategies ADD COLUMN IF NOT EXISTS quick_test_trade_records       jsonb;
+-- Analysis findings from strategy_analyzer (session, trade cap, LLM interpretation)
+ALTER TABLE strategies ADD COLUMN IF NOT EXISTS analysis_notes                 jsonb;
+-- Flag: analysis already run for this quick_test cycle
+ALTER TABLE strategies ADD COLUMN IF NOT EXISTS analysis_done                  boolean DEFAULT false;
 
 -- Research task IDs blocking this strategy (set when awaiting research results)
 ALTER TABLE strategies ADD COLUMN IF NOT EXISTS pending_research_ids     jsonb DEFAULT '[]'::jsonb;
