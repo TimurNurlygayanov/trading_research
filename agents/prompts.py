@@ -30,6 +30,25 @@ Your job: evaluate whether a strategy idea is worth implementing and backtesting
 
 {shared_constraints}
 
+FIRST: CLASSIFY THE SUBMISSION TYPE
+Before scoring, determine if this is a strategy idea or a research question.
+
+submission_type = "strategy" when the submission describes:
+- Entry and/or exit rules for a trade
+- A trading approach or system (even vague ones like "buy the dip", "follow the trend")
+- An indicator combination to backtest
+- Anything that can be expressed as buy/sell signals
+
+submission_type = "research" when the submission asks:
+- How X relates to Y in market data (correlation, causality, regime)
+- Whether a market pattern exists (does London open have higher volatility?)
+- What the best settings for an indicator are (without describing a full strategy)
+- To analyse or explore data without a clear entry/exit rule
+- A question starting with "how", "what", "does", "is there", "analyse", "research", "explore"
+
+If submission_type = "research": fill in research_title and research_question, set verdict="proceed", score=0, and leave strategy-specific fields null.
+If submission_type = "strategy": score and classify normally using the criteria below.
+
 SCORING CRITERIA (score 1-10):
 1. Quantifiability (0-2): Can this be expressed as precise, code-able rules?
    - 2: fully quantifiable (specific indicators, thresholds, entry/exit rules)
@@ -60,7 +79,8 @@ BONUS: +2 if this is a user-submitted idea (source = "user") — prioritize user
 
 OUTPUT FORMAT (JSON only, no other text):
 {{
-  "score": <float 1-10>,
+  "submission_type": "strategy" | "research",
+  "score": <float 1-10, only meaningful when submission_type=strategy>,
   "score_breakdown": {{
     "quantifiability": <0-2>,
     "edge_plausibility": <0-2>,
@@ -77,7 +97,9 @@ OUTPUT FORMAT (JSON only, no other text):
   "suggested_symbols": ["EURUSD", "GBPUSD"],
   "strategy_name": "<concise 4-8 word title for this strategy, e.g. 'RSI Divergence VWAP Bounce 1H'>",
   "refined_description": "<rewrite the strategy description incorporating your suggestions: make entry/exit rules precise and quantifiable, add missing details like stop-loss type, TP target, session filter. Keep the user's original intent. 2-4 sentences max.>",
-  "notes": "<any important considerations for the Implementer agent>"
+  "notes": "<any important considerations for the Implementer agent>",
+  "research_title": "<only when submission_type=research: short title for the research task>",
+  "research_question": "<only when submission_type=research: precise research question, what to analyse and what output is expected>"
 }}
 
 Threshold: score >= 6 → proceed, score 4-5 → modify (suggest improvements), score < 4 → reject.

@@ -39,6 +39,15 @@ def update_strategy(strategy_id: str, updates: dict[str, Any]) -> None:
     sb.table("strategies").update(updates).eq("id", strategy_id).execute()
 
 
+def delete_strategy(strategy_id: str) -> None:
+    sb = get_client()
+    # Clear FK references first
+    sb.table("user_ideas").update({"strategy_id": None}).eq("strategy_id", strategy_id).execute()
+    sb.table("spend_log").delete().eq("strategy_id", strategy_id).execute()
+    sb.table("knowledge_base").delete().eq("strategy_id", strategy_id).execute()
+    sb.table("strategies").delete().eq("id", strategy_id).execute()
+
+
 def get_strategy(strategy_id: str) -> dict[str, Any] | None:
     sb = get_client()
     result = sb.table("strategies").select("*").eq("id", strategy_id).execute()

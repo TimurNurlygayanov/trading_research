@@ -1434,15 +1434,11 @@ _IDEAS_HTML = """<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Trading Strategy Ideas</title>
+<title>Ideas — Trading Research</title>
 <style>
   *, *::before, *::after { box-sizing: border-box; }
-  body {
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-    background: #0f1117; color: #e2e8f0;
-    margin: 0; padding: 0;
-    min-height: 100vh;
-  }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+         background: #0f1117; color: #e2e8f0; margin: 0; padding: 0; min-height: 100vh; }
   .nav { display: flex; align-items: center; gap: 0; background: #111827;
          border-bottom: 1px solid #1f2937; padding: 0 24px; }
   .nav-logo { font-weight: 700; font-size: 0.95rem; color: #f8fafc;
@@ -1450,56 +1446,45 @@ _IDEAS_HTML = """<!DOCTYPE html>
   .nav a { display: block; padding: 14px 16px; font-size: 0.85rem; color: #94a3b8;
            text-decoration: none; border-bottom: 2px solid transparent; transition: color .15s; }
   .nav a:hover, .nav a.active { color: #f1f5f9; border-bottom-color: #6366f1; }
-  .page { padding: 32px 24px; }
-  h1 { font-size: 1.5rem; font-weight: 600; margin: 0 0 4px; color: #f8fafc; }
-  .subtitle { color: #94a3b8; font-size: 0.875rem; margin: 0 0 32px; }
-  .card {
-    background: #1e2533; border: 1px solid #2d3748;
-    border-radius: 12px; padding: 28px;
-    max-width: 680px; margin: 0 auto 32px;
-  }
-  label { display: block; font-size: 0.8rem; font-weight: 500;
-          color: #94a3b8; margin-bottom: 6px; text-transform: uppercase; letter-spacing: .05em; }
-  input[type=text], textarea, select {
+  .page { padding: 40px 24px; max-width: 720px; margin: 0 auto; }
+  h1 { font-size: 1.5rem; font-weight: 600; margin: 0 0 6px; color: #f8fafc; }
+  .subtitle { color: #64748b; font-size: 0.9rem; margin: 0 0 32px; line-height: 1.6; }
+  .card { background: #1e2533; border: 1px solid #2d3748;
+          border-radius: 12px; padding: 28px; margin-bottom: 36px; }
+  textarea {
     width: 100%; background: #0f1117; border: 1px solid #374151;
-    border-radius: 8px; color: #f1f5f9; padding: 10px 14px;
-    font-size: 0.95rem; outline: none;
-    transition: border-color .15s;
+    border-radius: 8px; color: #f1f5f9; padding: 14px;
+    font-size: 1rem; outline: none; transition: border-color .15s;
+    resize: vertical; min-height: 130px; font-family: inherit; line-height: 1.6;
   }
-  input[type=text]:focus, textarea:focus, select:focus { border-color: #6366f1; }
-  textarea { resize: vertical; min-height: 110px; font-family: inherit; }
-  .field { margin-bottom: 20px; }
-button[type=submit] {
-    width: 100%; background: #6366f1; color: #fff;
-    border: none; border-radius: 8px; padding: 12px;
-    font-size: 1rem; font-weight: 600; cursor: pointer;
+  textarea:focus { border-color: #6366f1; }
+  .hint { font-size: .78rem; color: #475569; margin: 10px 0 20px; }
+  button[type=submit] {
+    background: #6366f1; color: #fff; border: none; border-radius: 8px;
+    padding: 12px 28px; font-size: .95rem; font-weight: 600; cursor: pointer;
     transition: background .15s;
   }
   button[type=submit]:hover { background: #4f46e5; }
-  .flash {
-    max-width: 680px; margin: 0 auto 24px;
-    padding: 14px 18px; border-radius: 8px;
-    font-size: 0.9rem; font-weight: 500;
-  }
+  .flash { margin-bottom: 24px; padding: 14px 18px; border-radius: 8px;
+           font-size: 0.9rem; font-weight: 500; }
   .flash.success { background: #14532d; border: 1px solid #16a34a; color: #bbf7d0; }
   .flash.error   { background: #450a0a; border: 1px solid #dc2626; color: #fecaca; }
-  .ideas-list { max-width: 680px; margin: 0 auto; }
-  .idea-row {
-    background: #1e2533; border: 1px solid #2d3748;
-    border-radius: 10px; padding: 16px 20px; margin-bottom: 12px;
-  }
-  .idea-title { font-weight: 600; color: #f1f5f9; margin-bottom: 4px; }
-  .idea-meta  { font-size: 0.8rem; color: #64748b; }
-  .badge {
-    display: inline-block; padding: 2px 10px; border-radius: 99px;
-    font-size: 0.75rem; font-weight: 600; margin-left: 8px;
-  }
-  .badge-pending    { background: #1e3a5f; color: #93c5fd; }
-  .badge-picked_up  { background: #1c3352; color: #67e8f9; }
-  .badge-done       { background: #14532d; color: #86efac; }
-  .badge-failed     { background: #450a0a; color: #fca5a5; }
-  .section-title { font-size: 1rem; font-weight: 600; color: #94a3b8;
-                   max-width: 680px; margin: 0 auto 14px; }
+  .feed-hdr { font-size: .75rem; font-weight: 600; color: #475569;
+              text-transform: uppercase; letter-spacing: .07em; margin: 0 0 14px; }
+  .feed-row { background: #1e2533; border: 1px solid #2d3748;
+              border-radius: 10px; padding: 14px 18px; margin-bottom: 10px; }
+  .feed-title { font-weight: 600; color: #f1f5f9; font-size: .95rem; }
+  .feed-desc  { color: #94a3b8; font-size: .82rem; margin: 4px 0; }
+  .feed-meta  { font-size: .75rem; color: #475569; }
+  .badge { display: inline-block; padding: 2px 9px; border-radius: 99px;
+           font-size: .72rem; font-weight: 600; margin-left: 8px; vertical-align: middle; }
+  .badge-pending   { background: #1e3a5f; color: #93c5fd; }
+  .badge-running   { background: #1c3352; color: #67e8f9; }
+  .badge-done      { background: #14532d; color: #86efac; }
+  .badge-failed    { background: #450a0a; color: #fca5a5; }
+  .badge-picked_up { background: #1c3352; color: #67e8f9; }
+  .type-strategy { color: #818cf8; font-size: .72rem; font-weight: 600; }
+  .type-research { color: #34d399; font-size: .72rem; font-weight: 600; }
 </style>
 </head>
 <body>
@@ -1509,77 +1494,84 @@ button[type=submit] {
   <a href="/ideas" class="active">Ideas</a>
   <a href="/research">Research</a>
   <a href="/data">Data</a>
-
 </nav>
-
 <div class="page">
-<div style="max-width:680px;margin:0 auto 28px">
-  <h1>Strategy Ideas</h1>
-  <p class="subtitle">Describe your idea in plain English — the pipeline handles the rest.</p>
-</div>
+  <h1>Submit an Idea</h1>
+  <p class="subtitle">Strategy idea, research question, market pattern to investigate — describe it in plain text.<br>
+  The agent will classify it and route it to the right pipeline automatically.</p>
 
-{flash}
+  {flash}
 
-<div class="card">
-  <form method="post" action="/ideas">
-    <div class="field">
-      <label>Description *</label>
-      <textarea name="description" placeholder="Describe the entry/exit logic, which indicators, timeframe, markets. The more detail the better — but vague ideas work too." required></textarea>
-    </div>
-    <div class="field">
-      <label>Notes (optional)</label>
-      <textarea name="notes" placeholder="Known caveats, inspiration papers, session preferences, etc." style="min-height:70px"></textarea>
-    </div>
-    <button type="submit">Submit for Analysis</button>
-  </form>
-</div>
+  <div class="card">
+    <form method="post" action="/ideas">
+      <textarea name="description" rows="5"
+        placeholder="Examples:&#10;• Buy when RSI crosses above 30 and price is above 200 EMA on EURUSD&#10;• Does the London open spike reverse within 30 minutes?&#10;• Analyse how 1m volume predicts the next 1h candle direction&#10;• SuperTrend + MACD crossover with session filter" required></textarea>
+      <div class="hint">Strategy ideas get implemented and backtested. Research questions get analysed by a data agent. The pipeline decides which is which.</div>
+      <button type="submit">Submit</button>
+    </form>
+  </div>
 
-{ideas_section}
-
+  {feed_section}
 </div>
 </body>
 </html>"""
 
 
 def _render_ideas_page(flash: str = "", flash_type: str = "") -> str:
-    flash_html = ""
-    if flash:
-        flash_html = f'<div class="flash {flash_type}">{flash}</div>'
+    flash_html = f'<div class="flash {flash_type}">{flash}</div>' if flash else ""
 
-    # Load recent ideas from DB
-    ideas_html = ""
+    feed_items = ""
     try:
         sb = db.get_client()
-        result = (
+        # Recent strategy ideas (user_ideas inbox)
+        idea_rows = (
             sb.table("user_ideas")
             .select("id, title, description, status, created_at")
             .order("created_at", desc=True)
-            .limit(20)
+            .limit(15)
             .execute()
-        )
-        rows = result.data or []
-        if rows:
-            items = ""
-            for r in rows:
-                badge_cls = f"badge-{r['status'].replace('_', '_')}"
-                ts = r["created_at"][:10] if r.get("created_at") else ""
-                desc_preview = (r["description"] or "")[:120].replace("<", "&lt;")
-                if len(r["description"] or "") > 120:
-                    desc_preview += "…"
-                items += f"""
-                <div class="idea-row">
-                  <div class="idea-title">
-                    {r['title']}
-                    <span class="badge {badge_cls}">{r['status']}</span>
-                  </div>
-                  <div style="color:#94a3b8;font-size:.875rem;margin:4px 0 4px">{desc_preview}</div>
-                  <div class="idea-meta">{ts}</div>
-                </div>"""
-            ideas_html = f'<div class="section-title">Recent Ideas</div><div class="ideas-list">{items}</div>'
+        ).data or []
+        for r in idea_rows:
+            ts = (r.get("created_at") or "")[:10]
+            preview = (r.get("description") or "")[:100].replace("<", "&lt;")
+            if len(r.get("description") or "") > 100:
+                preview += "…"
+            badge = f'<span class="badge badge-{r["status"]}">{r["status"]}</span>'
+            feed_items += f"""<div class="feed-row">
+              <div class="feed-title"><span class="type-strategy">strategy</span> {badge}</div>
+              <div class="feed-desc">{preview}</div>
+              <div class="feed-meta">{ts}</div>
+            </div>"""
     except Exception:
         pass
 
-    return _IDEAS_HTML.replace("{flash}", flash_html).replace("{ideas_section}", ideas_html)
+    try:
+        tasks = db.get_research_tasks(status="all", limit=15)
+        for t in tasks:
+            ts = (t.get("created_at") or "")[:10]
+            preview = (t.get("result_summary") or t.get("question") or "")[:100].replace("<", "&lt;")
+            if len(preview) == 100:
+                preview += "…"
+            status = t.get("status", "pending")
+            badge = f'<span class="badge badge-{status}">{status}</span>'
+            feed_items += f"""<div class="feed-row">
+              <div class="feed-title"><span class="type-research">research</span>
+                {(t.get("title") or "")[:70]} {badge}</div>
+              <div class="feed-desc">{preview}</div>
+              <div class="feed-meta">{ts}</div>
+            </div>"""
+    except Exception:
+        pass
+
+    feed_section = ""
+    if feed_items:
+        feed_section = f'<div class="feed-hdr">Recent Submissions</div>{feed_items}'
+
+    return (
+        _IDEAS_HTML
+        .replace("{flash}", flash_html)
+        .replace("{feed_section}", feed_section)
+    )
 
 
 @app.get("/ideas", response_class=HTMLResponse)
@@ -1591,15 +1583,12 @@ def ideas_page() -> HTMLResponse:
 def submit_idea(
     background_tasks: BackgroundTasks,
     description: str = Form(...),
-    notes: str = Form(""),
 ):
     description = description.strip()
-    notes = notes.strip()
-
     if not description:
         return HTMLResponse(_render_ideas_page("Description is required.", "error"))
 
-    # Auto-generate a placeholder title from description (LLM will rename it during pre-filter)
+    # Placeholder title from description — LLM renames it during pre-filter
     title = description[:80].rstrip() + ("…" if len(description) > 80 else "")
 
     try:
@@ -1607,14 +1596,11 @@ def submit_idea(
         result = sb.table("user_ideas").insert({
             "title": title,
             "description": description,
-            "notes": notes or None,
             "status": "pending",
         }).execute()
         idea_id = result.data[0]["id"] if result.data else "?"
         log.info("idea_submitted", idea_id=idea_id, title=title)
-        # Process immediately in background instead of waiting for the 10-min scheduler
         background_tasks.add_task(_scheduled_queue_worker)
-        # Redirect to dashboard so the user can see their idea in the pipeline
         return RedirectResponse(url="/dashboard", status_code=303)
     except Exception as exc:
         log.error("idea_submit_failed", error=str(exc))

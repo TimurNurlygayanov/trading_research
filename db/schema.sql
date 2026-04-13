@@ -285,7 +285,8 @@ BEGIN
   FOR pol IN
     SELECT policyname, tablename FROM pg_policies
     WHERE tablename IN (
-      'strategies', 'user_ideas', 'generated_ideas', 'knowledge_base', 'spend_log'
+      'strategies', 'user_ideas', 'generated_ideas', 'knowledge_base', 'spend_log',
+      'research_tasks'
     )
   LOOP
     EXECUTE format('DROP POLICY IF EXISTS %I ON %I', pol.policyname, pol.tablename);

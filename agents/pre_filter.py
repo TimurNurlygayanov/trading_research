@@ -65,13 +65,37 @@ def run_pre_filter(strategy_id: str) -> dict[str, Any]:
     raw_text = response.content[0].text.strip()
     result = _parse_json_response(raw_text, strategy_id)
 
+    score = float(result.get("score", 0))
+    verdict = result.get("verdict", "reject")
+    submission_type = result.get("submission_type", "strategy")
+
+    # ── Route research questions to the research pipeline ────────────────────
+    if submission_type == "research":
+        research_title    = result.get("research_title") or strategy.get("name") or "Research Task"
+        research_question = result.get("research_question") or strategy.get("hypothesis") or ""
+        task = db.insert_research_task({
+            "title":    research_title,
+            "question": research_question,
+            "type":     "market_analysis",
+            "status":   "pending",
+            "created_by_strategy_id": None,
+        })
+        task_id = task.get("id", "?") if task else "?"
+        log.info("idea_routed_as_research", strategy_id=strategy_id, task_id=task_id)
+        # Delete the placeholder strategy record — it's not a strategy
+        try:
+            db.delete_strategy(strategy_id)
+        except Exception as _del_err:
+            log.warning("could_not_delete_placeholder_strategy", error=str(_del_err))
+        return {"submission_type": "research", "task_id": task_id}
+
+    # ── Strategy flow ────────────────────────────────────────────────────────
     # Apply user bonus
     if strategy.get("source") == "user":
         result["score"] = min(10.0, result.get("score", 0) + 2.0)
         result["score_breakdown"]["user_bonus"] = 2
 
     score = float(result.get("score", 0))
-    verdict = result.get("verdict", "reject")
 
     if verdict == "proceed" and score >= MIN_SCORE_TO_PROCEED:
         new_status = "filtered"
@@ -102,7 +126,6 @@ def run_pre_filter(strategy_id: str) -> dict[str, Any]:
         mods = result.get("suggested_modifications")
         note = f"Pre-filter passed — score {score:.1f}/10, verdict: {verdict}."
         if mods:
-            # Convert "1. ... 2. ..." into a proper newline-separated list
             import re
             mods_formatted = re.sub(r'\s+(\d+\.)\s+', r'\n\1 ', mods.strip())
             note += f"\n\nSuggestions:\n{mods_formatted}"
