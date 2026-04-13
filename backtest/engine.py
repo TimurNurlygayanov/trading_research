@@ -45,11 +45,11 @@ class BacktestResult:
     equity_peak: float
     return_pct: float
 
-    # Per-trade Sharpe (annualized from trade P&L — more reliable for intraday)
-    trade_sharpe: float = 0.0
-
     # Raw stats dict from backtesting.py
     raw_stats: dict[str, Any]
+
+    # Per-trade Sharpe (annualized from trade P&L — more reliable for intraday)
+    trade_sharpe: float = 0.0
 
     # Trade-level DataFrame
     trades: pd.DataFrame | None = None
