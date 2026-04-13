@@ -138,6 +138,17 @@ ALTER TABLE strategies ADD COLUMN IF NOT EXISTS report_text            text;
 ALTER TABLE strategies ADD COLUMN IF NOT EXISTS equity_curve_url       text;
 ALTER TABLE strategies ADD COLUMN IF NOT EXISTS exit_logic             text;
 
+-- Quick test results (raw run with default params, no optimization)
+ALTER TABLE strategies ADD COLUMN IF NOT EXISTS quick_test_sharpe        float8;
+ALTER TABLE strategies ADD COLUMN IF NOT EXISTS quick_test_calmar        float8;
+ALTER TABLE strategies ADD COLUMN IF NOT EXISTS quick_test_drawdown      float8;
+ALTER TABLE strategies ADD COLUMN IF NOT EXISTS quick_test_trades        int;
+ALTER TABLE strategies ADD COLUMN IF NOT EXISTS quick_test_win_rate      float8;
+ALTER TABLE strategies ADD COLUMN IF NOT EXISTS quick_test_signals_per_year float8;
+
+-- Research task IDs blocking this strategy (set when awaiting research results)
+ALTER TABLE strategies ADD COLUMN IF NOT EXISTS pending_research_ids     jsonb DEFAULT '[]'::jsonb;
+
 CREATE INDEX IF NOT EXISTS idx_strategies_status     ON strategies(status);
 CREATE INDEX IF NOT EXISTS idx_strategies_updated_at ON strategies(updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_strategies_source     ON strategies(source);
@@ -279,6 +290,62 @@ BEGIN
 END $$;
 
 CREATE POLICY allow_all ON strategies      FOR ALL USING (true) WITH CHECK (true);
+
+
+-- =============================================================================
+-- Table: research_tasks  (standalone research + those spawned by agents)
+-- =============================================================================
+
+CREATE TABLE IF NOT EXISTS research_tasks (
+  id                      uuid         PRIMARY KEY DEFAULT gen_random_uuid(),
+
+  -- Task identity
+  type                    text         NOT NULL DEFAULT 'market_analysis',
+  -- 'market_analysis' | 'indicator_research' | 'custom'
+  title                   text         NOT NULL,
+  question                text         NOT NULL,  -- the research question / objective
+
+  -- Data requirements (optional — what OHLCV data the analysis needs)
+  data_requirements       jsonb,        -- {symbol: str, timeframe: str, start: str, end: str}
+
+  -- Pipeline state
+  status                  text         NOT NULL DEFAULT 'pending',
+  -- pending → running → done | failed
+
+  -- Results
+  result_summary          text,         -- 2-4 sentence plain text summary of findings
+  report_text             text,         -- full markdown report
+  report_url              text,         -- Cloudflare R2 URL (if uploaded)
+  key_findings            jsonb,        -- [{finding: str, confidence: float}]
+  generated_code          text,         -- the Python analysis code that was executed
+
+  -- Provenance
+  created_by_strategy_id  uuid         REFERENCES strategies(id) ON DELETE SET NULL,
+  -- null = standalone research task submitted directly
+
+  -- Compute tracking
+  modal_job_id            text,
+  error_log               text,
+
+  created_at              timestamptz  NOT NULL DEFAULT now(),
+  updated_at              timestamptz  NOT NULL DEFAULT now()
+);
+
+ALTER TABLE research_tasks ADD COLUMN IF NOT EXISTS generated_code text;
+ALTER TABLE research_tasks ADD COLUMN IF NOT EXISTS key_findings    jsonb;
+
+CREATE INDEX IF NOT EXISTS idx_research_tasks_status     ON research_tasks(status);
+CREATE INDEX IF NOT EXISTS idx_research_tasks_type       ON research_tasks(type);
+CREATE INDEX IF NOT EXISTS idx_research_tasks_created_at ON research_tasks(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_research_tasks_strategy   ON research_tasks(created_by_strategy_id);
+
+DROP TRIGGER IF EXISTS trg_research_tasks_updated_at ON research_tasks;
+CREATE TRIGGER trg_research_tasks_updated_at
+  BEFORE UPDATE ON research_tasks
+  FOR EACH ROW EXECUTE FUNCTION _set_updated_at();
+
+ALTER TABLE research_tasks ENABLE ROW LEVEL SECURITY;
+CREATE POLICY allow_all ON research_tasks FOR ALL USING (true) WITH CHECK (true);
 CREATE POLICY allow_all ON user_ideas       FOR ALL USING (true) WITH CHECK (true);
 CREATE POLICY allow_all ON generated_ideas  FOR ALL USING (true) WITH CHECK (true);
 CREATE POLICY allow_all ON knowledge_base   FOR ALL USING (true) WITH CHECK (true);

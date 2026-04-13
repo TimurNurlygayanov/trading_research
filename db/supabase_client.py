@@ -199,6 +199,49 @@ def get_data_cache_bars(symbol: str, timeframe: str) -> list[dict[str, Any]]:
     return raw if isinstance(raw, list) else []
 
 
+# ── research_tasks ───────────────────────────────────────────────────────────
+
+def insert_research_task(data: dict[str, Any]) -> dict[str, Any]:
+    sb = get_client()
+    result = sb.table("research_tasks").insert(data).execute()
+    return result.data[0]
+
+
+def update_research_task(task_id: str, updates: dict[str, Any]) -> None:
+    sb = get_client()
+    sb.table("research_tasks").update(updates).eq("id", task_id).execute()
+
+
+def get_research_task(task_id: str) -> dict[str, Any] | None:
+    sb = get_client()
+    result = sb.table("research_tasks").select("*").eq("id", task_id).execute()
+    return result.data[0] if result.data else None
+
+
+def get_research_tasks(status: str = "pending", limit: int = 20) -> list[dict[str, Any]]:
+    sb = get_client()
+    q = sb.table("research_tasks").select("*")
+    if status != "all":
+        q = q.eq("status", status)
+    result = q.order("created_at", desc=True).limit(limit).execute()
+    return result.data or []
+
+
+def get_strategies_awaiting_research(limit: int = 5) -> list[dict[str, Any]]:
+    """Return strategies blocked waiting for research tasks to complete."""
+    sb = get_client()
+    result = (
+        sb.table("strategies")
+        .select("id, name, pending_research_ids, hypothesis, entry_logic, "
+                "indicators, pre_filter_notes, hyperparams")
+        .eq("status", "awaiting_research")
+        .order("created_at")
+        .limit(limit)
+        .execute()
+    )
+    return result.data or []
+
+
 def get_daily_spend(for_date: date | None = None) -> float:
     sb = get_client()
     target = (for_date or date.today()).isoformat()

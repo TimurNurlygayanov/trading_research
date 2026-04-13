@@ -60,6 +60,7 @@ def run_backtest(
     cash: float = 10_000.0,
     commission: float = 0.0002,
     exclusive_orders: bool = True,
+    enforce_gates: bool = True,
 ) -> BacktestResult:
     """
     Run a single backtest. Returns BacktestResult with pass/fail and all metrics.
@@ -105,7 +106,7 @@ def run_backtest(
     total_trades = len(trades_df)
 
     # ── Signal count check ───────────────────────────────────────────────────
-    if total_trades < MIN_SIGNALS_TOTAL:
+    if enforce_gates and total_trades < MIN_SIGNALS_TOTAL:
         return BacktestResult(
             passed=False,
             reject_reason=(
@@ -125,7 +126,7 @@ def run_backtest(
         entry_times = pd.to_datetime(trades_df["EntryTime"])
         trades_per_year = entry_times.dt.year.value_counts()
         min_per_year = int(trades_per_year.min())
-        if min_per_year < MIN_SIGNALS_PER_YEAR:
+        if enforce_gates and min_per_year < MIN_SIGNALS_PER_YEAR:
             worst_year = int(trades_per_year.idxmin())
             return BacktestResult(
                 passed=False,
@@ -159,12 +160,13 @@ def run_backtest(
 
     # ── Quality gates ────────────────────────────────────────────────────────
     reject_reason = None
-    if sharpe < MIN_SHARPE:
-        reject_reason = f"Sharpe {sharpe:.2f} below minimum {MIN_SHARPE}"
-    elif calmar < MIN_CALMAR:
-        reject_reason = f"Calmar {calmar:.2f} below minimum {MIN_CALMAR}"
-    elif max_dd > MAX_DRAWDOWN:
-        reject_reason = f"Max drawdown {max_dd:.1%} exceeds maximum {MAX_DRAWDOWN:.1%}"
+    if enforce_gates:
+        if sharpe < MIN_SHARPE:
+            reject_reason = f"Sharpe {sharpe:.2f} below minimum {MIN_SHARPE}"
+        elif calmar < MIN_CALMAR:
+            reject_reason = f"Calmar {calmar:.2f} below minimum {MIN_CALMAR}"
+        elif max_dd > MAX_DRAWDOWN:
+            reject_reason = f"Max drawdown {max_dd:.1%} exceeds maximum {MAX_DRAWDOWN:.1%}"
 
     return BacktestResult(
         passed=reject_reason is None,

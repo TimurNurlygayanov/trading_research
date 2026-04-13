@@ -312,7 +312,53 @@ IMPORTANT: The "Recommended timeframes" above is the user's intended timeframe �
 Knowledge base (what works and fails):
 {knowledge_base_context}
 
+Research results available (pre-computed analysis for this strategy):
+{research_context}
+
 Generate the complete strategy code following the template. Return JSON only."""
+
+
+IMPLEMENTER_USER_TEMPLATE_WITH_RESEARCH_OPTION = """Implement this trading strategy, OR request research if you need data analysis first.
+
+Title: {title}
+Description: {description}
+Notes: {notes}
+Pre-filter notes: {pre_filter_notes}
+Suggested indicators: {indicators}
+Recommended timeframes: {timeframes}
+Recommended symbols: {symbols}
+
+Knowledge base (what works and fails):
+{knowledge_base_context}
+
+You have TWO options:
+
+OPTION A — Request research first (use this if you need statistical evidence before coding):
+Return:
+{{
+  "needs_research_first": true,
+  "reason": "<why you need the research>",
+  "research_tasks": [
+    {{
+      "type": "market_analysis" | "indicator_research" | "custom",
+      "title": "<short task title>",
+      "question": "<specific research question — must be answerable by running Python code on OHLCV data>",
+      "data_requirements": {{
+        "symbol": "<e.g. EURUSD>",
+        "timeframe": "<e.g. 1h>",
+        "start": "<YYYY-MM-DD>",
+        "end": "<YYYY-MM-DD or omit for latest>"
+      }}
+    }}
+  ]
+}}
+
+OPTION B — Implement now (use this if you have enough information):
+Return the full strategy JSON (code, param_space, etc.) as documented.
+
+Choose OPTION A only if the strategy hypothesis depends on a specific statistical pattern that you are genuinely uncertain about (e.g., "does X correlate with Y?", "how often does this pattern occur?"). For standard indicator-based strategies, always choose OPTION B directly.
+
+Return JSON only."""
 
 
 # ── Agent 4: Validator ───────────────────────────────────────────────────────
@@ -471,6 +517,104 @@ Rules:
 - Extract 2-5 insights per strategy result
 - Negative findings are equally valuable: record what fails with the same specificity
 """
+
+# ── Agent: Researcher ────────────────────────────────────────────────────────
+
+RESEARCHER_SYSTEM = """You are the Researcher agent for an algorithmic trading research pipeline.
+Your job: write Python analysis code that investigates a specific research question about market data.
+
+The code you write will be executed in a safe sandbox with access to:
+- `pd` (pandas)
+- `np` (numpy)
+- `scipy_stats` (scipy.stats)
+- `data["df"]` — a pandas DataFrame with OHLCV columns (Open, High, Low, Close, Volume)
+  with DatetimeIndex in UTC. May be None if no data was requested.
+- `data["question"]` — the research question string
+
+CODE REQUIREMENTS:
+1. Define exactly one function: `run_analysis(data: dict) -> dict`
+2. The function must return a dict with at minimum:
+   - "summary": str — 3-6 sentence plain English summary of what was found
+   - "key_findings": list[str] — bullet-point findings (3-10 items), each < 100 chars
+   - "report_text": str (optional) — detailed markdown report with tables/sections
+3. Use pandas and numpy for all calculations — no external library calls
+4. Include descriptive print() statements so the user can follow the analysis
+5. Handle edge cases: check for NaN, empty data, division by zero
+6. For time series analysis: respect the chronological order of data — no lookahead
+
+STATISTICAL TOOLS AVAILABLE:
+- scipy_stats.pearsonr(x, y) → (r, p_value)
+- scipy_stats.spearmanr(x, y) → (rho, p_value)
+- scipy_stats.ttest_1samp(data, 0) → (t, p_value)
+- scipy_stats.ttest_ind(group1, group2) → (t, p_value)
+- scipy_stats.mannwhitneyu(group1, group2) → (u, p_value)
+- np.corrcoef(x, y) → correlation matrix
+- pd.Series.rolling(n).mean() / .std() / .corr(other)
+- pd.Series.autocorr(lag) → autocorrelation at lag
+
+COMMON ANALYSIS PATTERNS:
+
+Rolling correlation:
+```python
+returns = df["Close"].pct_change()
+rolling_corr = returns.rolling(252).corr(some_other_series)
+```
+
+Regime detection (above/below MA):
+```python
+ma = df["Close"].rolling(200).mean()
+in_uptrend = df["Close"] > ma
+```
+
+Bar-by-bar statistics:
+```python
+df["hour"] = df.index.hour
+df["return"] = df["Close"].pct_change()
+hourly_stats = df.groupby("hour")["return"].agg(["mean", "std", "count"])
+```
+
+Feature → forward return correlation:
+```python
+df["feature"] = ...  # some indicator
+df["fwd_return"] = df["Close"].pct_change().shift(-1)  # ONLY in research — not in strategy code
+corr, pval = scipy_stats.pearsonr(
+    df["feature"].dropna(),
+    df["fwd_return"].reindex(df["feature"].dropna().index).fillna(0)
+)
+```
+
+OUTPUT FORMAT (the function's return dict):
+{{
+  "summary": "3-6 sentences describing the main finding and its practical implications.",
+  "key_findings": [
+    "Finding 1 with specific numbers (e.g., correlation=0.32, p=0.001)",
+    "Finding 2 ...",
+    ...
+  ],
+  "report_text": "## Title\\n\\nFull markdown report with tables and sections..."
+}}
+
+IMPORTANT: Always include statistical significance (p-values, confidence intervals) in your findings.
+A finding without a p-value or sample size is not actionable.
+"""
+
+RESEARCHER_USER_TEMPLATE = """Write Python analysis code to answer this research question:
+
+Title: {title}
+Question: {question}
+Task type: {task_type}
+
+Data available:
+- Symbol: {symbol}
+- Timeframe: {timeframe}
+- Date range: {start} to {end}
+- DataFrame columns: Open, High, Low, Close, Volume (DatetimeIndex UTC)
+
+Write complete Python code defining run_analysis(data) → dict.
+Return ONLY the Python code — no explanation, no markdown fences."""
+
+
+# ── Agent 6: Learner ─────────────────────────────────────────────────────────
 
 LEARNER_USER_TEMPLATE = """Extract knowledge from this strategy result:
 

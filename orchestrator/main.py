@@ -164,24 +164,36 @@ def api_restart_strategy(strategy_id: str, background_tasks: BackgroundTasks) ->
       validating                → redispatch validator job (keep status)
     """
     try:
-        from orchestrator.queue_worker import _dispatch_backtest_job, _dispatch_validator_job
+        from orchestrator.queue_worker import (
+            _dispatch_quick_backtest_job, _dispatch_backtest_job, _dispatch_validator_job,
+        )
         strategy = db.get_strategy(strategy_id)
         if not strategy:
             return JSONResponse({"error": "not found"}, status_code=404)
 
         status = strategy.get("status")
-        if status in ("implemented", "backtesting"):
-            db.update_strategy(strategy_id, {"status": "implemented", "error_log": None})
+        if status in ("implemented", "quick_testing", "quick_tested"):
+            db.update_strategy(strategy_id, {
+                "status": "implemented", "error_log": None, "modal_job_id": None,
+            })
+            background_tasks.add_task(_dispatch_quick_backtest_job, strategy_id)
+            log.info("strategy_restarted_quick_backtest", strategy_id=strategy_id)
+            return JSONResponse({"ok": True, "dispatched_to": "quick_backtest"})
+        elif status == "backtesting":
+            db.update_strategy(strategy_id, {
+                "status": "quick_tested", "error_log": None, "modal_job_id": None,
+            })
             background_tasks.add_task(_dispatch_backtest_job, strategy_id)
-            log.info("strategy_restarted_backtest", strategy_id=strategy_id)
-            return JSONResponse({"ok": True, "dispatched_to": "backtest"})
+            log.info("strategy_restarted_full_backtest", strategy_id=strategy_id)
+            return JSONResponse({"ok": True, "dispatched_to": "full_backtest"})
         elif status == "validating":
+            db.update_strategy(strategy_id, {"modal_job_id": None})
             background_tasks.add_task(_dispatch_validator_job, strategy_id)
             log.info("strategy_restarted_validator", strategy_id=strategy_id)
             return JSONResponse({"ok": True, "dispatched_to": "validator"})
         else:
             return JSONResponse(
-                {"error": f"restart only available for implemented/backtesting/validating (current: {status})"},
+                {"error": f"restart only available for implemented/quick_testing/quick_tested/backtesting/validating (current: {status})"},
                 status_code=400,
             )
     except Exception as exc:
@@ -560,16 +572,19 @@ _DASHBOARD_HTML = r"""<!DOCTYPE html>
   /* ── status badges ── */
   .badge { display: inline-block; padding: 2px 10px; border-radius: 99px;
            font-size: 0.72rem; font-weight: 600; white-space: nowrap; }
-  .s-idea        { background: #1e293b; color: #94a3b8; }
-  .s-filtered    { background: #1e3a5f; color: #93c5fd; }
-  .s-implementing{ background: #2d1f5e; color: #c4b5fd; animation: pulse-purple 2s infinite; }
-  .s-implemented { background: #2d1f5e; color: #c4b5fd; }
-  .s-backtesting { background: #3b2f00; color: #fcd34d; animation: pulse-yellow 2s infinite; }
-  .s-validating  { background: #1c3352; color: #67e8f9; animation: pulse-cyan 2s infinite; }
-  .s-live        { background: #14532d; color: #86efac; }
-  .s-done        { background: #14532d; color: #86efac; }
-  .s-failed      { background: #450a0a; color: #fca5a5; }
-  .s-rejected    { background: #450a0a; color: #fca5a5; }
+  .s-idea              { background: #1e293b; color: #94a3b8; }
+  .s-filtered          { background: #1e3a5f; color: #93c5fd; }
+  .s-implementing      { background: #2d1f5e; color: #c4b5fd; animation: pulse-purple 2s infinite; }
+  .s-awaiting-research { background: #3b2000; color: #fb923c; animation: pulse-orange 2s infinite; }
+  .s-implemented       { background: #2d1f5e; color: #c4b5fd; }
+  .s-quick-testing     { background: #1a3a2a; color: #4ade80; animation: pulse-green 2s infinite; }
+  .s-quick-tested      { background: #1a3a2a; color: #4ade80; }
+  .s-backtesting       { background: #3b2f00; color: #fcd34d; animation: pulse-yellow 2s infinite; }
+  .s-validating        { background: #1c3352; color: #67e8f9; animation: pulse-cyan 2s infinite; }
+  .s-live              { background: #14532d; color: #86efac; }
+  .s-done              { background: #14532d; color: #86efac; }
+  .s-failed            { background: #450a0a; color: #fca5a5; }
+  .s-rejected          { background: #450a0a; color: #fca5a5; }
 
   @keyframes pulse-purple {
     0%, 100% { box-shadow: 0 0 0 0 rgba(139,92,246,.5); }
@@ -582,6 +597,14 @@ _DASHBOARD_HTML = r"""<!DOCTYPE html>
   @keyframes pulse-cyan {
     0%, 100% { box-shadow: 0 0 0 0 rgba(103,232,249,.5); }
     50%       { box-shadow: 0 0 0 4px rgba(103,232,249,0); }
+  }
+  @keyframes pulse-orange {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(251,146,60,.5); }
+    50%       { box-shadow: 0 0 0 4px rgba(251,146,60,0); }
+  }
+  @keyframes pulse-green {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(74,222,128,.5); }
+    50%       { box-shadow: 0 0 0 4px rgba(74,222,128,0); }
   }
 
   /* ── metric cells ── */
@@ -678,7 +701,7 @@ _DASHBOARD_HTML = r"""<!DOCTYPE html>
 </div>
 
 <script>
-const STATUS_ORDER = ['all','idea','filtered','implementing','implemented','backtesting','validating','live','failed'];
+const STATUS_ORDER = ['all','idea','filtered','implementing','awaiting_research','implemented','quick_testing','quick_tested','backtesting','validating','live','failed'];
 let currentStatus = 'all';
 let statsData = {};
 let strategiesData = [];
@@ -725,16 +748,19 @@ function switchTab(s) {
 }
 
 const STATUS_LABELS = {
-  'idea':         'Idea',
-  'filtered':     'Queued',
-  'implementing': '⚙ Implementing…',
-  'implemented':  'Dispatched',
-  'backtesting':  '⚙ Backtesting…',
-  'validating':   '⚙ Validating…',
-  'live':         '✓ Live',
-  'done':         '✓ Done',
-  'failed':       '✗ Failed',
-  'rejected':     '✗ Rejected',
+  'idea':              'Idea',
+  'filtered':          'Queued',
+  'implementing':      '⚙ Implementing…',
+  'awaiting_research': '⏳ Awaiting Research',
+  'implemented':       'Dispatched',
+  'quick_testing':     '⚙ Quick Test…',
+  'quick_tested':      'Quick Tested',
+  'backtesting':       '⚙ Optimizing…',
+  'validating':        '⚙ Validating…',
+  'live':              '✓ Live',
+  'done':              '✓ Done',
+  'failed':            '✗ Failed',
+  'rejected':          '✗ Rejected',
 };
 function statusLabel(s) { return STATUS_LABELS[s] || s; }
 
@@ -790,7 +816,7 @@ function closePanel() {
 }
 
 function renderPanel(s) {
-  const badgeCls = 's-' + (s.status || 'idea');
+  const badgeCls = 's-' + (s.status || 'idea').replace(/_/g,'-');
   const trainSharpe = fmtNum(s.backtest_sharpe);
   const oosSharpe   = fmtNum(s.oos_sharpe);
   const trainCls    = s.backtest_sharpe > 1 ? 'good' : s.backtest_sharpe > 0 ? '' : 'bad';
@@ -799,6 +825,28 @@ function renderPanel(s) {
   const mcCls = s.monte_carlo_pvalue < 0.05 ? 'good' : 'bad';
   const dd = s.max_drawdown != null ? (s.max_drawdown * 100).toFixed(2) + '%' : '—';
   const wr = s.win_rate != null ? (s.win_rate * 100).toFixed(1) + '%' : '—';
+
+  // Quick test results block (shown when quick_test data is available)
+  let quickTestHtml = '';
+  if (s.quick_test_trades != null || s.quick_test_sharpe != null) {
+    const qt_sharpe = s.quick_test_sharpe != null ? s.quick_test_sharpe.toFixed(3) : '—';
+    const qt_trades = s.quick_test_trades != null ? s.quick_test_trades : '—';
+    const qt_wr     = s.quick_test_win_rate != null ? (s.quick_test_win_rate*100).toFixed(1)+'%' : '—';
+    const qt_dd     = s.quick_test_drawdown != null ? (s.quick_test_drawdown*100).toFixed(1)+'%' : '—';
+    const qt_spy    = s.quick_test_signals_per_year != null ? Math.round(s.quick_test_signals_per_year) : '—';
+    const qt_cls    = s.quick_test_sharpe > 1 ? 'good' : s.quick_test_sharpe > 0 ? '' : 'bad';
+    quickTestHtml = `<div class="panel-section">
+      <h3>Quick Test Results <span style="font-size:.7rem;font-weight:400;color:#64748b">(default params, no optimization)</span></h3>
+      <div style="display:flex;gap:12px;flex-wrap:wrap">
+        <div class="kv"><div class="kv-label">Sharpe</div><div class="kv-val ${qt_cls}">${qt_sharpe}</div></div>
+        <div class="kv"><div class="kv-label">Trades</div><div class="kv-val">${qt_trades}</div></div>
+        <div class="kv"><div class="kv-label">Win Rate</div><div class="kv-val">${qt_wr}</div></div>
+        <div class="kv"><div class="kv-label">Drawdown</div><div class="kv-val">${qt_dd}</div></div>
+        <div class="kv"><div class="kv-label">Sig/Year</div><div class="kv-val">${qt_spy}</div></div>
+      </div>
+      ${s.quick_test_trades === 0 ? '<div style="color:#fb923c;font-size:.8rem;margin-top:8px">⚠ Zero trades with default params — optimizer may still find signal</div>' : ''}
+    </div>`;
+  }
 
   let wfHtml = '';
   if (s.walk_forward_scores) {
@@ -1003,7 +1051,7 @@ function renderPanel(s) {
       </div>
     </div>
 
-    ${modalHtml}${actionsHtml}${wfHtml}${paramsHtml}${codeHtml}${errHtml}${reportHtml}
+    ${modalHtml}${actionsHtml}${quickTestHtml}${wfHtml}${paramsHtml}${codeHtml}${errHtml}${reportHtml}
     <div class="panel-section" style="border-top:1px solid #1f2937;padding-top:16px;margin-top:4px">
       <h3>Comments</h3>
       <div id="comments-list-${s.id}" style="margin-bottom:10px">

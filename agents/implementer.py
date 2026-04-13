@@ -14,7 +14,11 @@ import anthropic
 from dotenv import load_dotenv
 
 from db import supabase_client as db
-from agents.prompts import IMPLEMENTER_SYSTEM, IMPLEMENTER_USER_TEMPLATE
+from agents.prompts import (
+    IMPLEMENTER_SYSTEM,
+    IMPLEMENTER_USER_TEMPLATE,
+    IMPLEMENTER_USER_TEMPLATE_WITH_RESEARCH_OPTION,
+)
 from agents.utils import full_description, add_pipeline_note
 from backtest.leakage_detector import check_leakage
 
@@ -26,11 +30,28 @@ MAX_RETRIES = 2
 MIN_LEAKAGE_SCORE = 7.0
 
 
-def run_implementer(strategy_id: str) -> dict[str, Any]:
+def run_implementer(
+    strategy_id: str,
+    research_results: list[dict] | None = None,
+    allow_research_requests: bool = True,
+) -> dict[str, Any]:
     """
     Generate strategy code from a filtered idea.
-    Retries up to MAX_RETRIES times if leakage is detected.
-    Updates strategy status in DB and returns generated code + param_space.
+
+    Parameters
+    ----------
+    strategy_id           : DB strategy UUID
+    research_results      : completed research task results to inject as context.
+                            Populated when re-running after awaiting_research.
+    allow_research_requests: if True, the LLM may respond with needs_research_first=true
+                             instead of code. Queue worker handles that response.
+                             Set False when re-running after research (always want code).
+
+    Returns
+    -------
+    dict with either:
+      - {"code": ..., "param_space": ..., ...}  — normal implementation
+      - {"needs_research": True, "task_ids": [...]}  — research requested
     """
     strategy = db.get_strategy(strategy_id)
     if not strategy:
@@ -41,23 +62,39 @@ def run_implementer(strategy_id: str) -> dict[str, Any]:
     knowledge = db.get_knowledge_summary(limit=20)
     knowledge_text = _format_knowledge(knowledge)
 
-    # Parse pre_filter_notes for context passed from pre-filter agent
     pre_filter_data = _parse_pre_filter_notes(strategy.get("pre_filter_notes", ""))
 
     def _esc(s: str) -> str:
-        """Escape curly braces in user content so str.format() doesn't choke on {self} etc."""
         return s.replace("{", "{{").replace("}", "}}")
 
-    user_msg = IMPLEMENTER_USER_TEMPLATE.format(
-        title=_esc(strategy.get("name", "")),
-        description=_esc(full_description(strategy)),
-        notes=_esc(strategy.get("entry_logic", "")),
-        pre_filter_notes=_esc(pre_filter_data.get("notes", "")),
-        indicators=", ".join(pre_filter_data.get("suggested_indicators", [])),
-        timeframes=", ".join(pre_filter_data.get("suggested_timeframes", ["1h", "4h"])),
-        symbols=", ".join(pre_filter_data.get("suggested_symbols", ["EURUSD", "GBPUSD"])),
-        knowledge_base_context=knowledge_text,
-    )
+    # Build research context string if we have prior research results
+    research_context = _format_research_results(research_results or [])
+
+    # Choose prompt variant based on whether we allow research requests
+    if allow_research_requests and not research_results:
+        template = IMPLEMENTER_USER_TEMPLATE_WITH_RESEARCH_OPTION
+        user_msg = template.format(
+            title=_esc(strategy.get("name", "")),
+            description=_esc(full_description(strategy)),
+            notes=_esc(strategy.get("entry_logic", "")),
+            pre_filter_notes=_esc(pre_filter_data.get("notes", "")),
+            indicators=", ".join(pre_filter_data.get("suggested_indicators", [])),
+            timeframes=", ".join(pre_filter_data.get("suggested_timeframes", ["1h", "4h"])),
+            symbols=", ".join(pre_filter_data.get("suggested_symbols", ["EURUSD", "GBPUSD"])),
+            knowledge_base_context=knowledge_text,
+        )
+    else:
+        user_msg = IMPLEMENTER_USER_TEMPLATE.format(
+            title=_esc(strategy.get("name", "")),
+            description=_esc(full_description(strategy)),
+            notes=_esc(strategy.get("entry_logic", "")),
+            pre_filter_notes=_esc(pre_filter_data.get("notes", "")),
+            indicators=", ".join(pre_filter_data.get("suggested_indicators", [])),
+            timeframes=", ".join(pre_filter_data.get("suggested_timeframes", ["1h", "4h"])),
+            symbols=", ".join(pre_filter_data.get("suggested_symbols", ["EURUSD", "GBPUSD"])),
+            knowledge_base_context=knowledge_text,
+            research_context=research_context,
+        )
 
     client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 
@@ -85,24 +122,71 @@ def run_implementer(strategy_id: str) -> dict[str, Any]:
         raw_text = response.content[0].text.strip()
         parsed = _parse_json_response(raw_text, strategy_id)
 
-        if not parsed or "code" not in parsed:
+        if not parsed:
             log.warning(f"Implementer: parse failed on attempt {attempt + 1}")
             if attempt < MAX_RETRIES:
                 messages.append({"role": "assistant", "content": raw_text})
                 messages.append({
                     "role": "user",
                     "content": (
-                        "Your response could not be parsed as valid JSON with a 'code' key. "
+                        "Your response could not be parsed as valid JSON. "
+                        "Please return ONLY a valid JSON object."
+                    ),
+                })
+                continue
+            _mark_failed(strategy_id, "Failed to parse implementer response after retries")
+            _log_spend(strategy_id, total_input_tokens, total_output_tokens)
+            raise RuntimeError(f"Implementer failed to produce valid JSON for {strategy_id}")
+
+        # Handle research request — agent wants to gather data before coding
+        if parsed.get("needs_research_first"):
+            research_tasks_raw = parsed.get("research_tasks") or []
+            if not research_tasks_raw:
+                # LLM said needs_research but gave no tasks — treat as a bad response
+                messages.append({"role": "assistant", "content": raw_text})
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "You set needs_research_first=true but provided no research_tasks. "
+                        "Either provide research_tasks with at least one item, "
+                        "or proceed directly with strategy implementation."
+                    ),
+                })
+                continue
+
+            _log_spend(strategy_id, total_input_tokens, total_output_tokens)
+            task_ids = _create_research_tasks(strategy_id, research_tasks_raw)
+            reason = parsed.get("reason", "Agent requested research before implementation.")
+            db.update_strategy(strategy_id, {
+                "status": "awaiting_research",
+                "pending_research_ids": task_ids,
+                "error_log": None,
+            })
+            add_pipeline_note(
+                strategy_id,
+                f"Implementer requested {len(task_ids)} research task(s) before coding. "
+                f"Reason: {reason}. Task IDs: {task_ids}"
+            )
+            log.info(f"Implementer: research requested, strategy={strategy_id}, tasks={task_ids}")
+            return {"needs_research": True, "task_ids": task_ids}
+
+        if "code" not in parsed:
+            log.warning(f"Implementer: no 'code' key on attempt {attempt + 1}")
+            if attempt < MAX_RETRIES:
+                messages.append({"role": "assistant", "content": raw_text})
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "Your response is missing the 'code' key. "
                         "Please return ONLY a JSON object with the keys: strategy_name, "
                         "strategy_class, code, param_space, hypothesis, indicators_used, "
                         "recommended_symbols, recommended_timeframes, notes."
                     ),
                 })
                 continue
-            # All retries exhausted on parse failure
-            _mark_failed(strategy_id, "Failed to parse implementer response after retries")
+            _mark_failed(strategy_id, "Implementer produced no code after retries")
             _log_spend(strategy_id, total_input_tokens, total_output_tokens)
-            raise RuntimeError(f"Implementer failed to produce valid JSON for {strategy_id}")
+            raise RuntimeError(f"Implementer produced no code for {strategy_id}")
 
         # Run leakage detection on generated code
         code = parsed["code"]
@@ -227,6 +311,54 @@ def _parse_json_response(text: str, strategy_id: str) -> dict | None:
     except json.JSONDecodeError as e:
         log.error(f"JSON parse error for {strategy_id}: {e}\nText prefix: {text[:300]}")
         return None
+
+
+def _format_research_results(results: list[dict]) -> str:
+    """Format completed research task results for injection into implementer context."""
+    if not results:
+        return "No prior research available."
+    lines = []
+    for r in results:
+        lines.append(f"### {r.get('title', 'Research')}")
+        lines.append(f"Question: {r.get('question', '')}")
+        lines.append(f"Summary: {r.get('result_summary', 'No summary.')}")
+        findings = r.get("key_findings") or []
+        if findings:
+            lines.append("Key findings:")
+            for f in findings[:5]:
+                finding_text = f if isinstance(f, str) else f.get("finding", "")
+                lines.append(f"  - {finding_text}")
+        lines.append("")
+    return "\n".join(lines)
+
+
+def _create_research_tasks(strategy_id: str, tasks_raw: list[dict]) -> list[str]:
+    """Create research_tasks DB records and dispatch them to Modal. Returns task IDs."""
+    task_ids = []
+    for task_spec in tasks_raw[:3]:  # cap at 3 research tasks per strategy
+        record = db.insert_research_task({
+            "type": task_spec.get("type", "custom"),
+            "title": task_spec.get("title", "Research Task"),
+            "question": task_spec.get("question", ""),
+            "data_requirements": task_spec.get("data_requirements"),
+            "status": "pending",
+            "created_by_strategy_id": strategy_id,
+        })
+        task_ids.append(record["id"])
+
+    # Dispatch research tasks to Modal asynchronously
+    try:
+        import modal
+        fn = modal.Function.from_name("trading-research-research", "run_research_task")
+        for task_id in task_ids:
+            call = fn.spawn(task_id)
+            db.update_research_task(task_id, {"modal_job_id": call.object_id, "status": "running"})
+        log.info(f"Research tasks dispatched to Modal: {task_ids}")
+    except Exception as exc:
+        log.warning(f"Could not dispatch research tasks to Modal: {exc}")
+        # Tasks remain in 'pending' — queue worker will retry dispatch
+
+    return task_ids
 
 
 def _format_knowledge(entries: list[dict]) -> str:

@@ -54,6 +54,158 @@ CACHE_DIR = "/ohlcv_cache"
 
 @app.function(
     image=image,
+    cpu=2,
+    memory=4096,
+    timeout=300,  # 5 minutes — just one run, no optimization
+    secrets=[modal.Secret.from_name("trading-research-secrets")],
+    volumes={CACHE_DIR: ohlcv_cache},
+)
+def run_quick_backtest(strategy_id: str) -> dict:
+    """
+    Quick backtest: run strategy code with default class-level params, no optimization.
+    Goal: confirm the strategy logic works and get a first read on results in ~2 min.
+    Stores quick_test_* metrics and sets status to 'quick_tested'.
+    The full optimization pipeline runs separately after this.
+    """
+    import os
+    import traceback
+    import pandas as pd
+    from backtesting import Strategy
+
+    try:
+        from db import supabase_client as db
+        from agents.utils import add_pipeline_note
+        from backtest.data_fetcher import fetch_ohlcv, split_train_oos
+        from backtest.engine import run_backtest
+        from backtest.leakage_detector import check_leakage
+
+        strategy = db.get_strategy(strategy_id)
+        if not strategy:
+            raise ValueError(f"Strategy {strategy_id} not found")
+
+        code = strategy.get("backtest_code")
+        if not code:
+            raise ValueError("No backtest_code on strategy")
+
+        indicators_meta = strategy.get("indicators") or {}
+        symbols = indicators_meta.get("symbols", ["EURUSD"])
+        if isinstance(symbols, str):
+            symbols = [symbols]
+        symbol = symbols[0] if symbols else "EURUSD"
+
+        timeframes = (
+            indicators_meta.get("timeframes")
+            or strategy.get("timeframes")
+            or ["1h"]
+        )
+        primary_tf = timeframes[0] if isinstance(timeframes, list) and timeframes else "1h"
+
+        db.update_strategy(strategy_id, {"status": "quick_testing"})
+        add_pipeline_note(strategy_id,
+            f"Quick test started — {symbol} {primary_tf}, default params, no optimization.")
+
+        # Leakage check (fast, before any data work)
+        leakage_result = check_leakage(code)
+        if not leakage_result.passed:
+            db.update_strategy(strategy_id, {
+                "status": "failed",
+                "leakage_score": leakage_result.score,
+                "leakage_issues": leakage_result.issues,
+                "error_log": (
+                    f"Leakage check failed (score={leakage_result.score}): "
+                    f"{leakage_result.issues[:3]}"
+                ),
+            })
+            add_pipeline_note(strategy_id,
+                f"Quick test FAILED leakage — score {leakage_result.score}/10. "
+                f"Issues: {'; '.join(leakage_result.issues[:3])}")
+            return {"passed": False, "reason": "leakage_check_failed",
+                    "issues": leakage_result.issues}
+
+        # Load data (from cache if available)
+        cache_file = f"{CACHE_DIR}/{symbol}_{primary_tf}.parquet"
+        if os.path.exists(cache_file):
+            df = pd.read_parquet(cache_file)
+            add_pipeline_note(strategy_id,
+                f"Data loaded from cache ({len(df)} bars).")
+        else:
+            df = fetch_ohlcv(symbol, primary_tf, start="2015-01-01", end="2026-12-31")
+            os.makedirs(CACHE_DIR, exist_ok=True)
+            df.to_parquet(cache_file)
+            ohlcv_cache.commit()
+            add_pipeline_note(strategy_id,
+                f"Data downloaded and cached ({len(df)} bars).")
+        train_df, _ = split_train_oos(df)
+
+        # Execute the strategy class
+        namespace: dict = {}
+        exec(compile(code, "<strategy>", "exec"), namespace)
+        strategy_classes = {
+            v.__name__: v for v in namespace.values()
+            if isinstance(v, type) and issubclass(v, Strategy) and v is not Strategy
+        }
+        if not strategy_classes:
+            raise ValueError("No Strategy subclass found in generated code")
+        expected_name = indicators_meta.get("strategy_class", "")
+        if expected_name and expected_name in strategy_classes:
+            strategy_class = strategy_classes[expected_name]
+        else:
+            strategy_class = next(iter(strategy_classes.values()))
+
+        # Run with default class-level params — no optimization, enforce_gates=False
+        # so we see actual metrics even if they don't pass quality gates yet.
+        result = run_backtest(strategy_class, train_df, params={}, enforce_gates=False)
+
+        # Save quick test results and advance pipeline regardless of metric quality.
+        # The full optimization may find much better params.
+        db.update_strategy(strategy_id, {
+            "status": "quick_tested",
+            "modal_job_id": None,
+            "quick_test_sharpe": result.sharpe,
+            "quick_test_calmar": result.calmar,
+            "quick_test_drawdown": result.max_drawdown,
+            "quick_test_trades": result.total_trades,
+            "quick_test_win_rate": result.win_rate,
+            "quick_test_signals_per_year": result.signals_per_year,
+            "leakage_score": leakage_result.score,
+            "leakage_issues": leakage_result.issues,
+            "error_log": None,
+        })
+
+        trade_note = (
+            f"Sharpe={result.sharpe:.3f}, "
+            f"trades={result.total_trades}, "
+            f"win={result.win_rate:.0%}, "
+            f"drawdown={result.max_drawdown:.1%}"
+        )
+        if result.total_trades == 0:
+            trade_note += " — ⚠️ NO TRADES with default params (optimizer may still find signal)"
+        add_pipeline_note(strategy_id,
+            f"Quick test done — {trade_note}. Proceeding to full optimization.")
+
+        return {
+            "passed": True,
+            "strategy_id": strategy_id,
+            "quick_sharpe": result.sharpe,
+            "quick_trades": result.total_trades,
+            "quick_win_rate": result.win_rate,
+        }
+
+    except Exception as e:
+        tb = traceback.format_exc()
+        try:
+            from db import supabase_client as db2
+            db2.update_strategy(strategy_id, {
+                "status": "failed",
+                "error_log": f"Quick backtest error: {type(e).__name__}: {e}\n{tb[:500]}",
+            })
+        except Exception:
+            pass
+        raise
+
+
+@app.function(
+    image=image,
     cpu=8,
     memory=8192,
     timeout=1200,  # 20 minutes — enough headroom with caching + fewer trials
