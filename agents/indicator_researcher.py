@@ -862,11 +862,30 @@ def run_indicator_research(task_id: str, cache_dir: str = "/ohlcv_cache") -> dic
                             spec["indicator"], combo_key, exc)
 
         if not best_by_combo:
-            raise ValueError(f"No successful sweep for {spec['indicator']}")
+            # No viable results — mark done (not failed) so it isn't auto-retried forever.
+            # This happens when generated code is broken or produces < 10 trades on all combos.
+            db.update_research_task(task_id, {
+                "status":         "done",
+                "modal_job_id":   None,
+                "result_summary": (
+                    f"{spec.get('title', spec['indicator'])}: no viable signals found "
+                    f"across {len(_TEST_ASSETS)} asset/TF combos (< 10 trades or code errors). "
+                    "Spec may need better entry logic or wider date range."
+                ),
+                "key_findings":   [],
+                "generated_code": code,
+                "error_log":      None,
+            })
+            return {"passed": False, "reason": "no_viable_signals", "task_id": task_id}
 
         # 3. MCPT — pick the globally best-performing combo for permutation test
-        best_combo = max(best_by_combo,
-                         key=lambda c: best_by_combo[c]["stats"].get("profit_factor", 0))
+        def _combo_pf(c: str) -> float:
+            r = best_by_combo[c]["stats"]
+            if "baseline" in r:
+                return (r.get("exit_rule") or r.get("baseline") or {}).get("profit_factor") or 0.0
+            return (r.get("fwd_5") or {}).get("profit_factor") or 0.0
+
+        best_combo = max(best_by_combo, key=_combo_pf)
         best_entry = best_by_combo[best_combo]
         symbol_mc, tf_mc = best_combo.rsplit("_", 1)
         df_mc = _load_data(symbol_mc, tf_mc, cache_dir)
@@ -1236,22 +1255,35 @@ def _sweep_params(
         combos = [{}]  # single run with defaults
 
     sweep: dict[str, dict] = {}
-    best_pf   = -1.0
+    best_pf     = -1.0
     best_entry: dict | None = None
+    first_error: str | None = None
+
+    def _extract_pf(result: dict) -> float:
+        """Pick the right profit-factor key regardless of research type."""
+        # Exit research returns {"baseline": {...}, "exit_rule": {...}}
+        if "baseline" in result:
+            return (result.get("exit_rule") or result.get("baseline") or {}).get("profit_factor") or 0.0
+        # Entry research returns {"fwd_5": {...}, ...}
+        return (result.get("fwd_5") or {}).get("profit_factor") or 0.0
 
     for params in combos:
         try:
             result = fn(df.copy(), **params)
             if not isinstance(result, dict):
                 continue
-            pf = result.get("fwd_5", {}).get("profit_factor") or 0.0
+            pf = _extract_pf(result)
             params_str = json.dumps(params, sort_keys=True)
             sweep[params_str] = result
             if pf > best_pf:
-                best_pf   = pf
+                best_pf    = pf
                 best_entry = {"params": params, "stats": result}
-        except Exception:
-            pass
+        except Exception as exc:
+            if first_error is None:
+                first_error = f"{type(exc).__name__}: {exc}"
+
+    if not sweep and first_error:
+        raise ValueError(f"All {len(combos)} param combos failed. First error: {first_error}")
 
     return sweep, best_entry
 

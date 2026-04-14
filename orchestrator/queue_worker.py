@@ -710,6 +710,69 @@ def _process_campaign_completion() -> int:
     return summarized
 
 
+_MAX_AUTO_RETRIES = 3
+# Don't retry a strategy that failed less than this many minutes ago —
+# gives Modal time to settle and avoids hammering a broken job immediately.
+_MIN_RETRY_WAIT_MINUTES = 15
+
+
+def _cleanup_old_failed_strategies() -> int:
+    """
+    Archive failed strategies that have been sitting in 'failed' for > 24 hours.
+
+    Rules:
+      - Failed > 24h AND retry_count >= MAX_AUTO_RETRIES  → archive (no more retries)
+      - Failed > 24h AND no backtest_code                 → archive (unfixable)
+      - Failed > 24h AND error is quality_rejection        → archive (legitimate gate)
+
+    Strategies that still have retries remaining are left alone — they will be
+    picked up by _process_failed_strategies on the next loop.
+    """
+    from datetime import datetime, timezone, timedelta
+    from agents.code_fixer import classify_error
+    from agents.utils import add_pipeline_note
+
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+
+    sb = db.get_client()
+    result = (
+        sb.table("strategies")
+        .select("id, name, retry_count, backtest_code, error_log, updated_at")
+        .eq("status", "failed")
+        .lt("updated_at", cutoff)
+        .limit(100)
+        .execute()
+    )
+
+    archived = 0
+    for s in (result.data or []):
+        sid         = s["id"]
+        retry_count = s.get("retry_count") or 0
+        has_code    = bool(s.get("backtest_code"))
+        error_log   = s.get("error_log") or ""
+        error_class = classify_error(error_log)
+
+        should_archive = (
+            retry_count >= _MAX_AUTO_RETRIES
+            or not has_code
+            or error_class == "quality_rejection"
+        )
+        if not should_archive:
+            continue
+
+        db.update_strategy(sid, {"status": "archived", "modal_job_id": None})
+        reason = (
+            "quality rejection"      if error_class == "quality_rejection" else
+            "no code to fix"         if not has_code else
+            f"retry limit ({retry_count}/{_MAX_AUTO_RETRIES})"
+        )
+        add_pipeline_note(sid, f"Auto-archived after 24 h in failed state ({reason}).")
+        log.info("strategy_auto_archived sid=%s reason=%s", sid, reason)
+        archived += 1
+
+    return archived
+
+
 def _process_failed_strategies() -> int:
     """
     Inspect recently-failed strategies and attempt automatic recovery.
@@ -721,21 +784,27 @@ def _process_failed_strategies() -> int:
       unknown            → retry once without code change if retry_count < 2
 
     Hard limits:
-      - retry_count >= 3  → give up
-      - No backtest_code  → can't fix code, give up
+      - retry_count >= _MAX_AUTO_RETRIES → give up
+      - No backtest_code                 → can't fix code, give up
+      - Failed < _MIN_RETRY_WAIT_MINUTES → too soon, skip this loop
     Returns number of strategies acted on.
     """
+    from datetime import datetime, timezone, timedelta
     from agents.code_fixer import classify_error, fix_strategy_code
     from agents.utils import add_pipeline_note
 
-    MAX_AUTO_RETRIES = 3
+    too_recent_cutoff = (
+        datetime.now(timezone.utc) - timedelta(minutes=_MIN_RETRY_WAIT_MINUTES)
+    ).isoformat()
 
     sb = db.get_client()
     result = (
         sb.table("strategies")
         .select("id, name, status, error_log, backtest_code, hypothesis, "
-                "entry_logic, retry_count, auto_fix_count, quick_test_all_timeframes")
+                "entry_logic, retry_count, auto_fix_count, quick_test_all_timeframes, "
+                "updated_at")
         .eq("status", "failed")
+        .lt("updated_at", too_recent_cutoff)   # only strategies that failed >15 min ago
         .order("updated_at", desc=True)
         .limit(20)
         .execute()
@@ -898,6 +967,7 @@ def process_queue() -> None:
     # Summarize completed campaigns so user sees consolidated results
     campaigns_summarized  = _process_campaign_completion()
     auto_fixed            = _process_failed_strategies()
+    archived              = _cleanup_old_failed_strategies()
 
     log.info(
         "queue_worker_done",
@@ -912,4 +982,5 @@ def process_queue() -> None:
         full_backtest_queued=full_backtest_queued,
         campaigns_summarized=campaigns_summarized,
         auto_fixed=auto_fixed,
+        archived=archived,
     )

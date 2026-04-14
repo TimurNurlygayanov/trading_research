@@ -524,6 +524,77 @@ async def api_update_tags(strategy_id: str, request: Request) -> JSONResponse:
         return JSONResponse({"error": str(exc)}, status_code=500)
 
 
+@app.get("/api/ideas-grouped")
+def api_ideas_grouped(limit: int = Query(default=100, le=200)) -> JSONResponse:
+    """
+    Return user ideas grouped with their generated strategies.
+    Each idea includes: idea text, date, and all strategies that came from it
+    (root + campaign children), plus aggregated pass/fail counts.
+    """
+    try:
+        sb = db.get_client()
+
+        # 1. Fetch recent user ideas (with strategy_id FK to root strategy)
+        ideas_res = (
+            sb.table("user_ideas")
+            .select("id, idea_text, status, strategy_id, created_at")
+            .order("created_at", desc=True)
+            .limit(limit)
+            .execute()
+        )
+        ideas = ideas_res.data or []
+
+        STRAT_COLS = (
+            "id, name, status, backtest_sharpe, oos_sharpe, max_drawdown, win_rate, "
+            "signals_per_year, quick_test_sharpe, quick_test_trades, best_timeframe, "
+            "campaign_id, is_campaign_root, error_log, tags, created_at, updated_at"
+        )
+        DONE_STATUSES = {"done", "live", "validating"}
+        IN_PROGRESS   = {"implementing", "quick_testing", "backtesting", "quick_tested",
+                         "awaiting_research", "implemented", "filtered", "awaiting_review"}
+
+        result = []
+        for idea in ideas:
+            root_id = idea.get("strategy_id")
+            strategies: list[dict] = []
+
+            if root_id:
+                # Fetch root + all campaign children in one query
+                strats_res = (
+                    sb.table("strategies")
+                    .select(STRAT_COLS)
+                    .or_(f"id.eq.{root_id},campaign_id.eq.{root_id}")
+                    .order("created_at")
+                    .execute()
+                )
+                strategies = strats_res.data or []
+
+            passed     = [s for s in strategies if s["status"] in DONE_STATUSES]
+            failed     = [s for s in strategies if s["status"] in ("failed", "rejected")]
+            in_prog    = [s for s in strategies if s["status"] in IN_PROGRESS]
+            best_sharpe = max(
+                (s["backtest_sharpe"] for s in passed if s.get("backtest_sharpe") is not None),
+                default=None,
+            )
+
+            result.append({
+                "idea_id":       idea["id"],
+                "idea_text":     idea.get("idea_text", ""),
+                "idea_status":   idea.get("status", ""),
+                "created_at":    idea.get("created_at", ""),
+                "total":         len(strategies),
+                "passed":        len(passed),
+                "failed":        len(failed),
+                "in_progress":   len(in_prog),
+                "best_sharpe":   best_sharpe,
+                "strategies":    strategies,
+            })
+
+        return JSONResponse({"ideas": result})
+    except Exception as exc:
+        return JSONResponse({"ideas": [], "error": str(exc)}, status_code=500)
+
+
 @app.get("/api/strategies")
 def api_strategies(
     status: str = Query("all"),
@@ -730,6 +801,13 @@ _DASHBOARD_HTML = r"""<!DOCTYPE html>
   .card-value.yellow { color: #fbbf24; }
   .card-value.blue   { color: #60a5fa; }
 
+  /* ── view toggle ── */
+  .view-toggle { display: flex; gap: 6px; margin-bottom: 16px; }
+  .vtab { padding: 6px 18px; border-radius: 8px; font-size: 0.82rem; font-weight: 600;
+          border: 1px solid #1f2937; background: transparent; color: #64748b; cursor: pointer; transition: all .15s; }
+  .vtab:hover  { color: #f1f5f9; border-color: #374151; }
+  .vtab.active { background: #1e293b; border-color: #6366f1; color: #f1f5f9; }
+
   /* ── filter tabs ── */
   .tabs { display: flex; gap: 4px; margin-bottom: 16px; flex-wrap: wrap; }
   .tab { padding: 6px 16px; border-radius: 99px; font-size: 0.8rem; font-weight: 500;
@@ -738,6 +816,35 @@ _DASHBOARD_HTML = r"""<!DOCTYPE html>
   .tab.active  { background: #6366f1; border-color: #6366f1; color: #fff; }
   .tab .count  { background: rgba(255,255,255,.15); border-radius: 99px;
                  padding: 1px 7px; font-size: 0.72rem; margin-left: 6px; }
+
+  /* ── ideas view ── */
+  .ideas-list { display: flex; flex-direction: column; gap: 10px; }
+  .idea-card  { background: #111827; border: 1px solid #1f2937; border-radius: 12px; overflow: hidden; }
+  .idea-header {
+    display: flex; align-items: flex-start; gap: 14px;
+    padding: 16px 20px; cursor: pointer; user-select: none;
+  }
+  .idea-header:hover { background: #141c2e; }
+  .idea-chevron { font-size: 0.85rem; color: #475569; margin-top: 2px; flex-shrink: 0; transition: transform .2s; }
+  .idea-card.open .idea-chevron { transform: rotate(90deg); }
+  .idea-body-text { flex: 1; font-size: 0.88rem; color: #e2e8f0; line-height: 1.5; }
+  .idea-meta { font-size: 0.72rem; color: #475569; margin-top: 4px; }
+  .idea-pills { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 6px; }
+  .idea-pill  { padding: 2px 10px; border-radius: 99px; font-size: 0.72rem; font-weight: 600; white-space: nowrap; }
+  .pill-passed  { background: #14532d; color: #86efac; }
+  .pill-failed  { background: #450a0a; color: #fca5a5; }
+  .pill-running { background: #3b2f00; color: #fcd34d; }
+  .pill-total   { background: #1e293b; color: #94a3b8; }
+  .pill-best    { background: #1e1b4b; color: #818cf8; }
+  .idea-strategies { display: none; border-top: 1px solid #1f2937; }
+  .idea-card.open .idea-strategies { display: block; }
+  .idea-strat-table { width: 100%; border-collapse: collapse; font-size: 0.82rem; }
+  .idea-strat-table td { padding: 9px 20px; border-bottom: 1px solid #0d1117; color: #94a3b8; vertical-align: middle; }
+  .idea-strat-table tr:last-child td { border-bottom: none; }
+  .idea-strat-table tr:hover td { background: #0d1117; cursor: pointer; }
+  .idea-strat-name { color: #cbd5e1; font-size: 0.83rem;
+                     max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .idea-empty { padding: 16px 20px; color: #475569; font-size: 0.82rem; }
 
   /* ── table ── */
   .table-wrap { background: #111827; border: 1px solid #1f2937; border-radius: 12px; overflow: hidden; }
@@ -863,26 +970,41 @@ _DASHBOARD_HTML = r"""<!DOCTYPE html>
     <div class="card"><div class="card-label">Queued</div><div class="card-value yellow" id="c-queued">…</div></div>
   </div>
 
-  <div class="tabs" id="tabs"></div>
+  <!-- View toggle -->
+  <div class="view-toggle">
+    <button class="vtab active" id="vtab-strategies" onclick="setView('strategies')">Strategies</button>
+    <button class="vtab"        id="vtab-ideas"      onclick="setView('ideas')">My Ideas</button>
+  </div>
 
-  <div class="table-wrap">
-    <table>
-      <thead>
-        <tr>
-          <th>Strategy</th>
-          <th>Status</th>
-          <th>Tags</th>
-          <th>Sharpe</th>
-          <th>OOS Sharpe</th>
-          <th>Drawdown</th>
-          <th>Win Rate</th>
-          <th>Sig/Year</th>
-          <th>Leakage</th>
-          <th>Updated</th>
-        </tr>
-      </thead>
-      <tbody id="tbody"><tr><td colspan="10" class="loading">Loading…</td></tr></tbody>
-    </table>
+  <!-- Strategies view -->
+  <div id="strategies-view">
+    <div class="tabs" id="tabs"></div>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Strategy</th>
+            <th>Status</th>
+            <th>Tags</th>
+            <th>Sharpe</th>
+            <th>OOS Sharpe</th>
+            <th>Drawdown</th>
+            <th>Win Rate</th>
+            <th>Sig/Year</th>
+            <th>Leakage</th>
+            <th>Updated</th>
+          </tr>
+        </thead>
+        <tbody id="tbody"><tr><td colspan="10" class="loading">Loading…</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- Ideas view -->
+  <div id="ideas-view" style="display:none">
+    <div id="ideas-list" class="ideas-list">
+      <div class="table-wrap" style="padding:20px;color:#475569">Loading ideas…</div>
+    </div>
   </div>
 </div>
 
@@ -897,8 +1019,10 @@ _DASHBOARD_HTML = r"""<!DOCTYPE html>
 <script>
 const STATUS_ORDER = ['all','idea','filtered','implementing','awaiting_research','implemented','quick_testing','quick_tested','awaiting_review','backtesting','validating','live','failed','archived'];
 let currentStatus = 'all';
+let currentView   = 'strategies';
 let statsData = {};
 let strategiesData = [];
+let ideasData = [];
 
 async function loadStats() {
   const r = await fetch('/api/stats');
@@ -920,7 +1044,27 @@ async function loadStrategies() {
   renderTable(strategiesData);
 }
 
-function loadAll() { loadStats(); loadStrategies(); }
+async function loadIdeas() {
+  const r = await fetch('/api/ideas-grouped?limit=100');
+  const data = await r.json();
+  ideasData = data.ideas || [];
+  renderIdeas(ideasData);
+}
+
+function loadAll() {
+  loadStats();
+  if (currentView === 'strategies') loadStrategies();
+  else loadIdeas();
+}
+
+function setView(v) {
+  currentView = v;
+  document.getElementById('strategies-view').style.display = v === 'strategies' ? '' : 'none';
+  document.getElementById('ideas-view').style.display      = v === 'ideas'      ? '' : 'none';
+  document.getElementById('vtab-strategies').classList.toggle('active', v === 'strategies');
+  document.getElementById('vtab-ideas').classList.toggle('active', v === 'ideas');
+  if (v === 'ideas' && !ideasData.length) loadIdeas();
+}
 
 function renderTabs(breakdown) {
   const tabs = document.getElementById('tabs');
@@ -995,6 +1139,78 @@ function renderTable(rows) {
       <td style="color:#475569;font-size:.78rem;white-space:nowrap">${updated}</td>
     </tr>`;
   }).join('');
+}
+
+function renderIdeas(ideas) {
+  const el = document.getElementById('ideas-list');
+  if (!ideas.length) {
+    el.innerHTML = '<div class="table-wrap" style="padding:20px;color:#475569">No ideas yet — post one above!</div>';
+    return;
+  }
+  el.innerHTML = ideas.map((idea, idx) => {
+    const date    = (idea.created_at || '').slice(0, 10);
+    const text    = esc(idea.idea_text || '(no text)');
+    const preview = idea.idea_text ? esc(idea.idea_text.slice(0, 160)) + (idea.idea_text.length > 160 ? '…' : '') : '';
+
+    const bestSharpe = idea.best_sharpe != null
+      ? `<span class="idea-pill pill-best">Best Sharpe ${parseFloat(idea.best_sharpe).toFixed(2)}</span>`
+      : '';
+    const pills = `
+      ${idea.passed > 0    ? `<span class="idea-pill pill-passed">${idea.passed} passed</span>` : ''}
+      ${idea.failed > 0    ? `<span class="idea-pill pill-failed">${idea.failed} failed</span>` : ''}
+      ${idea.in_progress > 0 ? `<span class="idea-pill pill-running">${idea.in_progress} running</span>` : ''}
+      <span class="idea-pill pill-total">${idea.total} total</span>
+      ${bestSharpe}
+    `;
+
+    const strats = idea.strategies || [];
+    let rows = '';
+    if (!strats.length) {
+      rows = `<div class="idea-empty">No strategies generated yet.</div>`;
+    } else {
+      // Sort: passed/done first, then in-progress, then failed
+      const DONE = new Set(['done','live','validating']);
+      const PROG = new Set(['implementing','quick_testing','backtesting','quick_tested','awaiting_research','implemented','filtered','awaiting_review']);
+      const sorted = [...strats].sort((a, b) => {
+        const rank = s => DONE.has(s) ? 0 : PROG.has(s) ? 1 : 2;
+        return rank(a.status) - rank(b.status);
+      });
+      rows = `<table class="idea-strat-table">` + sorted.map(s => {
+        const badgeCls = 's-' + (s.status || 'idea').replace(/_/g, '-');
+        const sharpe   = s.backtest_sharpe != null ? fmtNum(s.backtest_sharpe) : (s.quick_test_sharpe != null ? `~${fmtNum(s.quick_test_sharpe)}` : '—');
+        const oos      = s.oos_sharpe != null ? fmtNum(s.oos_sharpe) : '—';
+        const shCls    = s.backtest_sharpe > 1 ? 'pos' : s.backtest_sharpe > 0 ? 'neu' : s.backtest_sharpe < 0 ? 'neg' : '';
+        const tf       = s.best_timeframe ? `<span style="color:#475569;font-size:.7rem">${s.best_timeframe}</span>` : '';
+        return `<tr onclick="openPanel('${s.id}')">
+          <td class="idea-strat-name" title="${esc(s.name)}">${esc(s.name || '—')}</td>
+          <td><span class="badge ${badgeCls}">${statusLabel(s.status)}</span></td>
+          <td>${tf}</td>
+          <td class="metric ${shCls}">${sharpe}</td>
+          <td class="metric" style="color:#7dd3fc">${oos !== '—' ? oos : ''}</td>
+          <td style="color:#374151;font-size:.75rem;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${
+            s.status === 'failed' ? esc((s.error_log || '').slice(0, 80)) : ''
+          }</td>
+        </tr>`;
+      }).join('') + `</table>`;
+    }
+
+    return `<div class="idea-card" id="idea-card-${idx}">
+      <div class="idea-header" onclick="toggleIdea(${idx})">
+        <span class="idea-chevron">▶</span>
+        <div style="flex:1">
+          <div class="idea-body-text">${preview}</div>
+          <div class="idea-meta">${date}</div>
+          <div class="idea-pills">${pills}</div>
+        </div>
+      </div>
+      <div class="idea-strategies">${rows}</div>
+    </div>`;
+  }).join('');
+}
+
+function toggleIdea(idx) {
+  const card = document.getElementById(`idea-card-${idx}`);
+  card.classList.toggle('open');
 }
 
 async function openPanel(id) {
@@ -1936,6 +2152,8 @@ document.addEventListener('keydown', e => { if (e.key === 'Escape') closePanel()
 // Auto-refresh every 30s
 loadAll();
 setInterval(loadAll, 30000);
+// Open ideas view if URL hash says so
+if (location.hash === '#ideas') setView('ideas');
 </script>
 </body>
 </html>"""
