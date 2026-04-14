@@ -255,6 +255,11 @@ CREATE INDEX IF NOT EXISTS idx_knowledge_base_category    ON knowledge_base(cate
 CREATE INDEX IF NOT EXISTS idx_knowledge_base_strategy_id ON knowledge_base(strategy_id);
 CREATE INDEX IF NOT EXISTS idx_knowledge_base_created_at  ON knowledge_base(created_at DESC);
 
+ALTER TABLE knowledge_base ADD COLUMN IF NOT EXISTS p_value        float8;
+ALTER TABLE knowledge_base ADD COLUMN IF NOT EXISTS profit_factor  float8;
+ALTER TABLE knowledge_base ADD COLUMN IF NOT EXISTS t_stat         float8;
+ALTER TABLE knowledge_base ADD COLUMN IF NOT EXISTS optimal_params jsonb;
+
 
 -- =============================================================================
 -- Table: spend_log  (LLM cost tracking for daily budget enforcement)
@@ -353,6 +358,7 @@ CREATE TABLE IF NOT EXISTS research_tasks (
 ALTER TABLE research_tasks ADD COLUMN IF NOT EXISTS generated_code  text;
 ALTER TABLE research_tasks ADD COLUMN IF NOT EXISTS key_findings    jsonb;
 ALTER TABLE research_tasks ADD COLUMN IF NOT EXISTS research_spec   jsonb;
+ALTER TABLE research_tasks ADD COLUMN IF NOT EXISTS retry_count     int  DEFAULT 0;
 
 CREATE INDEX IF NOT EXISTS idx_research_tasks_status     ON research_tasks(status);
 CREATE INDEX IF NOT EXISTS idx_research_tasks_type       ON research_tasks(type);

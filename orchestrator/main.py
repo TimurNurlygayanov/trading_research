@@ -2234,6 +2234,7 @@ _RESEARCH_HTML = r"""<!DOCTYPE html>
   .queue-table td { padding: 10px 14px; border-bottom: 1px solid #111827; color: #94a3b8;
                     vertical-align: top; }
   .queue-table tr:hover td { background: #0d1117; }
+  .queue-table tbody tr { cursor: pointer; }
   .q-title { color: #e2e8f0; font-size: 0.85rem; }
   .q-status { display: inline-block; padding: 2px 10px; border-radius: 99px;
               font-size: 0.7rem; font-weight: 600; white-space: nowrap; }
@@ -2241,6 +2242,31 @@ _RESEARCH_HTML = r"""<!DOCTYPE html>
   .qs-running  { background: #3b2f00; color: #fcd34d; }
   .qs-done     { background: #14532d; color: #86efac; }
   .qs-failed   { background: #7f1d1d; color: #fca5a5; }
+
+  /* Task detail modal */
+  .modal-overlay { display:none; position:fixed; inset:0; background:rgba(0,0,0,.7);
+                   z-index:1000; align-items:center; justify-content:center; }
+  .modal-overlay.open { display:flex; }
+  .modal-box { background:#111827; border:1px solid #1f2937; border-radius:10px;
+               width:min(720px,92vw); max-height:85vh; overflow-y:auto;
+               padding:24px 28px; position:relative; }
+  .modal-close { position:absolute; top:14px; right:16px; background:none; border:none;
+                 color:#64748b; font-size:1.4rem; cursor:pointer; line-height:1; }
+  .modal-close:hover { color:#e2e8f0; }
+  .modal-title { font-size:1rem; font-weight:700; color:#f1f5f9; margin-bottom:4px; }
+  .modal-meta  { font-size:0.75rem; color:#475569; margin-bottom:16px; }
+  .modal-section { margin-top:16px; }
+  .modal-section-hdr { font-size:0.7rem; font-weight:600; text-transform:uppercase;
+                       letter-spacing:.05em; color:#475569; margin-bottom:6px; }
+  .modal-body-text { font-size:0.82rem; color:#94a3b8; line-height:1.6;
+                     white-space:pre-wrap; word-break:break-word; }
+  .modal-error { font-size:0.82rem; color:#fca5a5; background:#1a0d0d;
+                 border:1px solid #7f1d1d; border-radius:6px; padding:12px;
+                 white-space:pre-wrap; word-break:break-word; font-family:monospace; }
+  .modal-finding { background:#0d1117; border-left:3px solid #6366f1;
+                   padding:8px 12px; margin-bottom:6px; border-radius:0 4px 4px 0; }
+  .modal-finding-text { font-size:0.82rem; color:#c7d2fe; }
+  .modal-finding-conf { font-size:0.7rem; color:#475569; margin-top:2px; }
 
   /* ── Buttons ── */
   .btn-primary { background: #6366f1; border: none; border-radius: 8px; color: #fff;
@@ -2322,6 +2348,31 @@ _RESEARCH_HTML = r"""<!DOCTYPE html>
 </div>
 
 <div class="toast" id="toast"></div>
+
+<!-- Task detail modal -->
+<div class="modal-overlay" id="task-modal" onclick="closeModal(event)">
+  <div class="modal-box">
+    <button class="modal-close" onclick="document.getElementById('task-modal').classList.remove('open')">&#x2715;</button>
+    <div class="modal-title" id="m-title"></div>
+    <div class="modal-meta"  id="m-meta"></div>
+    <div class="modal-section" id="m-error-wrap" style="display:none">
+      <div class="modal-section-hdr">Error</div>
+      <div class="modal-error" id="m-error"></div>
+    </div>
+    <div class="modal-section" id="m-summary-wrap" style="display:none">
+      <div class="modal-section-hdr">Summary</div>
+      <div class="modal-body-text" id="m-summary"></div>
+    </div>
+    <div class="modal-section" id="m-findings-wrap" style="display:none">
+      <div class="modal-section-hdr">Key Findings</div>
+      <div id="m-findings"></div>
+    </div>
+    <div class="modal-section" id="m-report-wrap" style="display:none">
+      <div class="modal-section-hdr">Full Report</div>
+      <div class="modal-body-text" id="m-report"></div>
+    </div>
+  </div>
+</div>
 
 <script>
 let allEntries = [];
@@ -2426,7 +2477,10 @@ function renderCard(e) {
 </div>`;
 }
 
+let _queueTasks = [];
+
 function renderQueue(tasks) {
+  _queueTasks = tasks;
   const el = document.getElementById('queue-wrap');
   if (!tasks.length) {
     el.className = '';
@@ -2434,12 +2488,12 @@ function renderQueue(tasks) {
     return;
   }
   el.className = '';
-  const rows = tasks.map(t => {
+  const rows = tasks.map((t, i) => {
     const status  = t.status || 'pending';
     const title   = (t.title || '').replace('[Indicator] ', '');
     const ts      = (t.created_at || '').slice(0, 16).replace('T', ' ');
     const summary = esc((t.result_summary || '').slice(0, 100) + (t.result_summary && t.result_summary.length > 100 ? '…' : ''));
-    return `<tr>
+    return `<tr onclick="openTaskModal(${i})" title="Click to view details">
       <td class="q-title">${esc(title)}</td>
       <td><span class="q-status qs-${status}">${status}</span></td>
       <td>${summary}</td>
@@ -2453,6 +2507,61 @@ function renderQueue(tasks) {
   </tr></thead>
   <tbody>${rows}</tbody>
 </table>`;
+}
+
+function openTaskModal(i) {
+  const t = _queueTasks[i];
+  if (!t) return;
+  document.getElementById('m-title').textContent = (t.title || '').replace('[Indicator] ', '');
+  document.getElementById('m-meta').textContent  =
+    `Status: ${t.status || '—'}  ·  Created: ${(t.created_at || '').slice(0, 16).replace('T', ' ')}`;
+
+  const errWrap = document.getElementById('m-error-wrap');
+  if (t.error_log) {
+    document.getElementById('m-error').textContent = t.error_log;
+    errWrap.style.display = '';
+  } else {
+    errWrap.style.display = 'none';
+  }
+
+  const sumWrap = document.getElementById('m-summary-wrap');
+  if (t.result_summary) {
+    document.getElementById('m-summary').textContent = t.result_summary;
+    sumWrap.style.display = '';
+  } else {
+    sumWrap.style.display = 'none';
+  }
+
+  const findingsWrap = document.getElementById('m-findings-wrap');
+  const findings = t.key_findings;
+  if (findings && findings.length) {
+    document.getElementById('m-findings').innerHTML = findings.map(f => {
+      const conf = f.confidence != null ? `Confidence: ${(f.confidence * 100).toFixed(0)}%` : '';
+      return `<div class="modal-finding">
+        <div class="modal-finding-text">${esc(f.finding || '')}</div>
+        ${conf ? `<div class="modal-finding-conf">${conf}</div>` : ''}
+      </div>`;
+    }).join('');
+    findingsWrap.style.display = '';
+  } else {
+    findingsWrap.style.display = 'none';
+  }
+
+  const reportWrap = document.getElementById('m-report-wrap');
+  if (t.report_text) {
+    document.getElementById('m-report').textContent = t.report_text;
+    reportWrap.style.display = '';
+  } else {
+    reportWrap.style.display = 'none';
+  }
+
+  document.getElementById('task-modal').classList.add('open');
+}
+
+function closeModal(e) {
+  if (e.target === document.getElementById('task-modal')) {
+    document.getElementById('task-modal').classList.remove('open');
+  }
 }
 
 async function generateTasks() {

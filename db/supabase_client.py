@@ -267,7 +267,8 @@ def get_knowledge_entries(
     """Return knowledge_base entries with optional category/indicator filters."""
     sb = get_client()
     q = sb.table("knowledge_base").select(
-        "id, category, indicator, timeframe, asset, session, summary, sharpe_ref, created_at"
+        "id, category, indicator, timeframe, asset, session, summary, "
+        "sharpe_ref, p_value, profit_factor, t_stat, optimal_params, created_at"
     )
     if category and category != "all":
         q = q.eq("category", category)

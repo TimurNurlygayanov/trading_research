@@ -136,6 +136,17 @@ def run_quick_backtest(strategy_id: str) -> dict:
             strategy_class = next(iter(strategy_classes.values()))
 
         # ── Run backtest on each timeframe ────────────────────────────────────
+        def _clean(v, ndigits=4):
+            """Round float; replace NaN/inf with None so JSONB accepts it."""
+            import math
+            if v is None:
+                return None
+            try:
+                f = float(v)
+                return None if (math.isnan(f) or math.isinf(f)) else round(f, ndigits)
+            except (TypeError, ValueError):
+                return None
+
         tf_results: dict = {}   # tf -> metrics dict
         tf_dates:   dict = {}   # tf -> (start_str, end_str, n_bars)
         cache_committed = False
@@ -161,14 +172,14 @@ def run_quick_backtest(strategy_id: str) -> dict:
                                       enforce_gates=False)
 
                 tf_results[tf] = {
-                    "sharpe":          round(result.sharpe, 4),
-                    "equity_sharpe":   round(result.equity_sharpe, 4),
-                    "trades":          result.total_trades,
-                    "win_rate":        round(result.win_rate, 4),
-                    "drawdown":        round(result.max_drawdown, 4),
-                    "profit_factor":   round(result.profit_factor, 3),
-                    "signals_per_year": round(result.signals_per_year, 1),
-                    "bars":            len(train_df),
+                    "sharpe":           _clean(result.sharpe),
+                    "equity_sharpe":    _clean(result.equity_sharpe),
+                    "trades":           result.total_trades,
+                    "win_rate":         _clean(result.win_rate),
+                    "drawdown":         _clean(result.max_drawdown),
+                    "profit_factor":    _clean(result.profit_factor, 3),
+                    "signals_per_year": _clean(result.signals_per_year, 1),
+                    "bars":             len(train_df),
                 }
             except Exception as tf_err:
                 tf_results[tf] = {"error": str(tf_err)[:200], "sharpe": -999.0}
@@ -404,30 +415,8 @@ def run_backtest_pipeline(strategy_id: str) -> dict:
             add_pipeline_note(strategy_id, f"Backtest FAILED leakage check — score {leakage_result.score}/10. Issues: {'; '.join(leakage_result.issues[:3])}")
             return {"passed": False, "reason": "leakage_check_failed", "issues": leakage_result.issues}
 
-        # 3. Fetch data for primary timeframe
+        # 3. Execute the strategy class from code string (no data needed yet)
         import os as _os
-        cache_file = f"{CACHE_DIR}/{symbol}_{primary_tf}.parquet"
-        if _os.path.exists(cache_file):
-            df = pd.read_parquet(cache_file)
-            add_pipeline_note(strategy_id, f"Data loaded from cache for {primary_tf} ({len(df)} bars).")
-        else:
-            df = fetch_ohlcv(symbol, primary_tf, start="2015-01-01", end="2026-12-31")
-            _os.makedirs(CACHE_DIR, exist_ok=True)
-            df.to_parquet(cache_file)
-            ohlcv_cache.commit()
-            add_pipeline_note(strategy_id, f"Data downloaded and cached for {primary_tf} ({len(df)} bars).")
-        train_df, oos_df = split_train_oos(df)
-        add_pipeline_note(strategy_id,
-            f"Train period: {train_df.index[0].strftime('%Y-%m-%d')} → "
-            f"{train_df.index[-1].strftime('%Y-%m-%d')} "
-            f"({round((train_df.index[-1] - train_df.index[0]).days / 365.25, 1)}y, "
-            f"{len(train_df):,} bars). "
-            f"OOS: {oos_df.index[0].strftime('%Y-%m-%d')} → "
-            f"{oos_df.index[-1].strftime('%Y-%m-%d')} "
-            f"({len(oos_df):,} bars)."
-        )
-
-        # 4. Execute the strategy class from code string
         namespace: dict = {}
         exec(compile(code, "<strategy>", "exec"), namespace)
         strategy_classes = {
@@ -443,8 +432,7 @@ def run_backtest_pipeline(strategy_id: str) -> dict:
         else:
             strategy_class = next(iter(strategy_classes.values()))
 
-        # 5. Optimize on training data
-        # Convert param_space from JSON format to optimizer tuple format.
+        # 4. Build param_space for optimizer
         # LLM may produce either:
         #   ["int", 5, 30]               → ("int", 5, 30)
         #   ["float", 1.0, 4.0]          → ("float", 1.0, 4.0)
@@ -461,8 +449,90 @@ def run_backtest_pipeline(strategy_id: str) -> dict:
             else:
                 opt_space[k] = tuple(v)
 
-        best_params, study = optimize_strategy(
-            strategy_class, train_df, opt_space, n_trials=50, n_jobs=4
+        # 5. Determine which timeframes are worth optimizing.
+        # Use quick-test results: any TF that produced at least 1 trade is viable.
+        # Skip TFs with 0 trades — there is nothing to optimize.
+        quick_test_all = strategy.get("quick_test_all_timeframes") or {}
+        viable_tfs = [
+            tf for tf, m in quick_test_all.items()
+            if isinstance(m, dict) and m.get("trades", 0) > 0
+        ]
+        # Sort by trade count descending so higher-signal TFs run first
+        viable_tfs.sort(key=lambda tf: quick_test_all[tf].get("trades", 0), reverse=True)
+        if not viable_tfs:
+            viable_tfs = [primary_tf]  # fallback if quick-test data is missing
+
+        add_pipeline_note(strategy_id,
+            f"Viable timeframes for optimization: {viable_tfs} "
+            f"(skipping TFs with 0 trades)."
+        )
+
+        # 6. Optimize on every viable timeframe; pick the winner by best train Sharpe.
+        tf_opt_results: dict = {}   # tf → {best_params, sharpe, trades, train_df, oos_df}
+
+        for opt_tf in viable_tfs:
+            try:
+                cache_file = f"{CACHE_DIR}/{symbol}_{opt_tf}.parquet"
+                if _os.path.exists(cache_file):
+                    opt_df = pd.read_parquet(cache_file)
+                else:
+                    opt_df = fetch_ohlcv(symbol, opt_tf, start="2015-01-01", end="2026-12-31")
+                    _os.makedirs(CACHE_DIR, exist_ok=True)
+                    opt_df.to_parquet(cache_file)
+                    ohlcv_cache.commit()
+
+                opt_train_df, opt_oos_df = split_train_oos(opt_df)
+                opt_params, _ = optimize_strategy(
+                    strategy_class, opt_train_df, opt_space, n_trials=50, n_jobs=4
+                )
+                opt_result = run_backtest(
+                    strategy_class, opt_train_df, params=opt_params, enforce_gates=False
+                )
+                sharpe = opt_result.sharpe if opt_result else -999.0
+                trades = opt_result.total_trades if opt_result else 0
+                tf_opt_results[opt_tf] = {
+                    "best_params": opt_params,
+                    "sharpe":      sharpe,
+                    "trades":      trades,
+                    "train_df":    opt_train_df,
+                    "oos_df":      opt_oos_df,
+                }
+                add_pipeline_note(
+                    strategy_id,
+                    f"  {opt_tf}: optimized Sharpe={sharpe:.3f}, trades={trades}."
+                )
+            except Exception as tf_err:
+                add_pipeline_note(
+                    strategy_id,
+                    f"  {opt_tf}: optimization failed — {tf_err}"
+                )
+
+        if not tf_opt_results:
+            raise ValueError("All timeframe optimizations failed")
+
+        # Winner = best optimized train Sharpe
+        best_opt_tf = max(tf_opt_results, key=lambda tf: tf_opt_results[tf]["sharpe"])
+        best_r      = tf_opt_results[best_opt_tf]
+        primary_tf  = best_opt_tf
+        best_params = best_r["best_params"]
+        train_df    = best_r["train_df"]
+        oos_df      = best_r["oos_df"]
+
+        add_pipeline_note(
+            strategy_id,
+            f"Winner: {primary_tf} (Sharpe={best_r['sharpe']:.3f}, "
+            f"trades={best_r['trades']}). Running full pipeline on {primary_tf}."
+        )
+        db.update_strategy(strategy_id, {"best_timeframe": primary_tf})
+
+        add_pipeline_note(strategy_id,
+            f"Train period: {train_df.index[0].strftime('%Y-%m-%d')} → "
+            f"{train_df.index[-1].strftime('%Y-%m-%d')} "
+            f"({round((train_df.index[-1] - train_df.index[0]).days / 365.25, 1)}y, "
+            f"{len(train_df):,} bars). "
+            f"OOS: {oos_df.index[0].strftime('%Y-%m-%d')} → "
+            f"{oos_df.index[-1].strftime('%Y-%m-%d')} "
+            f"({len(oos_df):,} bars)."
         )
 
         # 5.5. Recent-data gate: quick sanity check on last 90 days of OOS data.

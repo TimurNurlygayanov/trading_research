@@ -95,8 +95,58 @@ def _dispatch_validator_job(strategy_id: str) -> None:
         })
 
 
+_RESEARCH_MAX_RETRIES = 3
+
+
+def _retry_failed_research_tasks() -> int:
+    """Reset failed research tasks (retry_count < max) back to pending."""
+    failed = db.get_research_tasks(status="failed", limit=50)
+    reset = 0
+    for task in failed:
+        retries = task.get("retry_count") or 0
+        if retries >= _RESEARCH_MAX_RETRIES:
+            continue
+        db.update_research_task(task["id"], {
+            "status":      "pending",
+            "retry_count": retries + 1,
+            "modal_job_id": None,
+        })
+        reset += 1
+        log.info("research_task_reset_for_retry task_id=%s retry=%s", task["id"], retries + 1)
+    return reset
+
+
+def _auto_generate_research_tasks() -> int:
+    """
+    Keep the research queue populated.
+    1. Drain the static spec catalogue first.
+    2. Once all static specs are done/running, ask Claude for novel combos.
+    Only runs when the pending queue is below a threshold.
+    """
+    pending_count = len(db.get_research_tasks(status="pending", limit=30))
+    if pending_count >= 20:
+        return 0  # queue is healthy, nothing to do
+
+    from agents.indicator_researcher import generate_research_tasks, generate_llm_combo_tasks
+
+    # Phase 1: fill from static catalogue
+    created = generate_research_tasks()
+    if created > 0:
+        log.info("auto_generate_research_static created=%s", created)
+        return created
+
+    # Phase 2: catalogue exhausted — ask Claude for novel combos
+    try:
+        created = generate_llm_combo_tasks(n=15)
+        if created > 0:
+            log.info("auto_generate_research_llm created=%s", created)
+    except Exception as exc:
+        log.warning("auto_generate_research_llm_failed error=%s", exc)
+    return created
+
+
 def _dispatch_pending_research_tasks() -> int:
-    """Find research tasks stuck in 'pending' and dispatch them to Modal.
+    """Find research tasks in 'pending' and dispatch them to Modal.
 
     Routes by task type:
       indicator_research → run_indicator_research_task
@@ -120,13 +170,13 @@ def _dispatch_pending_research_tasks() -> int:
                 "modal_job_id": call.object_id,
             })
             dispatched += 1
-            log.info("modal_research_dispatched",
-                     task_id=task_id, task_type=task_type, job_id=call.object_id)
+            log.info("modal_research_dispatched task_id=%s task_type=%s job_id=%s",
+                     task_id, task_type, call.object_id)
         except ImportError:
-            log.warning("modal_not_installed_research", task_id=task_id)
+            log.warning("modal_not_installed_research task_id=%s", task_id)
             break
         except Exception as exc:
-            log.error("modal_research_dispatch_failed", task_id=task_id, error=str(exc))
+            log.error("modal_research_dispatch_failed task_id=%s error=%s", task_id, exc)
     return dispatched
 
 
@@ -838,6 +888,8 @@ def process_queue() -> None:
     recovered_ideas       = _recover_stuck_idea_strategies()
     filtered_processed    = _process_filtered_strategies()
     research_unblocked    = _process_awaiting_research_strategies()
+    research_retried      = _retry_failed_research_tasks()
+    research_generated    = _auto_generate_research_tasks()
     research_dispatched   = _dispatch_pending_research_tasks()
     # 'implemented' → quick backtest; 'validating' → validator
     modal_dispatched      = _process_implemented_strategies()
@@ -853,6 +905,8 @@ def process_queue() -> None:
         recovered_ideas=recovered_ideas,
         filtered_processed=filtered_processed,
         research_unblocked=research_unblocked,
+        research_retried=research_retried,
+        research_generated=research_generated,
         research_dispatched=research_dispatched,
         modal_dispatched=modal_dispatched,
         full_backtest_queued=full_backtest_queued,
