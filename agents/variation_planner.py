@@ -192,7 +192,7 @@ def run_variation_planner(
         except Exception:
             pass
 
-    client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+    from agents.utils import call_claude
     total_input = 0
     total_output = 0
 
@@ -203,7 +203,7 @@ def run_variation_planner(
             + (f"PRE-FILTER SUGGESTIONS:\n{suggestions[:400]}" if suggestions else "")
         ).strip()
 
-        r1 = client.messages.create(
+        r1 = call_claude(
             model=MODEL,
             max_tokens=1024,
             system=_DECOMPOSE_SYSTEM,
@@ -248,7 +248,7 @@ def run_variation_planner(
     )
 
     try:
-        r2 = client.messages.create(
+        r2 = call_claude(
             model=MODEL,
             max_tokens=6000,
             system=_GENERATE_SYSTEM.format(n=n_extra, knowledge=knowledge_text),

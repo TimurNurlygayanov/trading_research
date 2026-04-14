@@ -96,7 +96,7 @@ def run_implementer(
             research_context=research_context,
         )
 
-    client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+    from agents.utils import call_claude
 
     result: dict[str, Any] | None = None
     last_leakage_result = None
@@ -108,7 +108,7 @@ def run_implementer(
     for attempt in range(MAX_RETRIES + 1):
         log.info(f"Implementer: strategy={strategy_id} attempt={attempt + 1}/{MAX_RETRIES + 1}")
 
-        response = client.messages.create(
+        response = call_claude(
             model=MODEL,
             max_tokens=4096,
             system=IMPLEMENTER_SYSTEM,

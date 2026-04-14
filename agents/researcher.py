@@ -48,8 +48,8 @@ def generate_research_code(
         end=end,
     )
 
-    client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
-    response = client.messages.create(
+    from agents.utils import call_claude
+    response = call_claude(
         model=MODEL,
         max_tokens=4096,
         system=RESEARCHER_SYSTEM,

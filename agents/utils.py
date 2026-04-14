@@ -3,6 +3,38 @@ from __future__ import annotations
 
 import datetime
 import json
+import logging
+import os
+import time
+
+log = logging.getLogger(__name__)
+
+
+def call_claude(**kwargs):
+    """
+    Wrapper around anthropic client.messages.create() with exponential backoff
+    on 429 rate-limit errors.  Waits up to 5 attempts (total ~7 min delay budget).
+
+    Usage:
+        response = call_claude(model=MODEL, max_tokens=1024, system=SYSTEM,
+                               messages=[...])
+    """
+    import anthropic
+
+    client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+    wait = 30  # seconds before first retry
+    for attempt in range(5):
+        try:
+            return client.messages.create(**kwargs)
+        except anthropic.RateLimitError as exc:
+            if attempt == 4:
+                raise
+            log.warning(
+                "Anthropic rate limit hit, retrying in %ds (attempt %d/5): %s",
+                wait, attempt + 1, exc,
+            )
+            time.sleep(wait)
+            wait = min(wait * 2, 120)  # cap at 2 min
 
 
 def add_pipeline_note(strategy_id: str, text: str) -> None:

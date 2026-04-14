@@ -36,8 +36,8 @@ def run_summariser(strategy_id: str) -> dict[str, Any]:
 
     user_msg = _build_user_message(strategy)
 
-    client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
-    response = client.messages.create(
+    from agents.utils import call_claude
+    response = call_claude(
         model=MODEL,
         max_tokens=1024,
         system=SUMMARISER_SYSTEM,

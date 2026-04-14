@@ -145,14 +145,25 @@ def _auto_generate_research_tasks() -> int:
     return created
 
 
+_MAX_CONCURRENT_RESEARCH = 2  # cap to avoid Anthropic token rate limits
+
+
 def _dispatch_pending_research_tasks() -> int:
     """Find research tasks in 'pending' and dispatch them to Modal.
+
+    At most _MAX_CONCURRENT_RESEARCH jobs run simultaneously to avoid
+    hitting the Anthropic output-token-per-minute rate limit.
 
     Routes by task type:
       indicator_research → run_indicator_research_task
       everything else    → run_research_task
     """
-    pending = db.get_research_tasks(status="pending", limit=10)
+    running_count = len(db.get_research_tasks(status="running", limit=20))
+    slots = _MAX_CONCURRENT_RESEARCH - running_count
+    if slots <= 0:
+        return 0
+
+    pending = db.get_research_tasks(status="pending", limit=slots)
     dispatched = 0
     for task in pending:
         task_id   = task["id"]

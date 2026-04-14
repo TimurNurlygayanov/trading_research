@@ -738,8 +738,8 @@ Respond ONLY with a JSON array. Each element must have:
 
 No markdown, no explanation — only the raw JSON array."""
 
-    client = anthropic.Anthropic()
-    response = client.messages.create(
+    from agents.utils import call_claude
+    response = call_claude(
         model=MODEL,
         max_tokens=2000,
         messages=[{"role": "user", "content": prompt}],
@@ -1154,8 +1154,8 @@ def _generate_analysis_code(indicator: str, description: str, spec_type: str = "
         "Write the parameterized analyze_indicator(df, **params) and PARAM_SPACE."
     )
 
-    client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
-    response = client.messages.create(
+    from agents.utils import call_claude
+    response = call_claude(
         model=MODEL,
         max_tokens=3000,
         system=system,
@@ -1502,8 +1502,8 @@ def _interpret_and_save(
                         f" | short: hit={_pct(ss.get('hit_rate'))}  PF={_fmt(ss.get('profit_factor'))}"
                     )
 
-    client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
-    response = client.messages.create(
+    from agents.utils import call_claude
+    response = call_claude(
         model=MODEL,
         max_tokens=2000,
         system=_INTERP_SYSTEM,

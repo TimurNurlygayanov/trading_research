@@ -46,8 +46,8 @@ def run_validator(strategy_id: str) -> dict[str, Any]:
         code=code,
     )
 
-    client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
-    response = client.messages.create(
+    from agents.utils import call_claude
+    response = call_claude(
         model=MODEL,
         max_tokens=4096,
         system=VALIDATOR_SYSTEM,

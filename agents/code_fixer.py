@@ -197,8 +197,8 @@ def fix_strategy_code(
 
     try:
         from db import supabase_client as db  # noqa: import inside fn for testability
-        client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
-        response = client.messages.create(
+        from agents.utils import call_claude
+        response = call_claude(
             model=MODEL,
             max_tokens=4096,
             system=_FIX_SYSTEM,

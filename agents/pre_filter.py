@@ -48,8 +48,8 @@ def run_pre_filter(strategy_id: str) -> dict[str, Any]:
         knowledge_base_context=knowledge_text,
     )
 
-    client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
-    response = client.messages.create(
+    from agents.utils import call_claude
+    response = call_claude(
         model=MODEL,
         max_tokens=1024,
         system=PRE_FILTER_SYSTEM,

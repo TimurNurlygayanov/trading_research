@@ -36,8 +36,8 @@ def run_learner(strategy_id: str) -> list[dict[str, Any]]:
 
     user_msg = _build_user_message(strategy)
 
-    client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
-    response = client.messages.create(
+    from agents.utils import call_claude
+    response = call_claude(
         model=MODEL,
         max_tokens=1024,
         system=LEARNER_SYSTEM,

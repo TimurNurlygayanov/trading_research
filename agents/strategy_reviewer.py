@@ -64,8 +64,8 @@ def run_strategy_reviewer(strategy_id: str, user_message: str) -> dict[str, str]
     )
 
     try:
-        client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
-        response = client.messages.create(
+        from agents.utils import call_claude
+        response = call_claude(
             model=MODEL,
             max_tokens=4096,
             system=_REVIEWER_SYSTEM,
