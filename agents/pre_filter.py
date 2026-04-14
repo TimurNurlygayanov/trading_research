@@ -20,7 +20,7 @@ from agents.utils import full_description, add_pipeline_note
 load_dotenv()
 log = logging.getLogger(__name__)
 
-MODEL = "claude-haiku-4-5-20251001"  # Light agent — use Haiku for cost efficiency
+MODEL = "claude-sonnet-4-6"  # Scoring quality matters — weak analysis sends bad ideas downstream
 MIN_SCORE_TO_PROCEED = 6.0
 
 

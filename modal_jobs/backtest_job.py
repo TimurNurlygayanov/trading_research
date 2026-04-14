@@ -137,6 +137,7 @@ def run_quick_backtest(strategy_id: str) -> dict:
 
         # ── Run backtest on each timeframe ────────────────────────────────────
         tf_results: dict = {}   # tf -> metrics dict
+        tf_dates:   dict = {}   # tf -> (start_str, end_str, n_bars)
         cache_committed = False
 
         for tf in QUICK_TEST_TIMEFRAMES:
@@ -151,6 +152,11 @@ def run_quick_backtest(strategy_id: str) -> dict:
                     cache_committed = False  # will commit after all downloads
 
                 train_df, _ = split_train_oos(df)
+                tf_dates[tf] = (
+                    train_df.index[0].strftime("%Y-%m-%d"),
+                    train_df.index[-1].strftime("%Y-%m-%d"),
+                    len(train_df),
+                )
                 result = run_backtest(strategy_class, train_df, params={},
                                       enforce_gates=False)
 
@@ -233,6 +239,14 @@ def run_quick_backtest(strategy_id: str) -> dict:
                     f"dd={m['drawdown']:.1%}{marker}"
                 )
 
+        # Date range info for the best timeframe
+        if best_tf in tf_dates:
+            t0, t1, n_bars = tf_dates[best_tf]
+            years = round((pd.Timestamp(t1) - pd.Timestamp(t0)).days / 365.25, 1)
+            date_line = f"\nTrain period: {t0} → {t1} ({years}y, {n_bars:,} bars on {best_tf})"
+        else:
+            date_line = ""
+
         add_pipeline_note(strategy_id,
             f"Multi-timeframe quick test complete — best: {best_tf} "
             f"(Sharpe={best.get('sharpe', 0):+.4f}, "
@@ -240,7 +254,8 @@ def run_quick_backtest(strategy_id: str) -> dict:
             f"win={best.get('win_rate', 0):.0%}, "
             f"pf={best.get('profit_factor', 0):.3f}, "
             f"dd={best.get('drawdown', 0):.1%})\n"
-            + "\n".join(tf_lines))
+            + "\n".join(tf_lines)
+            + date_line)
 
         # Generate HTML report for best timeframe + capture trades for analyzer
         html_report = None
@@ -402,6 +417,15 @@ def run_backtest_pipeline(strategy_id: str) -> dict:
             ohlcv_cache.commit()
             add_pipeline_note(strategy_id, f"Data downloaded and cached for {primary_tf} ({len(df)} bars).")
         train_df, oos_df = split_train_oos(df)
+        add_pipeline_note(strategy_id,
+            f"Train period: {train_df.index[0].strftime('%Y-%m-%d')} → "
+            f"{train_df.index[-1].strftime('%Y-%m-%d')} "
+            f"({round((train_df.index[-1] - train_df.index[0]).days / 365.25, 1)}y, "
+            f"{len(train_df):,} bars). "
+            f"OOS: {oos_df.index[0].strftime('%Y-%m-%d')} → "
+            f"{oos_df.index[-1].strftime('%Y-%m-%d')} "
+            f"({len(oos_df):,} bars)."
+        )
 
         # 4. Execute the strategy class from code string
         namespace: dict = {}

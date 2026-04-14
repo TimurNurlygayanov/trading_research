@@ -96,21 +96,32 @@ def _dispatch_validator_job(strategy_id: str) -> None:
 
 
 def _dispatch_pending_research_tasks() -> int:
-    """Find research tasks stuck in 'pending' and dispatch them to Modal."""
+    """Find research tasks stuck in 'pending' and dispatch them to Modal.
+
+    Routes by task type:
+      indicator_research → run_indicator_research_task
+      everything else    → run_research_task
+    """
     pending = db.get_research_tasks(status="pending", limit=10)
     dispatched = 0
     for task in pending:
-        task_id = task["id"]
+        task_id   = task["id"]
+        task_type = task.get("type", "market_analysis")
         try:
             import modal
-            fn = modal.Function.from_name("trading-research-research", "run_research_task")
+            if task_type == "indicator_research":
+                fn_name = "run_indicator_research_task"
+            else:
+                fn_name = "run_research_task"
+            fn   = modal.Function.from_name("trading-research-research", fn_name)
             call = fn.spawn(task_id)
             db.update_research_task(task_id, {
                 "status": "running",
                 "modal_job_id": call.object_id,
             })
             dispatched += 1
-            log.info("modal_research_dispatched", task_id=task_id, job_id=call.object_id)
+            log.info("modal_research_dispatched",
+                     task_id=task_id, task_type=task_type, job_id=call.object_id)
         except ImportError:
             log.warning("modal_not_installed_research", task_id=task_id)
             break
@@ -245,11 +256,19 @@ def _recover_stuck_idea_strategies() -> int:
 def _process_filtered_strategies() -> int:
     """
     Run the implementer on strategies that passed pre-filter.
-    Two possible outcomes:
-      - Code produced → strategy becomes 'implemented' → dispatch quick backtest
-      - Research requested → strategy becomes 'awaiting_research'
+
+    For strategies that are not yet part of a campaign (campaign_id=None,
+    is_campaign_root=False), first run the Variation Planner to generate
+    N structurally diverse child strategies before implementing the root.
+
+    Two implementer outcomes:
+      - Code produced → 'implemented' → dispatch quick backtest
+      - Research requested → 'awaiting_research'
     Returns number of strategies processed.
     """
+    import os as _os
+    N_VARIATIONS = int(_os.environ.get("CAMPAIGN_N_VARIATIONS", "8"))
+
     strategies = db.get_strategies_by_status("filtered", limit=3)
     if not strategies:
         return 0
@@ -258,6 +277,43 @@ def _process_filtered_strategies() -> int:
     for strategy in strategies:
         strategy_id = strategy.get("id")
         try:
+            is_campaign_child = bool(strategy.get("campaign_id"))
+            is_campaign_root  = bool(strategy.get("is_campaign_root"))
+
+            # ── Variation planning (only for fresh, standalone strategies) ────
+            if not is_campaign_child and not is_campaign_root:
+                # Mark as root FIRST so a failure doesn't cause infinite replanning
+                db.update_strategy(strategy_id, {"is_campaign_root": True})
+                try:
+                    check_budget("variation_planner")
+                except BudgetExceeded as be:
+                    log.warning("budget_exceeded_variation_planner",
+                                strategy_id=strategy_id, error=str(be))
+                    # Fall through — implement as single strategy
+                else:
+                    try:
+                        from agents.variation_planner import run_variation_planner
+                        variations = run_variation_planner(strategy_id, N_VARIATIONS)
+                        seed_hyp = strategy.get("hypothesis", "")
+                        for v in variations:
+                            db.insert_strategy({
+                                "campaign_id":      strategy_id,
+                                "name":             v.get("name", "Variation"),
+                                "hypothesis":       v.get("description", ""),
+                                "entry_logic":      seed_hyp,  # seed kept as context
+                                "source":           "researcher",
+                                "status":           "filtered",
+                                "pre_filter_score": strategy.get("pre_filter_score"),
+                                "pre_filter_notes": strategy.get("pre_filter_notes"),
+                            })
+                        log.info("campaign_created", strategy_id=strategy_id,
+                                 n_children=len(variations))
+                    except Exception as exc:
+                        log.error("variation_planner_failed",
+                                  strategy_id=strategy_id, error=str(exc))
+                        # Fall through — implement as single strategy anyway
+
+            # ── Run implementer ───────────────────────────────────────────────
             try:
                 check_budget("implementer")
             except BudgetExceeded as budget_err:
@@ -269,14 +325,10 @@ def _process_filtered_strategies() -> int:
             try:
                 result = run_implementer(strategy_id, allow_research_requests=True)
                 if result.get("needs_research"):
-                    # Strategy is now in 'awaiting_research' — queue worker will
-                    # check back once all research tasks complete
                     log.info("implementer_requested_research",
                              strategy_id=strategy_id, tasks=result.get("task_ids"))
                 else:
-                    # Code produced — dispatch to quick backtest immediately
-                    log.info("implementer_complete",
-                             strategy_id=strategy_id,
+                    log.info("implementer_complete", strategy_id=strategy_id,
                              has_code=bool(result.get("code")))
                     _dispatch_quick_backtest_job(strategy_id)
             except Exception as exc:
@@ -425,71 +477,187 @@ def _process_implemented_strategies() -> int:
 def _process_quick_tested_strategies() -> int:
     """
     For each 'quick_tested' strategy:
-      1. If analysis_done=False and quick_test_trades exist → run strategy_analyzer
-         (finds better session hours, trade caps, and LLM code suggestions).
-         If the analyzer patches the code, status → 'implemented' for a new quick test.
-      2. If analysis_done=True (or no trade data) → dispatch full optimization.
+
+    Campaign strategies (campaign_id set OR is_campaign_root=True):
+      1. Run strategy_analyzer once (analysis_done=False).
+         If analyzer patches the code → re-run quick test.
+      2. Auto-archive if quality gate fails (Sharpe < 0 AND trades < 30).
+      3. Otherwise stay in 'quick_tested' — campaign review handles bulk approval.
+
+    Standalone strategies (no campaign):
+      1. Run strategy_analyzer (same as above).
+      2. Set status='awaiting_review' for individual user review.
+
     Returns number of strategies acted on.
     """
     from agents.strategy_analyzer import run_strategy_analyzer
     from agents.utils import add_pipeline_note
 
-    quick_tested = db.get_strategies_by_status("quick_tested", limit=5)
+    quick_tested = db.get_strategies_by_status("quick_tested", limit=10)
     if not quick_tested:
         return 0
 
     acted = 0
     for strategy in quick_tested:
-        strategy_id = strategy.get("id")
+        strategy_id   = strategy.get("id")
         if strategy.get("modal_job_id"):
-            continue  # already dispatched
+            continue  # still running
 
-        analysis_done  = strategy.get("analysis_done", False)
-        has_trades     = bool(strategy.get("quick_test_trades"))
+        is_campaign   = bool(strategy.get("campaign_id")) or bool(strategy.get("is_campaign_root"))
+        analysis_done = strategy.get("analysis_done", False)
+        has_trades    = bool(strategy.get("quick_test_trades"))  # int count
 
-        # ── Step 1: run analyzer (first time only) ────────────────────────────
+        # Campaign strategies that are already analyzed just wait for campaign review
+        if is_campaign and analysis_done:
+            continue
+
+        # ── Run analyzer (first time, any strategy type) ─────────────────────
         if not analysis_done and has_trades:
             try:
                 check_budget("strategy_analyzer")
             except BudgetExceeded as be:
                 log.warning("budget_exceeded_analyzer", strategy_id=strategy_id,
                             error=str(be))
-                # Skip analyzer, go straight to optimization
                 db.update_strategy(strategy_id, {"analysis_done": True})
             else:
                 try:
                     result = run_strategy_analyzer(strategy_id)
-                    # Mark analysis done regardless of whether code was patched
                     db.update_strategy(strategy_id, {"analysis_done": True})
-
                     if result.get("code_patched"):
-                        # Analyzer improved the code → re-run quick test
-                        log.info("analyzer_code_patched_rerequick",
+                        log.info("analyzer_code_patched_requeue_quick",
                                  strategy_id=strategy_id)
                         _dispatch_quick_backtest_job(strategy_id)
                         acted += 1
-                        continue  # don't dispatch full backtest yet
-
-                    log.info("analyzer_done_no_code_change", strategy_id=strategy_id,
+                        continue
+                    log.info("analyzer_done", strategy_id=strategy_id,
                              improvements=result.get("improvements", []))
                 except Exception as exc:
                     log.error("strategy_analyzer_failed", strategy_id=strategy_id,
                               error=str(exc))
-                    # Don't block optimization if analyzer crashes
                     db.update_strategy(strategy_id, {"analysis_done": True})
 
-        # ── Step 2: dispatch full optimization ────────────────────────────────
+        # ── Campaign strategies: auto-archive weak variations ─────────────────
+        if is_campaign:
+            sharpe = strategy.get("quick_test_sharpe") or 0.0
+            trades = strategy.get("quick_test_trades") or 0
+            if sharpe < 0 and trades < 30:
+                db.update_strategy(strategy_id, {
+                    "status":    "archived",
+                    "error_log": (
+                        f"Campaign quality gate: Sharpe={sharpe:.4f}, trades={trades}. "
+                        "Auto-archived — did not meet minimum thresholds."
+                    ),
+                })
+                log.info("campaign_variation_archived", strategy_id=strategy_id,
+                         sharpe=sharpe, trades=trades)
+                acted += 1
+            else:
+                log.info("campaign_variation_ready", strategy_id=strategy_id,
+                         sharpe=sharpe, trades=trades)
+            continue  # campaign review panel handles approval
+
+        # ── Standalone strategies: individual review ─────────────────────────
         try:
-            _dispatch_backtest_job(strategy_id)
-            acted += 1
-            log.info("full_backtest_dispatched_after_analysis",
-                     strategy_id=strategy_id,
+            db.update_strategy(strategy_id, {"status": "awaiting_review"})
+            add_pipeline_note(
+                strategy_id,
+                "Quick test + analysis complete. "
+                "Waiting for your review — approve to start full optimization, "
+                "or request changes to revise the strategy code."
+            )
+            log.info("strategy_awaiting_review", strategy_id=strategy_id,
                      quick_sharpe=strategy.get("quick_test_sharpe"))
+            acted += 1
         except Exception as exc:
-            log.error("full_backtest_dispatch_failed",
+            log.error("set_awaiting_review_failed",
                       strategy_id=strategy_id, error=str(exc))
 
     return acted
+
+
+def _process_campaign_completion() -> int:
+    """
+    Detect campaigns where all variations have finished quick testing.
+    Adds a summary note to the root so the user knows the campaign is ready to review.
+    Safe to call every cycle — uses a marker in comments to avoid duplicate summaries.
+    Returns number of campaigns newly summarized.
+    """
+    from agents.utils import add_pipeline_note
+
+    sb = db.get_client()
+
+    # Find campaign roots that are in a stable quick-test state
+    REVIEWABLE = ("quick_tested", "awaiting_review", "backtesting",
+                  "validating", "live", "failed", "archived")
+    result = (
+        sb.table("strategies")
+        .select("id, name, status, quick_test_sharpe, quick_test_trades, "
+                "best_timeframe, comments")
+        .eq("is_campaign_root", True)
+        .in_("status", list(REVIEWABLE))
+        .execute()
+    )
+    roots = result.data or []
+
+    summarized = 0
+    for root in roots:
+        root_id  = root["id"]
+        children = db.get_campaign_children(root_id)
+        if not children:
+            continue
+
+        # All children must be in a terminal quick-test state
+        TERMINAL = {"quick_tested", "awaiting_review", "backtesting", "validating",
+                    "live", "failed", "archived"}
+        if not all(c.get("status") in TERMINAL for c in children):
+            continue
+
+        # Check if we already wrote a campaign summary
+        import json as _json
+        comments = root.get("comments") or []
+        if isinstance(comments, str):
+            try:
+                comments = _json.loads(comments)
+            except Exception:
+                comments = []
+        if any("[campaign_summary]" in (c.get("text", "")) for c in comments):
+            continue  # already done
+
+        # Build results table across root + children
+        root_full      = db.get_strategy(root_id)
+        all_variations = [root_full] + children if root_full else children
+        with_results   = [s for s in all_variations if s.get("quick_test_sharpe") is not None]
+        with_results.sort(key=lambda s: s.get("quick_test_sharpe") or 0, reverse=True)
+
+        passed = [s for s in with_results
+                  if (s.get("quick_test_sharpe") or 0) > 0
+                  and (s.get("quick_test_trades") or 0) >= 30]
+        archived = [c for c in children if c.get("status") == "archived"]
+
+        lines = [
+            f"[campaign_summary] Campaign complete — {len(all_variations)} variations tested.",
+            f"Passed quality gate (Sharpe > 0, trades ≥ 30): {len(passed)} / {len(all_variations)}.",
+            f"Auto-archived (weak): {len(archived)}.",
+            "",
+            "All results (sorted by Sharpe):",
+        ]
+        for i, s in enumerate(with_results[:10], 1):
+            sh   = s.get("quick_test_sharpe") or 0
+            tr   = s.get("quick_test_trades") or 0
+            tf   = s.get("best_timeframe") or "?"
+            mark = " ← seed" if s.get("id") == root_id else ""
+            stat = s.get("status", "?")
+            lines.append(
+                f"  {i}. {s.get('name','?')}: "
+                f"Sharpe={sh:+.4f}, trades={tr}, TF={tf}, status={stat}{mark}"
+            )
+
+        add_pipeline_note(root_id, "\n".join(lines))
+        log.info("campaign_summarized", root_id=root_id,
+                 total=len(all_variations), passed=len(passed))
+        summarized += 1
+
+    return summarized
 
 
 def _process_failed_strategies() -> int:
@@ -673,8 +841,10 @@ def process_queue() -> None:
     research_dispatched   = _dispatch_pending_research_tasks()
     # 'implemented' → quick backtest; 'validating' → validator
     modal_dispatched      = _process_implemented_strategies()
-    # 'quick_tested' → full backtest
+    # 'quick_tested' → analyzer → awaiting_review (standalone) or campaign hold
     full_backtest_queued  = _process_quick_tested_strategies()
+    # Summarize completed campaigns so user sees consolidated results
+    campaigns_summarized  = _process_campaign_completion()
     auto_fixed            = _process_failed_strategies()
 
     log.info(
@@ -686,5 +856,6 @@ def process_queue() -> None:
         research_dispatched=research_dispatched,
         modal_dispatched=modal_dispatched,
         full_backtest_queued=full_backtest_queued,
+        campaigns_summarized=campaigns_summarized,
         auto_fixed=auto_fixed,
     )

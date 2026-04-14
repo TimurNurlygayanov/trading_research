@@ -162,6 +162,25 @@ def run_research_task(task_id: str) -> dict:
         raise
 
 
+@app.function(
+    image=image,
+    cpu=4,
+    memory=8192,
+    timeout=600,
+    secrets=[modal.Secret.from_name("trading-research-secrets")],
+    volumes={CACHE_DIR: ohlcv_cache},
+)
+def run_indicator_research_task(task_id: str) -> dict:
+    """
+    Run a systematic indicator forward-return analysis task.
+    Called for research_tasks with type='indicator_research'.
+    """
+    import sys
+    sys.path.insert(0, "/root")
+    from agents.indicator_researcher import run_indicator_research
+    return run_indicator_research(task_id, cache_dir=CACHE_DIR)
+
+
 def _execute_analysis(code: str, df, question: str) -> dict:
     """
     Execute LLM-generated analysis code in a restricted namespace.

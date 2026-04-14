@@ -25,7 +25,7 @@ from backtest.leakage_detector import check_leakage
 load_dotenv()
 log = logging.getLogger(__name__)
 
-MODEL = "claude-sonnet-4-6"  # Needs better code quality than Haiku
+MODEL = "claude-opus-4-5"  # Highest quality for code generation — fewer retries saves total cost
 MAX_RETRIES = 2
 MIN_LEAKAGE_SCORE = 7.0
 

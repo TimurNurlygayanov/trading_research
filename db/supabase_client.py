@@ -67,6 +67,23 @@ def get_strategies_by_status(status: str, limit: int = 10) -> list[dict[str, Any
     return result.data
 
 
+def get_campaign_children(campaign_id: str) -> list[dict[str, Any]]:
+    """Return all child strategies for a campaign, ordered by quick_test_sharpe desc."""
+    sb = get_client()
+    result = (
+        sb.table("strategies")
+        .select(
+            "id, name, status, hypothesis, quick_test_sharpe, quick_test_trades, "
+            "quick_test_win_rate, quick_test_drawdown, quick_test_signals_per_year, "
+            "best_timeframe, error_log, analysis_notes, updated_at"
+        )
+        .eq("campaign_id", campaign_id)
+        .order("quick_test_sharpe", desc=True, nullsfirst=False)
+        .execute()
+    )
+    return result.data or []
+
+
 # ── user_ideas ───────────────────────────────────────────────────────────────
 
 def get_pending_user_ideas(limit: int = 5) -> list[dict[str, Any]]:
@@ -227,13 +244,49 @@ def get_research_task(task_id: str) -> dict[str, Any] | None:
     return result.data[0] if result.data else None
 
 
-def get_research_tasks(status: str = "pending", limit: int = 20) -> list[dict[str, Any]]:
+def get_research_tasks(
+    status: str = "pending",
+    limit: int = 20,
+    task_type: str | None = None,
+) -> list[dict[str, Any]]:
     sb = get_client()
     q = sb.table("research_tasks").select("*")
     if status != "all":
         q = q.eq("status", status)
+    if task_type:
+        q = q.eq("type", task_type)
     result = q.order("created_at", desc=True).limit(limit).execute()
     return result.data or []
+
+
+def get_knowledge_entries(
+    category: str | None = None,
+    indicator: str | None = None,
+    limit: int = 200,
+) -> list[dict[str, Any]]:
+    """Return knowledge_base entries with optional category/indicator filters."""
+    sb = get_client()
+    q = sb.table("knowledge_base").select(
+        "id, category, indicator, timeframe, asset, session, summary, sharpe_ref, created_at"
+    )
+    if category and category != "all":
+        q = q.eq("category", category)
+    if indicator:
+        q = q.ilike("indicator", f"%{indicator}%")
+    result = q.order("created_at", desc=True).limit(limit).execute()
+    return result.data or []
+
+
+def get_knowledge_stats() -> dict[str, int]:
+    """Return counts per category for the knowledge base."""
+    sb = get_client()
+    result = sb.table("knowledge_base").select("category").execute()
+    rows = result.data or []
+    stats: dict[str, int] = {"total": len(rows), "works": 0, "fails": 0, "partial": 0, "edge_case": 0}
+    for r in rows:
+        cat = r.get("category", "partial")
+        stats[cat] = stats.get(cat, 0) + 1
+    return stats
 
 
 def get_strategies_awaiting_research(limit: int = 5) -> list[dict[str, Any]]:

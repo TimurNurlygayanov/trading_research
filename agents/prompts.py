@@ -241,6 +241,25 @@ from backtesting import Strategy
 
 
 class {{StrategyName}}Strategy(Strategy):
+    '''
+    <Strategy name>
+
+    Edge / hypothesis:
+        <One sentence — why should this strategy be profitable?>
+
+    Entry logic:
+        Long:  <exact condition using indicator names>
+        Short: <exact condition using indicator names>
+
+    Exit logic:
+        <ATR-based SL/TP, or trailing stop, etc.>
+
+    Key parameters (tuned by Optuna):
+        <param_name>: <what it controls>
+
+    Notes:
+        <Any quirks, known limitations, or asset/session assumptions>
+    '''
     # ── Hyperparameters (tuned by Optuna) ─────────────────────────────────
     # [STRATEGY-SPECIFIC PARAMS HERE]
     atr_period: int = 14

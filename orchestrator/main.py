@@ -160,8 +160,10 @@ def api_restart_strategy(strategy_id: str, background_tasks: BackgroundTasks) ->
     """
     Force-redispatch a stuck in-progress strategy to Modal.
     Works for: implemented, backtesting, validating.
-      implemented / backtesting → reset to implemented → redispatch backtest job
-      validating                → redispatch validator job (keep status)
+      implemented / quick_testing → reset to implemented → redispatch quick backtest
+      quick_tested / backtesting  → dispatch full backtest
+      awaiting_review             → dispatch full backtest (skip review)
+      validating                  → redispatch validator job
     """
     try:
         from orchestrator.queue_worker import (
@@ -173,15 +175,13 @@ def api_restart_strategy(strategy_id: str, background_tasks: BackgroundTasks) ->
 
         status = strategy.get("status")
         if status in ("implemented", "quick_testing"):
-            # Re-run the quick test from scratch
             db.update_strategy(strategy_id, {
                 "status": "implemented", "error_log": None, "modal_job_id": None,
             })
             background_tasks.add_task(_dispatch_quick_backtest_job, strategy_id)
             log.info("strategy_restarted_quick_backtest", strategy_id=strategy_id)
             return JSONResponse({"ok": True, "dispatched_to": "quick_backtest"})
-        elif status in ("quick_tested", "backtesting"):
-            # Skip quick test and go straight to full optimization
+        elif status in ("quick_tested", "awaiting_review", "backtesting"):
             db.update_strategy(strategy_id, {
                 "status": "quick_tested", "error_log": None, "modal_job_id": None,
             })
@@ -195,10 +195,134 @@ def api_restart_strategy(strategy_id: str, background_tasks: BackgroundTasks) ->
             return JSONResponse({"ok": True, "dispatched_to": "validator"})
         else:
             return JSONResponse(
-                {"error": f"restart only available for implemented/quick_testing/quick_tested/backtesting/validating (current: {status})"},
+                {"error": f"restart not available for status '{status}'"},
                 status_code=400,
             )
     except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+@app.post("/api/strategy/{strategy_id}/approve")
+def api_approve_strategy(strategy_id: str, background_tasks: BackgroundTasks) -> JSONResponse:
+    """
+    User approves the quick-test results and starts full optimization.
+    Only valid when status == 'awaiting_review'.
+    """
+    try:
+        from orchestrator.queue_worker import _dispatch_backtest_job
+        from agents.utils import add_pipeline_note
+
+        strategy = db.get_strategy(strategy_id)
+        if not strategy:
+            return JSONResponse({"error": "not found"}, status_code=404)
+
+        status = strategy.get("status")
+        # Allow approval from awaiting_review (standalone) or quick_tested (campaign child)
+        if status not in ("awaiting_review", "quick_tested"):
+            return JSONResponse(
+                {"error": f"Cannot approve strategy with status '{status}'"},
+                status_code=400,
+            )
+
+        db.update_strategy(strategy_id, {
+            "status": "quick_tested",
+            "modal_job_id": None,
+            "error_log": None,
+        })
+        add_pipeline_note(strategy_id, "User approved — starting full optimization (Optuna + walk-forward).")
+        background_tasks.add_task(_dispatch_backtest_job, strategy_id)
+        log.info("strategy_approved_for_optimization", strategy_id=strategy_id)
+        return JSONResponse({"ok": True})
+    except Exception as exc:
+        log.error("approve_strategy_error", strategy_id=strategy_id, error=str(exc))
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+@app.post("/api/strategy/{strategy_id}/revise")
+async def api_revise_strategy(
+    strategy_id: str, request: Request, background_tasks: BackgroundTasks
+) -> JSONResponse:
+    """
+    User requests a code change during the review stage.
+    Body: {"message": "add a volume filter and limit to London session"}
+    The reviewer agent updates backtest_code and re-dispatches the quick test.
+    """
+    try:
+        from agents.strategy_reviewer import run_strategy_reviewer
+        from orchestrator.queue_worker import _dispatch_quick_backtest_job
+        from orchestrator.budget_guard import check_budget, BudgetExceeded
+
+        body = await request.json()
+        message = (body.get("message") or "").strip()
+        if not message:
+            return JSONResponse({"error": "message is required"}, status_code=400)
+
+        strategy = db.get_strategy(strategy_id)
+        if not strategy:
+            return JSONResponse({"error": "not found"}, status_code=404)
+
+        try:
+            check_budget("strategy_reviewer")
+        except BudgetExceeded as be:
+            return JSONResponse({"error": str(be)}, status_code=429)
+
+        def _run_revision():
+            result = run_strategy_reviewer(strategy_id, message)
+            if "error" not in result:
+                _dispatch_quick_backtest_job(strategy_id)
+
+        background_tasks.add_task(_run_revision)
+        log.info("strategy_revision_requested", strategy_id=strategy_id,
+                 message=message[:80])
+        return JSONResponse({"ok": True, "message": "Revision queued — re-running quick test."})
+    except Exception as exc:
+        log.error("revise_strategy_error", strategy_id=strategy_id, error=str(exc))
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+@app.get("/api/strategy/{strategy_id}/campaign")
+def api_campaign_children(strategy_id: str) -> JSONResponse:
+    """
+    Return all variations in a campaign, including the root as variation #1.
+    Sorted by quick_test_sharpe descending.
+    """
+    try:
+        children  = db.get_campaign_children(strategy_id)
+        root_full = db.get_strategy(strategy_id)
+        if not root_full:
+            return JSONResponse({"error": "not found"}, status_code=404)
+
+        root_entry = {
+            "id":                        root_full["id"],
+            "name":                      root_full.get("name", ""),
+            "status":                    root_full.get("status", ""),
+            "hypothesis":                root_full.get("hypothesis", ""),
+            "quick_test_sharpe":         root_full.get("quick_test_sharpe"),
+            "quick_test_trades":         root_full.get("quick_test_trades"),
+            "quick_test_win_rate":       root_full.get("quick_test_win_rate"),
+            "quick_test_drawdown":       root_full.get("quick_test_drawdown"),
+            "quick_test_signals_per_year": root_full.get("quick_test_signals_per_year"),
+            "best_timeframe":            root_full.get("best_timeframe"),
+            "error_log":                 root_full.get("error_log"),
+            "is_root":                   True,
+        }
+        all_variations = [root_entry] + [dict(c, is_root=False) for c in children]
+        all_variations.sort(
+            key=lambda x: x.get("quick_test_sharpe") or -999,
+            reverse=True,
+        )
+        passed = sum(
+            1 for v in all_variations
+            if (v.get("quick_test_sharpe") or 0) > 0
+            and (v.get("quick_test_trades") or 0) >= 30
+        )
+        return JSONResponse({
+            "variations": all_variations,
+            "total":      len(all_variations),
+            "passed":     passed,
+        })
+    except Exception as exc:
+        log.error("api_campaign_children_error", strategy_id=strategy_id, error=str(exc))
         return JSONResponse({"error": str(exc)}, status_code=500)
 
 
@@ -241,8 +365,9 @@ def api_retry_strategy(strategy_id: str, background_tasks: BackgroundTasks) -> J
 
 
 # Statuses that mean the pipeline has moved on — no job is actively running
-_TERMINAL_STATUSES = {"quick_tested", "implemented", "backtesting", "validating",
-                      "validated", "live", "failed", "filtered", "idea"}
+_TERMINAL_STATUSES = {"quick_tested", "awaiting_review", "implemented",
+                      "backtesting", "validating", "validated", "live",
+                      "failed", "archived", "filtered", "idea"}
 # Max age before we consider an in-progress strategy stuck (minutes)
 _STUCK_MINUTES = 25
 
@@ -417,6 +542,7 @@ def api_strategies(
             "quick_test_sharpe, quick_test_trades, quick_test_win_rate, "
             "quick_test_drawdown, quick_test_signals_per_year, "
             "best_timeframe, quick_test_all_timeframes, "
+            "campaign_id, is_campaign_root, "
             "error_log, report_url, tags, comments, modal_job_id, created_at, updated_at"
         )
         if status != "all":
@@ -634,13 +760,19 @@ _DASHBOARD_HTML = r"""<!DOCTYPE html>
   .s-implemented       { background: #2d1f5e; color: #c4b5fd; }
   .s-quick-testing     { background: #1a3a2a; color: #4ade80; animation: pulse-green 2s infinite; }
   .s-quick-tested      { background: #1a3a2a; color: #4ade80; }
+  .s-awaiting-review   { background: #1e1b4b; color: #818cf8; animation: pulse-indigo 2s infinite; }
   .s-backtesting       { background: #3b2f00; color: #fcd34d; animation: pulse-yellow 2s infinite; }
   .s-validating        { background: #1c3352; color: #67e8f9; animation: pulse-cyan 2s infinite; }
   .s-live              { background: #14532d; color: #86efac; }
   .s-done              { background: #14532d; color: #86efac; }
   .s-failed            { background: #450a0a; color: #fca5a5; }
   .s-rejected          { background: #450a0a; color: #fca5a5; }
+  .s-archived          { background: #1c1c1c; color: #475569; }
 
+  @keyframes pulse-indigo {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(99,102,241,.5); }
+    50%       { box-shadow: 0 0 0 4px rgba(99,102,241,0); }
+  }
   @keyframes pulse-purple {
     0%, 100% { box-shadow: 0 0 0 0 rgba(139,92,246,.5); }
     50%       { box-shadow: 0 0 0 4px rgba(139,92,246,0); }
@@ -666,25 +798,31 @@ _DASHBOARD_HTML = r"""<!DOCTYPE html>
   .metric { font-family: "SF Mono", "Fira Code", monospace; font-size: 0.82rem; }
   .pos { color: #4ade80; } .neg { color: #f87171; } .neu { color: #94a3b8; }
 
-  /* ── detail panel (slide-in) ── */
-  .panel-overlay { position: fixed; inset: 0; background: rgba(0,0,0,.6);
-                   z-index: 100; display: none; }
-  .panel-overlay.open { display: block; }
-  .panel { position: fixed; right: 0; top: 0; bottom: 0; width: min(620px, 100vw);
-           background: #111827; border-left: 1px solid #1f2937;
-           overflow-y: auto; z-index: 101; padding: 28px;
-           transform: translateX(100%); transition: transform .25s ease; }
-  .panel.open { transform: translateX(0); }
-  .panel-close { float: right; background: none; border: none; color: #64748b;
-                 font-size: 1.4rem; cursor: pointer; line-height: 1; }
-  .panel-close:hover { color: #f1f5f9; }
-  .panel h2 { font-size: 1.1rem; font-weight: 600; color: #f8fafc;
-              margin-bottom: 6px; padding-right: 32px; }
-  .panel-hyp { color: #94a3b8; font-size: 0.875rem; margin-bottom: 20px; line-height: 1.5; }
+  /* ── detail panel (centered fullscreen dialog) ── */
+  .panel-overlay { position: fixed; inset: 0; background: rgba(0,0,0,.75);
+                   z-index: 100; display: none;
+                   align-items: flex-start; justify-content: center;
+                   padding: 24px 16px; overflow-y: auto; }
+  .panel-overlay.open { display: flex; }
+  .panel { position: relative; width: 100%; max-width: 960px; min-height: 0;
+           background: #111827; border: 1px solid #1f2937; border-radius: 14px;
+           overflow: visible; z-index: 101; padding: 32px 36px;
+           margin: auto;
+           opacity: 0; transform: scale(.97) translateY(8px);
+           transition: opacity .2s ease, transform .2s ease; }
+  .panel-overlay.open .panel { opacity: 1; transform: scale(1) translateY(0); }
+  .panel-close { position: absolute; top: 16px; right: 18px;
+                 background: #1e2533; border: 1px solid #374151; border-radius: 8px;
+                 color: #94a3b8; font-size: 1.1rem; cursor: pointer;
+                 padding: 4px 10px; line-height: 1; }
+  .panel-close:hover { color: #f1f5f9; background: #374151; }
+  .panel h2 { font-size: 1.2rem; font-weight: 700; color: #f8fafc;
+              margin-bottom: 6px; padding-right: 48px; }
+  .panel-hyp { color: #94a3b8; font-size: 0.875rem; margin-bottom: 20px; line-height: 1.6; }
   .panel-section { margin-bottom: 20px; }
   .panel-section h3 { font-size: 0.72rem; font-weight: 600; text-transform: uppercase;
                       letter-spacing: .07em; color: #475569; margin-bottom: 10px; }
-  .kv-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  .kv-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; }
   .kv { background: #0f1623; border-radius: 8px; padding: 10px 12px; }
   .kv-label { font-size: 0.7rem; color: #64748b; margin-bottom: 3px; text-transform: uppercase; letter-spacing: .05em; }
   .kv-val   { font-size: 0.95rem; font-weight: 600; color: #f1f5f9;
@@ -748,15 +886,16 @@ _DASHBOARD_HTML = r"""<!DOCTYPE html>
   </div>
 </div>
 
-<!-- Detail panel -->
-<div class="panel-overlay" id="overlay" onclick="closePanel()"></div>
-<div class="panel" id="panel">
-  <button class="panel-close" onclick="closePanel()">×</button>
-  <div id="panel-content"></div>
+<!-- Detail panel — centered dialog -->
+<div class="panel-overlay" id="overlay" onclick="if(event.target===this)closePanel()">
+  <div class="panel" id="panel">
+    <button class="panel-close" onclick="closePanel()">✕ close</button>
+    <div id="panel-content"></div>
+  </div>
 </div>
 
 <script>
-const STATUS_ORDER = ['all','idea','filtered','implementing','awaiting_research','implemented','quick_testing','quick_tested','backtesting','validating','live','failed'];
+const STATUS_ORDER = ['all','idea','filtered','implementing','awaiting_research','implemented','quick_testing','quick_tested','awaiting_review','backtesting','validating','live','failed','archived'];
 let currentStatus = 'all';
 let statsData = {};
 let strategiesData = [];
@@ -810,12 +949,14 @@ const STATUS_LABELS = {
   'implemented':       'Dispatched',
   'quick_testing':     '⚙ Quick Test…',
   'quick_tested':      'Quick Tested',
+  'awaiting_review':   '👁 Awaiting Review',
   'backtesting':       '⚙ Optimizing…',
   'validating':        '⚙ Validating…',
   'live':              '✓ Live',
   'done':              '✓ Done',
   'failed':            '✗ Failed',
   'rejected':          '✗ Rejected',
+  'archived':          '↓ Archived',
 };
 function statusLabel(s) { return STATUS_LABELS[s] || s; }
 
@@ -858,8 +999,9 @@ function renderTable(rows) {
 
 async function openPanel(id) {
   document.getElementById('overlay').classList.add('open');
-  document.getElementById('panel').classList.add('open');
   document.getElementById('panel-content').innerHTML = '<div class="loading">Loading…</div>';
+  // Prevent body scroll while dialog is open
+  document.body.style.overflow = 'hidden';
   const r = await fetch('/api/strategy/' + id);
   const s = await r.json();
   renderPanel(s);
@@ -867,7 +1009,7 @@ async function openPanel(id) {
 
 function closePanel() {
   document.getElementById('overlay').classList.remove('open');
-  document.getElementById('panel').classList.remove('open');
+  document.body.style.overflow = '';
 }
 
 function renderPanel(s) {
@@ -1002,7 +1144,156 @@ function renderPanel(s) {
       <div class="error-box">${esc(s.error_log)}</div></div>`;
   }
 
-  // "Run Full Optimization" action for quick_tested strategies
+  // Campaign panel — shown when strategy is the root of a variation campaign
+  let campaignHtml = '';
+  if (s.is_campaign_root) {
+    const statusesRunning = ['filtering','implementing','implemented','quick_testing'];
+    const allDone = !statusesRunning.includes(s.status); // rough check
+    campaignHtml = `
+    <div class="panel-section" style="background:#0c1220;border:2px solid #1e3a5f;
+                border-radius:12px;padding:18px 20px">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px">
+        <div>
+          <span style="font-size:.72rem;font-weight:600;text-transform:uppercase;
+                       letter-spacing:.07em;color:#38bdf8">🔬 Strategy Campaign</span>
+          <div style="font-size:.82rem;color:#94a3b8;margin-top:3px">
+            Multiple implementations tested in parallel — pick the best performer.
+          </div>
+        </div>
+        <button onclick="loadCampaignTable('${s.id}')"
+          style="background:#1e2533;border:1px solid #374151;border-radius:8px;
+                 color:#64748b;padding:5px 12px;font-size:.78rem;cursor:pointer">
+          ↻ Refresh
+        </button>
+      </div>
+
+      <div id="campaign-table-${s.id}">
+        <div style="color:#64748b;font-size:.8rem;padding:8px 0">Loading variations…</div>
+      </div>
+
+      <div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:14px;padding-top:14px;
+                  border-top:1px solid #1f2937">
+        <button onclick="approveTopCampaign('${s.id}', 3)"
+          id="campaign-top3-${s.id}"
+          style="background:#4f46e5;border:none;border-radius:8px;color:#fff;
+                 padding:9px 20px;font-size:.85rem;font-weight:700;cursor:pointer">
+          ✓ Optimize top 3
+        </button>
+        <button onclick="approveTopCampaign('${s.id}', 1)"
+          id="campaign-top1-${s.id}"
+          style="background:#059669;border:none;border-radius:8px;color:#fff;
+                 padding:9px 20px;font-size:.85rem;font-weight:700;cursor:pointer">
+          ✓ Optimize best only
+        </button>
+        <span style="font-size:.75rem;color:#374151;align-self:center">
+          Approves for full Optuna optimization (~15–25 min each)
+        </span>
+      </div>
+      <div id="campaign-result-${s.id}" style="margin-top:8px;font-size:.8rem;color:#64748b"></div>
+    </div>`;
+
+    // Load async after render
+    setTimeout(() => loadCampaignTable('${s.id}'), 80);
+  }
+
+  // Review panel for awaiting_review strategies
+  let reviewHtml = '';
+  if (s.status === 'awaiting_review') {
+    // Build a concise "what was implemented" summary from indicators JSONB
+    let implSummary = '';
+    const ind = s.indicators || {};
+    const indicatorsUsed = (ind.indicators_used || []).join(', ') || '—';
+    const symbolUsed     = (ind.symbols || [])[0] || s.symbol || 'EURUSD';
+    const bestTfLabel    = s.best_timeframe || '—';
+    implSummary = `
+      <div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:12px">
+        <div style="background:#0f1623;border-radius:8px;padding:8px 12px;font-size:.8rem">
+          <span style="color:#475569">Class: </span><span style="color:#7dd3fc">${esc(ind.strategy_class||'—')}</span>
+        </div>
+        <div style="background:#0f1623;border-radius:8px;padding:8px 12px;font-size:.8rem">
+          <span style="color:#475569">Indicators: </span><span style="color:#7dd3fc">${esc(indicatorsUsed)}</span>
+        </div>
+        <div style="background:#0f1623;border-radius:8px;padding:8px 12px;font-size:.8rem">
+          <span style="color:#475569">Symbol: </span><span style="color:#7dd3fc">${esc(symbolUsed)}</span>
+        </div>
+        <div style="background:#0f1623;border-radius:8px;padding:8px 12px;font-size:.8rem">
+          <span style="color:#475569">Best TF: </span><span style="color:#38bdf8;font-weight:600">${esc(bestTfLabel)}</span>
+        </div>
+      </div>`;
+
+    // Analyzer findings summary
+    let analyzerSummary = '';
+    if (s.analysis_notes && s.analysis_notes.llm) {
+      const llm = s.analysis_notes.llm;
+      if (llm.key_finding) {
+        analyzerSummary = `
+        <div style="background:#0c1a2e;border:1px solid #1e3a5f;border-radius:8px;
+                    padding:10px 14px;margin-bottom:12px;font-size:.82rem;color:#93c5fd;line-height:1.5">
+          <span style="font-size:.68rem;font-weight:600;text-transform:uppercase;
+                       letter-spacing:.06em;color:#475569;display:block;margin-bottom:4px">Analyzer finding</span>
+          ${esc(llm.key_finding)}
+          ${llm.improvement_type && llm.improvement_type !== 'none'
+            ? `<span style="background:#172554;border-radius:4px;padding:1px 7px;font-size:.7rem;
+                            margin-left:8px;color:#38bdf8">${esc(llm.improvement_type)}</span>` : ''}
+        </div>`;
+      }
+    }
+
+    reviewHtml = `
+    <div class="panel-section" style="background:#120f1f;border:2px solid #4f46e5;
+                border-radius:10px;padding:16px 18px">
+      <div style="font-size:.72rem;font-weight:600;text-transform:uppercase;
+                  letter-spacing:.07em;color:#818cf8;margin-bottom:12px">
+        👁 Strategy Review — Your Approval Required
+      </div>
+      ${implSummary}
+      ${analyzerSummary}
+      <div style="color:#94a3b8;font-size:.82rem;margin-bottom:14px">
+        Review the quick test results above. Approve to start full optimization
+        (Optuna 50 trials + walk-forward + OOS), or request a change to the code.
+      </div>
+
+      <div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:16px">
+        <button onclick="approveStrategy('${s.id}')"
+          id="approve-btn-${s.id}"
+          style="background:#4f46e5;border:none;border-radius:8px;color:#fff;
+                 padding:9px 22px;font-size:.9rem;font-weight:700;cursor:pointer">
+          ✓ Approve &amp; Optimize
+        </button>
+        <span style="font-size:.78rem;color:#4b5563;align-self:center">
+          ~15–25 min on Modal
+        </span>
+      </div>
+
+      <div style="border-top:1px solid #1f2937;padding-top:14px">
+        <div style="font-size:.72rem;font-weight:600;text-transform:uppercase;
+                    letter-spacing:.07em;color:#64748b;margin-bottom:8px">
+          Request a Change
+        </div>
+        <div style="color:#64748b;font-size:.78rem;margin-bottom:8px">
+          Examples: "add a volume filter", "limit to London session 8–17 UTC",
+          "replace EMA with VWAP", "tighten stop loss to 1× ATR"
+        </div>
+        <textarea id="revise-input-${s.id}" rows="3"
+          placeholder="Describe what you'd like changed…"
+          style="width:100%;background:#0f1623;border:1px solid #374151;border-radius:8px;
+                 color:#f1f5f9;padding:8px 12px;font-size:.85rem;outline:none;
+                 resize:vertical;font-family:inherit;margin-bottom:8px"></textarea>
+        <div style="display:flex;gap:10px;align-items:center">
+          <button onclick="reviseStrategy('${s.id}')"
+            id="revise-btn-${s.id}"
+            style="background:#1e2533;border:1px solid #374151;border-radius:8px;
+                   color:#94a3b8;padding:8px 18px;font-size:.85rem;font-weight:600;cursor:pointer">
+            ↺ Request Changes &amp; Re-test
+          </button>
+          <span style="font-size:.75rem;color:#374151">Will re-run quick test after applying changes</span>
+        </div>
+      </div>
+      <div id="review-result-${s.id}" style="margin-top:10px;font-size:.8rem;color:#64748b"></div>
+    </div>`;
+  }
+
+  // "Run Full Optimization" action for quick_tested strategies (manual override)
   let quickOptimizeHtml = '';
   if (s.status === 'quick_tested') {
     quickOptimizeHtml = `
@@ -1011,19 +1302,15 @@ function renderPanel(s) {
       <div style="font-size:.72rem;font-weight:600;text-transform:uppercase;
                   letter-spacing:.07em;color:#4ade80;margin-bottom:10px">Ready for Full Optimization</div>
       <div style="color:#94a3b8;font-size:.82rem;margin-bottom:12px">
-        Quick test complete. The optimizer (Optuna 50 trials + walk-forward + OOS) will now
-        search for the best parameters. This takes ~15–25 min on Modal.
+        Quick test complete — waiting for analyzer. Or start immediately:
       </div>
       <div style="display:flex;gap:10px;flex-wrap:wrap">
         <button onclick="runFullOptimization('${s.id}')"
           style="background:#16a34a;border:none;border-radius:8px;color:#fff;
                  padding:9px 20px;font-size:.85rem;font-weight:600;cursor:pointer"
           id="optimize-btn-${s.id}">
-          ▶ Run Full Optimization
+          ▶ Run Full Optimization Now
         </button>
-        <span style="font-size:.78rem;color:#4b5563;align-self:center">
-          or wait — auto-starts on next queue cycle (~10 min)
-        </span>
       </div>
       <div id="optimize-result-${s.id}" style="margin-top:8px;font-size:.8rem;color:#64748b"></div>
     </div>`;
@@ -1198,7 +1485,7 @@ function renderPanel(s) {
       </div>
     </div>
 
-    ${quickOptimizeHtml}${modalHtml}${actionsHtml}${quickTestHtml}${wfHtml}${paramsHtml}${codeHtml}${errHtml}${reportHtml}
+    ${campaignHtml}${reviewHtml}${quickOptimizeHtml}${modalHtml}${actionsHtml}${quickTestHtml}${wfHtml}${paramsHtml}${codeHtml}${errHtml}${reportHtml}
     <div class="panel-section" style="border-top:1px solid #1f2937;padding-top:16px;margin-top:4px">
       <h3>Comments</h3>
       <div id="comments-list-${s.id}" style="margin-bottom:10px">
@@ -1350,12 +1637,194 @@ async function saveTags(id) {
   }
 }
 
+async function loadCampaignTable(rootId) {
+  const container = document.getElementById(`campaign-table-${rootId}`);
+  if (!container) return;
+  container.innerHTML = '<div style="color:#64748b;font-size:.8rem">Loading…</div>';
+  try {
+    const r = await fetch(`/api/strategy/${rootId}/campaign`);
+    const d = await r.json();
+    const variations = d.variations || [];
+    if (!variations.length) {
+      container.innerHTML = '<span style="color:#64748b;font-size:.8rem">No variations found yet.</span>';
+      return;
+    }
+    const thStyle = 'padding:5px 10px;text-align:left;font-size:.7rem;font-weight:600;text-transform:uppercase;letter-spacing:.06em;color:#475569;border-bottom:1px solid #1e293b';
+    const tdStyle = 'padding:6px 10px;border-bottom:1px solid #0f1623;font-size:.8rem;vertical-align:middle';
+    const rows = variations.map(v => {
+      const sh = v.quick_test_sharpe != null
+        ? `<span style="${v.quick_test_sharpe>0.3?'color:#34d399':v.quick_test_sharpe>0?'color:#94a3b8':'color:#f87171'}">${v.quick_test_sharpe>=0?'+':''}${v.quick_test_sharpe.toFixed(3)}</span>`
+        : '<span style="color:#374151">—</span>';
+      const tr = v.quick_test_trades ?? '—';
+      const wr = v.quick_test_win_rate != null ? (v.quick_test_win_rate*100).toFixed(0)+'%' : '—';
+      const tf = v.best_timeframe || '—';
+      const seedBadge = v.is_root ? ' <span style="background:#1e3a5f;color:#38bdf8;border-radius:4px;padding:1px 6px;font-size:.66rem">seed</span>' : '';
+      const statusBadge = `<span class="badge s-${(v.status||'').replace(/_/g,'-')}" style="font-size:.66rem">${statusLabel(v.status||'')}</span>`;
+      const passGate = (v.quick_test_sharpe||0) > 0 && (v.quick_test_trades||0) >= 30;
+      const rowBg = passGate ? 'background:#0d1f16' : '';
+      const actionBtn = (v.status === 'quick_tested' || v.status === 'awaiting_review') && passGate
+        ? `<button onclick="event.stopPropagation();approveVariationFromCampaign('${v.id}','${rootId}')"
+             style="background:#16a34a;border:none;border-radius:6px;color:#fff;
+                    padding:3px 10px;font-size:.75rem;cursor:pointer;white-space:nowrap">
+             Optimize
+           </button>` : '';
+      return `<tr onclick="openPanel('${v.id}')" style="cursor:pointer;${rowBg}">
+        <td style="${tdStyle}">${esc(v.name)}${seedBadge}</td>
+        <td style="${tdStyle}">${statusBadge}</td>
+        <td style="${tdStyle}">${sh}</td>
+        <td style="${tdStyle}">${tr}</td>
+        <td style="${tdStyle}">${wr}</td>
+        <td style="${tdStyle}">${tf}</td>
+        <td style="${tdStyle}">${actionBtn}</td>
+      </tr>`;
+    }).join('');
+    container.innerHTML = `
+      <div style="font-size:.75rem;color:#475569;margin-bottom:8px">
+        ${d.total} variations · <span style="color:#4ade80">${d.passed} passed quality gate</span>
+        · click any row to open details
+      </div>
+      <table style="width:100%;border-collapse:collapse">
+        <thead><tr>
+          <th style="${thStyle}">Variation</th>
+          <th style="${thStyle}">Status</th>
+          <th style="${thStyle}">Sharpe</th>
+          <th style="${thStyle}">Trades</th>
+          <th style="${thStyle}">Win%</th>
+          <th style="${thStyle}">Best TF</th>
+          <th style="${thStyle}"></th>
+        </tr></thead>
+        <tbody>${rows}</tbody>
+      </table>`;
+  } catch(e) {
+    container.innerHTML = `<span style="color:#f87171;font-size:.8rem">Failed to load: ${e.message}</span>`;
+  }
+}
+
+async function approveTopCampaign(rootId, topN) {
+  const btn1 = document.getElementById(`campaign-top1-${rootId}`);
+  const btn3 = document.getElementById(`campaign-top3-${rootId}`);
+  const out  = document.getElementById(`campaign-result-${rootId}`);
+  if (btn1) btn1.disabled = true;
+  if (btn3) btn3.disabled = true;
+  out.textContent = 'Fetching top variations…';
+  try {
+    const r = await fetch(`/api/strategy/${rootId}/campaign`);
+    const d = await r.json();
+    const eligible = (d.variations || [])
+      .filter(v => (v.status === 'quick_tested' || v.status === 'awaiting_review')
+               && (v.quick_test_sharpe || 0) > 0
+               && (v.quick_test_trades || 0) >= 30)
+      .slice(0, topN);
+    if (!eligible.length) {
+      out.style.color = '#f87171';
+      out.textContent = 'No eligible variations (need Sharpe > 0 and trades ≥ 30).';
+      if (btn1) btn1.disabled = false;
+      if (btn3) btn3.disabled = false;
+      return;
+    }
+    let approved = 0;
+    for (const v of eligible) {
+      const ar = await fetch(`/api/strategy/${v.id}/approve`, {method: 'POST'});
+      const ad = await ar.json();
+      if (ad.ok) approved++;
+    }
+    out.style.color = '#4ade80';
+    out.textContent = `✓ Approved ${approved} variation${approved>1?'s':''} for full optimization.`;
+    setTimeout(() => { loadAll(); openPanel(rootId); }, 2000);
+  } catch(e) {
+    out.style.color = '#f87171';
+    out.textContent = 'Error: ' + e.message;
+    if (btn1) btn1.disabled = false;
+    if (btn3) btn3.disabled = false;
+  }
+}
+
+async function approveVariationFromCampaign(variationId, rootId) {
+  const r = await fetch(`/api/strategy/${variationId}/approve`, {method: 'POST'});
+  const d = await r.json();
+  if (d.ok) {
+    loadAll();
+    loadCampaignTable(rootId);
+  } else {
+    alert('Approve failed: ' + (d.error || 'unknown'));
+  }
+}
+
 async function deleteStrategy(id, name) {
   if (!confirm(`Delete "${name}"?\nThis cannot be undone.`)) return;
   const r = await fetch(`/api/strategy/${id}`, {method:'DELETE'});
   const data = await r.json();
   if (data.ok) { closePanel(); loadAll(); }
   else alert('Delete failed: ' + (data.error || 'unknown error'));
+}
+
+async function approveStrategy(id) {
+  const btn = document.getElementById(`approve-btn-${id}`);
+  const out = document.getElementById(`review-result-${id}`);
+  btn.disabled = true;
+  btn.textContent = 'Approving…';
+  try {
+    const r = await fetch(`/api/strategy/${id}/approve`, {method: 'POST'});
+    const d = await r.json();
+    if (d.ok) {
+      out.style.color = '#4ade80';
+      out.textContent = '✓ Approved — full optimization dispatched. Refreshing…';
+      setTimeout(() => { loadAll(); openPanel(id); }, 2000);
+    } else {
+      out.style.color = '#f87171';
+      out.textContent = '✗ ' + (d.error || 'Error');
+      btn.disabled = false;
+      btn.textContent = '✓ Approve & Optimize';
+    }
+  } catch(e) {
+    out.style.color = '#f87171';
+    out.textContent = 'Network error.';
+    btn.disabled = false;
+    btn.textContent = '✓ Approve & Optimize';
+  }
+}
+
+async function reviseStrategy(id) {
+  const input = document.getElementById(`revise-input-${id}`);
+  const btn   = document.getElementById(`revise-btn-${id}`);
+  const out   = document.getElementById(`review-result-${id}`);
+  const message = input.value.trim();
+  if (!message) { out.style.color = '#f87171'; out.textContent = 'Please describe what to change.'; return; }
+  btn.disabled = true;
+  btn.textContent = 'Applying changes…';
+  try {
+    const r = await fetch(`/api/strategy/${id}/revise`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({message}),
+    });
+    const d = await r.json();
+    if (d.ok) {
+      out.style.color = '#fbbf24';
+      out.textContent = '↺ ' + d.message + ' Panel will update when done.';
+      input.value = '';
+      // Poll for status change back to awaiting_review
+      let polls = 0;
+      const poll = setInterval(async () => {
+        polls++;
+        const pr = await fetch('/api/strategy/' + id);
+        const ps = await pr.json();
+        if (ps.status === 'awaiting_review' || polls > 30) {
+          clearInterval(poll);
+          loadAll();
+          openPanel(id);
+        }
+      }, 5000);
+    } else {
+      out.style.color = '#f87171';
+      out.textContent = '✗ ' + (d.error || 'Error');
+    }
+  } catch(e) {
+    out.style.color = '#f87171';
+    out.textContent = 'Network error.';
+  }
+  btn.disabled = false;
+  btn.textContent = '↺ Request Changes & Re-test';
 }
 
 async function runFullOptimization(id) {
@@ -1460,6 +1929,9 @@ async function saveAndRetry(id) {
     btn.disabled = false;
   }
 }
+
+// Close panel on Escape
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closePanel(); });
 
 // Auto-refresh every 30s
 loadAll();
@@ -1671,7 +2143,7 @@ _RESEARCH_HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Research — Trading Research</title>
+<title>Indicator Research — Trading Research</title>
 <style>
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
   body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
@@ -1684,75 +2156,103 @@ _RESEARCH_HTML = r"""<!DOCTYPE html>
   .nav a { display: block; padding: 14px 16px; font-size: 0.85rem; color: #94a3b8;
            text-decoration: none; border-bottom: 2px solid transparent; transition: color .15s; }
   .nav a:hover, .nav a.active { color: #f1f5f9; border-bottom-color: #6366f1; }
-  .nav-right { margin-left: auto; display: flex; align-items: center; gap: 12px; }
+  .nav-right { margin-left: auto; display: flex; align-items: center; gap: 10px; }
 
-  .page { max-width: 1100px; margin: 0 auto; padding: 32px 24px; }
+  .page { max-width: 1300px; margin: 0 auto; padding: 32px 24px; }
   .page-header { display: flex; align-items: flex-start; justify-content: space-between;
-                 margin-bottom: 28px; flex-wrap: wrap; gap: 14px; }
+                 margin-bottom: 24px; flex-wrap: wrap; gap: 14px; }
   .page-title { font-size: 1.4rem; font-weight: 700; color: #f8fafc; margin-bottom: 4px; }
-  .page-sub { font-size: 0.85rem; color: #64748b; }
+  .page-sub   { font-size: 0.85rem; color: #64748b; }
 
-  .refresh-btn { background: #6366f1; border: none; border-radius: 8px;
-                 color: #fff; font-size: 0.85rem; font-weight: 600;
-                 padding: 9px 18px; cursor: pointer; }
-  .refresh-btn:hover { background: #4f46e5; }
-  .refresh-btn:disabled { opacity: .5; cursor: default; }
+  /* ── Stats bar ── */
+  .stats-bar { display: flex; gap: 14px; margin-bottom: 24px; flex-wrap: wrap; }
+  .stat-pill { background: #111827; border: 1px solid #1f2937; border-radius: 10px;
+               padding: 12px 20px; min-width: 110px; text-align: center; }
+  .stat-pill .num { font-size: 1.6rem; font-weight: 700; color: #f8fafc;
+                    font-family: "SF Mono","Fira Code",monospace; line-height: 1; }
+  .stat-pill .lbl { font-size: 0.7rem; color: #475569; text-transform: uppercase;
+                    letter-spacing: .06em; margin-top: 4px; }
+  .stat-pill.works   .num { color: #4ade80; }
+  .stat-pill.fails   .num { color: #f87171; }
+  .stat-pill.partial .num { color: #fbbf24; }
 
-  .tabs { display: flex; gap: 4px; margin-bottom: 20px; }
-  .tab { padding: 6px 16px; border-radius: 99px; font-size: 0.8rem; font-weight: 500;
-         border: 1px solid #1f2937; background: transparent; color: #64748b; cursor: pointer; }
-  .tab:hover  { color: #f1f5f9; border-color: #374151; }
-  .tab.active { background: #6366f1; border-color: #6366f1; color: #fff; }
-  .tab .cnt   { background: rgba(255,255,255,.15); border-radius: 99px;
-                padding: 1px 7px; font-size: 0.72rem; margin-left: 6px; }
+  /* ── Filter bar ── */
+  .filter-bar { display: flex; gap: 10px; margin-bottom: 20px; flex-wrap: wrap; align-items: center; }
+  .filter-chip { padding: 5px 14px; border-radius: 99px; font-size: 0.8rem; font-weight: 500;
+                 border: 1px solid #1f2937; background: transparent; color: #64748b;
+                 cursor: pointer; transition: all .15s; }
+  .filter-chip:hover  { color: #f1f5f9; border-color: #374151; }
+  .filter-chip.active { color: #fff; border-color: transparent; }
+  .filter-chip.all     { }
+  .filter-chip.all.active    { background: #6366f1; }
+  .filter-chip.works.active  { background: #059669; }
+  .filter-chip.fails.active  { background: #dc2626; }
+  .filter-chip.partial.active { background: #b45309; }
+  .search-input { flex: 1; max-width: 260px; background: #111827; border: 1px solid #1f2937;
+                  border-radius: 8px; color: #f1f5f9; font-size: 0.85rem;
+                  padding: 7px 14px; outline: none; }
+  .search-input:focus { border-color: #4f46e5; }
+  .search-input::placeholder { color: #374151; }
 
-  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 16px; }
+  /* ── Knowledge grid ── */
+  .kb-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 14px;
+             margin-bottom: 40px; }
 
-  .idea-card { background: #111827; border: 1px solid #1f2937; border-radius: 14px;
-               padding: 20px; display: flex; flex-direction: column; gap: 14px;
-               transition: border-color .15s; }
-  .idea-card:hover { border-color: #374151; }
-  .idea-card.approved  { border-color: #14532d; opacity: .7; }
-  .idea-card.dismissed { border-color: #1f2937; opacity: .45; }
+  .kb-card { background: #111827; border: 1px solid #1f2937; border-radius: 12px;
+             padding: 18px; display: flex; flex-direction: column; gap: 10px; }
+  .kb-card:hover { border-color: #374151; }
 
-  .card-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; }
-  .card-title { font-size: 0.95rem; font-weight: 600; color: #f1f5f9; line-height: 1.4; flex: 1; }
-  .confidence { display: inline-block; padding: 2px 8px; border-radius: 99px;
-                font-size: 0.68rem; font-weight: 700; text-transform: uppercase;
-                letter-spacing: .05em; white-space: nowrap; flex-shrink: 0; }
-  .conf-high   { background: #14532d; color: #86efac; }
-  .conf-medium { background: #3b2f00; color: #fcd34d; }
-  .conf-low    { background: #1e293b; color: #94a3b8; }
+  .kb-card-top { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; }
+  .kb-indicator { font-size: 0.95rem; font-weight: 700; color: #f1f5f9;
+                  font-family: "SF Mono","Fira Code",monospace; }
+  .cat-badge { padding: 3px 10px; border-radius: 99px; font-size: 0.68rem;
+               font-weight: 700; text-transform: uppercase; letter-spacing: .04em;
+               white-space: nowrap; flex-shrink: 0; }
+  .cat-works   { background: #14532d; color: #86efac; }
+  .cat-fails   { background: #7f1d1d; color: #fca5a5; }
+  .cat-partial { background: #3b2f00; color: #fcd34d; }
+  .cat-edge_case { background: #1e293b; color: #7dd3fc; }
 
-  .card-summary { font-size: 0.84rem; color: #94a3b8; line-height: 1.6; flex: 1; }
+  .kb-meta { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  .kb-tag  { background: #1e2533; border-radius: 6px; padding: 2px 8px;
+             font-size: 0.72rem; color: #64748b; font-family: "SF Mono",monospace; }
+  .kb-sharpe { font-size: 0.72rem; font-weight: 600; margin-left: auto;
+               font-family: "SF Mono",monospace; }
+  .kb-sharpe.pos { color: #4ade80; }
+  .kb-sharpe.neg { color: #f87171; }
+  .kb-sharpe.neu { color: #64748b; }
 
-  .card-meta { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
-  .source-badge { background: #1e293b; border-radius: 99px; padding: 3px 10px;
-                  font-size: 0.72rem; color: #64748b; }
-  .asset-badge  { background: #1c2a3f; border-radius: 99px; padding: 3px 10px;
-                  font-size: 0.72rem; color: #7dd3fc; }
-  .source-link  { font-size: 0.75rem; color: #818cf8; text-decoration: none;
-                  margin-left: auto; }
-  .source-link:hover { text-decoration: underline; }
+  .kb-summary { font-size: 0.82rem; color: #94a3b8; line-height: 1.55; flex: 1; }
 
-  .card-actions { display: flex; gap: 8px; }
-  .btn-approve  { flex: 1; background: #059669; border: none; border-radius: 8px;
-                  color: #fff; font-size: 0.82rem; font-weight: 600; padding: 8px 14px;
-                  cursor: pointer; }
-  .btn-approve:hover  { background: #047857; }
-  .btn-approve:disabled { opacity: .5; cursor: default; }
-  .btn-dismiss  { background: #1e2533; border: 1px solid #374151; border-radius: 8px;
-                  color: #64748b; font-size: 0.82rem; padding: 8px 14px; cursor: pointer; }
-  .btn-dismiss:hover { color: #f87171; border-color: #7f1d1d; }
-  .btn-dismiss:disabled { opacity: .5; cursor: default; }
+  /* ── Queue section ── */
+  .section-hdr { font-size: 1rem; font-weight: 700; color: #f1f5f9; margin: 8px 0 16px;
+                 display: flex; align-items: center; gap: 14px; }
+  .queue-table { width: 100%; border-collapse: collapse; font-size: 0.83rem; }
+  .queue-table th { text-align: left; padding: 8px 14px; color: #475569; font-weight: 600;
+                    font-size: 0.72rem; text-transform: uppercase; letter-spacing: .05em;
+                    border-bottom: 1px solid #1f2937; }
+  .queue-table td { padding: 10px 14px; border-bottom: 1px solid #111827; color: #94a3b8;
+                    vertical-align: top; }
+  .queue-table tr:hover td { background: #0d1117; }
+  .q-title { color: #e2e8f0; font-size: 0.85rem; }
+  .q-status { display: inline-block; padding: 2px 10px; border-radius: 99px;
+              font-size: 0.7rem; font-weight: 600; white-space: nowrap; }
+  .qs-pending  { background: #1e293b; color: #7dd3fc; }
+  .qs-running  { background: #3b2f00; color: #fcd34d; }
+  .qs-done     { background: #14532d; color: #86efac; }
+  .qs-failed   { background: #7f1d1d; color: #fca5a5; }
 
-  .status-chip { display: inline-block; padding: 3px 10px; border-radius: 99px;
-                 font-size: 0.72rem; font-weight: 600; }
-  .chip-approved  { background: #14532d; color: #86efac; }
-  .chip-dismissed { background: #1e293b; color: #64748b; }
+  /* ── Buttons ── */
+  .btn-primary { background: #6366f1; border: none; border-radius: 8px; color: #fff;
+                 font-size: 0.85rem; font-weight: 600; padding: 9px 18px; cursor: pointer; }
+  .btn-primary:hover { background: #4f46e5; }
+  .btn-primary:disabled { opacity: .5; cursor: default; }
+  .btn-secondary { background: #1e2533; border: 1px solid #374151; border-radius: 8px;
+                   color: #94a3b8; font-size: 0.85rem; padding: 8px 16px; cursor: pointer; }
+  .btn-secondary:hover { color: #f1f5f9; border-color: #6366f1; }
 
-  .empty { text-align: center; padding: 80px 0; color: #475569; font-size: 0.9rem; }
-  .loading { text-align: center; padding: 60px 0; color: #475569; }
+  .empty   { text-align: center; padding: 60px 0; color: #475569; font-size: 0.9rem; }
+  .loading { text-align: center; padding: 40px 0; color: #475569; }
   .toast { position: fixed; bottom: 24px; right: 24px; background: #059669;
            color: #fff; border-radius: 10px; padding: 12px 20px;
            font-size: 0.85rem; font-weight: 600; z-index: 999;
@@ -1768,10 +2268,9 @@ _RESEARCH_HTML = r"""<!DOCTYPE html>
   <a href="/ideas">Ideas</a>
   <a href="/research" class="active">Research</a>
   <a href="/data">Data</a>
-
   <div class="nav-right">
-    <button class="refresh-btn" id="refresh-btn" onclick="triggerRefresh()">
-      + Fetch new papers
+    <button class="btn-secondary" id="gen-btn" onclick="generateTasks()">
+      ⚗ Run indicator research
     </button>
   </div>
 </nav>
@@ -1779,159 +2278,197 @@ _RESEARCH_HTML = r"""<!DOCTYPE html>
 <div class="page">
   <div class="page-header">
     <div>
-      <div class="page-title">Research Feed</div>
-      <div class="page-sub">AI-extracted strategy ideas from arXiv and Semantic Scholar. Click "Use this idea" to send to the pipeline.</div>
+      <div class="page-title">Indicator Research Lab</div>
+      <div class="page-sub">
+        Systematic forward-return analysis of every pandas_ta indicator + price structure concept.
+        Findings are injected into strategy generation automatically.
+      </div>
     </div>
   </div>
 
-  <div class="tabs">
-    <button class="tab active" onclick="switchTab('pending',this)">Pending <span class="cnt" id="cnt-pending">…</span></button>
-    <button class="tab" onclick="switchTab('approved',this)">Approved <span class="cnt" id="cnt-approved">…</span></button>
-    <button class="tab" onclick="switchTab('dismissed',this)">Dismissed <span class="cnt" id="cnt-dismissed">…</span></button>
-    <button class="tab" onclick="switchTab('all',this)">All <span class="cnt" id="cnt-all">…</span></button>
+  <!-- Stats -->
+  <div class="stats-bar" id="stats-bar">
+    <div class="stat-pill"><div class="num" id="s-total">…</div><div class="lbl">Total entries</div></div>
+    <div class="stat-pill works"><div class="num" id="s-works">…</div><div class="lbl">Works</div></div>
+    <div class="stat-pill fails"><div class="num" id="s-fails">…</div><div class="lbl">Fails</div></div>
+    <div class="stat-pill partial"><div class="num" id="s-partial">…</div><div class="lbl">Partial</div></div>
+    <div class="stat-pill" style="margin-left:auto">
+      <div class="num" id="s-pending">…</div><div class="lbl">Queue pending</div>
+    </div>
+    <div class="stat-pill">
+      <div class="num" id="s-running">…</div><div class="lbl">Running</div>
+    </div>
   </div>
 
-  <div id="grid-container" class="loading">Loading…</div>
+  <!-- Knowledge base -->
+  <div class="filter-bar">
+    <button class="filter-chip all active" onclick="setFilter('all',this)">All</button>
+    <button class="filter-chip works"   onclick="setFilter('works',this)">Works</button>
+    <button class="filter-chip fails"   onclick="setFilter('fails',this)">Fails</button>
+    <button class="filter-chip partial" onclick="setFilter('partial',this)">Partial</button>
+    <input class="search-input" id="search" placeholder="Filter by indicator…"
+           oninput="onSearch()" />
+  </div>
+  <div id="kb-grid" class="loading">Loading knowledge base…</div>
+
+  <!-- Queue -->
+  <div class="section-hdr" style="margin-top:40px">
+    Research Queue
+    <span style="font-size:0.78rem;font-weight:400;color:#475569">
+      (latest 30 indicator research tasks)
+    </span>
+  </div>
+  <div id="queue-wrap" class="loading">Loading…</div>
 </div>
 
 <div class="toast" id="toast"></div>
 
 <script>
-let currentTab = 'pending';
+let allEntries = [];
+let currentCat = 'all';
+let searchVal  = '';
 
-async function loadIdeas(status) {
-  document.getElementById('grid-container').innerHTML = '<div class="loading">Loading…</div>';
+async function init() {
+  await Promise.all([loadStats(), loadKnowledge(), loadQueue()]);
+  setInterval(init, 30000);
+}
+
+async function loadStats() {
   try {
-    const r = await fetch('/api/generated-ideas?status=' + status + '&limit=100');
-    const data = await r.json();
-    renderGrid(data.ideas || []);
-    loadCounts();
+    const r = await fetch('/api/research/stats');
+    const d = await r.json();
+    document.getElementById('s-total').textContent   = d.total   ?? '0';
+    document.getElementById('s-works').textContent   = d.works   ?? '0';
+    document.getElementById('s-fails').textContent   = d.fails   ?? '0';
+    document.getElementById('s-partial').textContent = d.partial ?? '0';
+    document.getElementById('s-pending').textContent = d.queue_pending ?? '0';
+    document.getElementById('s-running').textContent = d.queue_running ?? '0';
+  } catch(e) {}
+}
+
+async function loadKnowledge() {
+  try {
+    const r = await fetch('/api/knowledge?limit=300');
+    const d = await r.json();
+    allEntries = d.entries || [];
+    renderKnowledge();
   } catch(e) {
-    document.getElementById('grid-container').innerHTML = '<div class="empty">Failed to load ideas.</div>';
+    document.getElementById('kb-grid').innerHTML = '<div class="empty">Failed to load knowledge base.</div>';
   }
 }
 
-async function loadCounts() {
-  const statuses = ['pending', 'approved', 'dismissed', 'all'];
-  for (const s of statuses) {
-    try {
-      const r = await fetch('/api/generated-ideas?status=' + s + '&limit=200');
-      const d = await r.json();
-      const el = document.getElementById('cnt-' + s);
-      if (el) el.textContent = (d.ideas || []).length;
-    } catch(e) {}
+async function loadQueue() {
+  try {
+    const r = await fetch('/api/research/tasks?type=indicator_research&limit=30');
+    const d = await r.json();
+    renderQueue(d.tasks || []);
+  } catch(e) {
+    document.getElementById('queue-wrap').innerHTML = '<div class="empty">Failed to load queue.</div>';
   }
 }
 
-function switchTab(status, btn) {
-  currentTab = status;
-  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+function setFilter(cat, btn) {
+  currentCat = cat;
+  document.querySelectorAll('.filter-chip').forEach(c => c.classList.remove('active'));
   btn.classList.add('active');
-  loadIdeas(status);
+  renderKnowledge();
 }
 
-function renderGrid(ideas) {
-  const container = document.getElementById('grid-container');
-  if (!ideas.length) {
-    container.innerHTML = '<div class="empty">No ideas in this category yet.<br>Click "+ Fetch new papers" to generate ideas from recent research.</div>';
+function onSearch() {
+  searchVal = document.getElementById('search').value.toLowerCase();
+  renderKnowledge();
+}
+
+function renderKnowledge() {
+  const el = document.getElementById('kb-grid');
+  let entries = allEntries;
+  if (currentCat !== 'all') entries = entries.filter(e => e.category === currentCat);
+  if (searchVal)             entries = entries.filter(e =>
+    (e.indicator || '').toLowerCase().includes(searchVal) ||
+    (e.summary   || '').toLowerCase().includes(searchVal));
+
+  if (!entries.length) {
+    el.className = '';
+    el.innerHTML = '<div class="empty">No entries match the current filter.<br>'
+      + (allEntries.length === 0 ? 'Click "Run indicator research" to generate and queue tests.' : '') + '</div>';
     return;
   }
-  container.className = 'grid';
-  container.innerHTML = ideas.map(idea => renderCard(idea)).join('');
+  el.className = 'kb-grid';
+  el.innerHTML = entries.map(renderCard).join('');
 }
 
-function renderCard(idea) {
-  const confCls = 'conf-' + (idea.confidence || 'medium');
-  const confLabel = (idea.confidence || 'medium').toUpperCase();
-  const sourceLabel = (idea.source_type || '').replace('_', ' ').toUpperCase();
-  const assetLabel = (idea.asset_class || 'multi').toUpperCase();
-  const ts = (idea.created_at || '').slice(0, 10);
-  const isPending   = idea.status === 'pending';
-  const isApproved  = idea.status === 'approved';
-  const isDismissed = idea.status === 'dismissed';
-
-  const cardCls = isApproved ? 'idea-card approved' : isDismissed ? 'idea-card dismissed' : 'idea-card';
-  const statusChip = isApproved
-    ? '<span class="status-chip chip-approved">✓ Queued</span>'
-    : isDismissed
-    ? '<span class="status-chip chip-dismissed">✕ Dismissed</span>'
-    : '';
-
-  const actions = isPending ? `
-    <div class="card-actions">
-      <button class="btn-approve" onclick="approveIdea('${idea.id}', this)">
-        Use this idea →
-      </button>
-      <button class="btn-dismiss" onclick="dismissIdea('${idea.id}', this)" title="Dismiss">✕</button>
-    </div>` : `<div style="display:flex;align-items:center;gap:8px">${statusChip}</div>`;
-
+function renderCard(e) {
+  const cat   = e.category || 'partial';
+  const ind   = e.indicator || '?';
+  const tf    = e.timeframe || '';
+  const asset = e.asset     || '';
+  const sharpe = e.sharpe_ref;
+  const sharpeCls = sharpe === null || sharpe === undefined ? 'neu'
+                  : sharpe > 0.3  ? 'pos'
+                  : sharpe < -0.3 ? 'neg' : 'neu';
+  const sharpeStr = sharpe !== null && sharpe !== undefined
+    ? (sharpe > 0 ? '+' : '') + parseFloat(sharpe).toFixed(2) : '—';
+  const summary = esc(e.summary || '');
+  const ts = (e.created_at || '').slice(0, 10);
   return `
-  <div class="idea-card ${cardCls}" id="card-${idea.id}">
-    <div class="card-header">
-      <div class="card-title">${esc(idea.title)}</div>
-      <span class="confidence ${confCls}">${confLabel}</span>
-    </div>
-    <div class="card-summary">${esc(idea.summary)}</div>
-    <div class="card-meta">
-      <span class="source-badge">${sourceLabel}</span>
-      <span class="asset-badge">${assetLabel}</span>
-      <span style="font-size:.72rem;color:#374151">${ts}</span>
-      ${idea.source_url ? `<a class="source-link" href="${esc(idea.source_url)}" target="_blank">↗ Paper</a>` : ''}
-    </div>
-    ${actions}
-  </div>`;
+<div class="kb-card">
+  <div class="kb-card-top">
+    <div class="kb-indicator">${esc(ind)}</div>
+    <span class="cat-badge cat-${cat}">${cat}</span>
+  </div>
+  <div class="kb-meta">
+    ${asset ? `<span class="kb-tag">${esc(asset)}</span>` : ''}
+    ${tf    ? `<span class="kb-tag">${esc(tf)}</span>`    : ''}
+    <span class="kb-sharpe ${sharpeCls}">Sharpe ${sharpeStr}</span>
+  </div>
+  <div class="kb-summary">${summary}</div>
+  <div style="font-size:.68rem;color:#374151;margin-top:2px">${ts}</div>
+</div>`;
 }
 
-async function approveIdea(id, btn) {
-  btn.disabled = true;
-  btn.textContent = 'Queuing…';
-  try {
-    const r = await fetch('/api/generated-ideas/' + id + '/approve', {method: 'POST'});
-    const d = await r.json();
-    if (d.ok) {
-      showToast('Idea queued for analysis!');
-      setTimeout(() => loadIdeas(currentTab), 800);
-    } else {
-      showToast('Error: ' + (d.error || 'unknown'), true);
-      btn.disabled = false;
-      btn.textContent = 'Use this idea →';
-    }
-  } catch(e) {
-    showToast('Network error', true);
-    btn.disabled = false;
-    btn.textContent = 'Use this idea →';
+function renderQueue(tasks) {
+  const el = document.getElementById('queue-wrap');
+  if (!tasks.length) {
+    el.className = '';
+    el.innerHTML = '<div class="empty">No indicator research tasks yet.<br>Click "Run indicator research" to generate them.</div>';
+    return;
   }
+  el.className = '';
+  const rows = tasks.map(t => {
+    const status  = t.status || 'pending';
+    const title   = (t.title || '').replace('[Indicator] ', '');
+    const ts      = (t.created_at || '').slice(0, 16).replace('T', ' ');
+    const summary = esc((t.result_summary || '').slice(0, 100) + (t.result_summary && t.result_summary.length > 100 ? '…' : ''));
+    return `<tr>
+      <td class="q-title">${esc(title)}</td>
+      <td><span class="q-status qs-${status}">${status}</span></td>
+      <td>${summary}</td>
+      <td style="white-space:nowrap;color:#374151">${ts}</td>
+    </tr>`;
+  }).join('');
+  el.innerHTML = `
+<table class="queue-table">
+  <thead><tr>
+    <th>Indicator / Signal</th><th>Status</th><th>Summary</th><th>Created</th>
+  </tr></thead>
+  <tbody>${rows}</tbody>
+</table>`;
 }
 
-async function dismissIdea(id, btn) {
+async function generateTasks() {
+  const btn = document.getElementById('gen-btn');
   btn.disabled = true;
+  btn.textContent = 'Generating…';
   try {
-    await fetch('/api/generated-ideas/' + id + '/dismiss', {method: 'POST'});
-    const card = document.getElementById('card-' + id);
-    if (card) card.style.opacity = '0.3';
-    setTimeout(() => loadIdeas(currentTab), 500);
-  } catch(e) {
-    btn.disabled = false;
-  }
-}
-
-async function triggerRefresh() {
-  const btn = document.getElementById('refresh-btn');
-  btn.disabled = true;
-  btn.textContent = 'Fetching papers…';
-  try {
-    const r = await fetch('/api/generated-ideas/refresh', {method: 'POST'});
+    const r = await fetch('/api/research/generate', {method: 'POST'});
     const d = await r.json();
-    showToast('Fetching papers in background — check back in ~30 seconds.');
-    setTimeout(() => {
-      btn.disabled = false;
-      btn.textContent = '+ Fetch new papers';
-      loadIdeas(currentTab);
-    }, 30000);
+    showToast(`Created ${d.created} new research tasks. They will start shortly.`);
+    setTimeout(() => { loadStats(); loadQueue(); }, 1500);
   } catch(e) {
-    showToast('Failed to trigger refresh', true);
+    showToast('Failed to generate tasks', true);
+  } finally {
     btn.disabled = false;
-    btn.textContent = '+ Fetch new papers';
+    btn.textContent = '⚗ Run indicator research';
   }
 }
 
@@ -1939,7 +2476,7 @@ function showToast(msg, isError) {
   const t = document.getElementById('toast');
   t.textContent = msg;
   t.className = 'toast' + (isError ? ' error' : '') + ' show';
-  setTimeout(() => { t.className = 'toast' + (isError ? ' error' : ''); }, 3500);
+  setTimeout(() => { t.className = 'toast' + (isError ? ' error' : ''); }, 4000);
 }
 
 function esc(s) {
@@ -1947,7 +2484,7 @@ function esc(s) {
   return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
 
-loadIdeas('pending');
+init();
 </script>
 </body>
 </html>"""
@@ -1956,6 +2493,80 @@ loadIdeas('pending');
 @app.get("/research", response_class=HTMLResponse)
 def research_page() -> HTMLResponse:
     return HTMLResponse(_RESEARCH_HTML)
+
+
+# ---------------------------------------------------------------------------
+# Indicator Research Lab API
+# ---------------------------------------------------------------------------
+
+@app.post("/api/research/generate")
+def api_generate_research_tasks(background_tasks: BackgroundTasks) -> JSONResponse:
+    """Create pending research_task rows for all untested indicator specs."""
+    def _run():
+        from agents.indicator_researcher import generate_research_tasks
+        return generate_research_tasks()
+    background_tasks.add_task(_run)
+    # Also run synchronously to get count immediately
+    try:
+        from agents.indicator_researcher import generate_research_tasks
+        created = generate_research_tasks()
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
+    return JSONResponse({"ok": True, "created": created})
+
+
+@app.get("/api/knowledge")
+def api_get_knowledge(
+    category: str = Query(default="all"),
+    indicator: str = Query(default=""),
+    limit: int = Query(default=200),
+) -> JSONResponse:
+    """Return knowledge_base entries with optional filters."""
+    try:
+        entries = db.get_knowledge_entries(
+            category=category if category != "all" else None,
+            indicator=indicator if indicator else None,
+            limit=min(limit, 500),
+        )
+        return JSONResponse({"entries": entries})
+    except Exception as exc:
+        return JSONResponse({"entries": [], "error": str(exc)}, status_code=500)
+
+
+@app.get("/api/research/stats")
+def api_research_stats() -> JSONResponse:
+    """Return knowledge base category counts + queue status counts."""
+    try:
+        kb_stats = db.get_knowledge_stats()
+        pending_tasks = db.get_research_tasks(
+            status="pending", task_type="indicator_research", limit=200)
+        running_tasks = db.get_research_tasks(
+            status="running", task_type="indicator_research", limit=200)
+        return JSONResponse({
+            **kb_stats,
+            "queue_pending": len(pending_tasks),
+            "queue_running": len(running_tasks),
+        })
+    except Exception as exc:
+        return JSONResponse({"total": 0, "error": str(exc)}, status_code=500)
+
+
+@app.get("/api/research/tasks")
+def api_research_tasks(
+    type: str = Query(default="indicator_research"),
+    status: str = Query(default="all"),
+    limit: int = Query(default=30),
+) -> JSONResponse:
+    """Return research tasks filtered by type and status."""
+    try:
+        tasks = db.get_research_tasks(
+            status=status,
+            task_type=type if type else None,
+            limit=min(limit, 200),
+        )
+        return JSONResponse({"tasks": tasks})
+    except Exception as exc:
+        return JSONResponse({"tasks": [], "error": str(exc)}, status_code=500)
 
 
 # ---------------------------------------------------------------------------

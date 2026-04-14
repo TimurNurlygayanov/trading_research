@@ -158,6 +158,15 @@ ALTER TABLE strategies ADD COLUMN IF NOT EXISTS analysis_done                  b
 -- Research task IDs blocking this strategy (set when awaiting research results)
 ALTER TABLE strategies ADD COLUMN IF NOT EXISTS pending_research_ids     jsonb DEFAULT '[]'::jsonb;
 
+-- Campaign / variation exploration
+-- campaign_id: NULL for standalone strategies and campaign roots.
+--              Set to the root strategy's id for all variation children.
+-- is_campaign_root: true on the original strategy that spawned the campaign.
+ALTER TABLE strategies ADD COLUMN IF NOT EXISTS campaign_id          uuid    REFERENCES strategies(id) ON DELETE SET NULL;
+ALTER TABLE strategies ADD COLUMN IF NOT EXISTS is_campaign_root     boolean DEFAULT false;
+
+CREATE INDEX IF NOT EXISTS idx_strategies_campaign_id ON strategies(campaign_id);
+
 CREATE INDEX IF NOT EXISTS idx_strategies_status     ON strategies(status);
 CREATE INDEX IF NOT EXISTS idx_strategies_updated_at ON strategies(updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_strategies_source     ON strategies(source);
@@ -341,8 +350,9 @@ CREATE TABLE IF NOT EXISTS research_tasks (
   updated_at              timestamptz  NOT NULL DEFAULT now()
 );
 
-ALTER TABLE research_tasks ADD COLUMN IF NOT EXISTS generated_code text;
+ALTER TABLE research_tasks ADD COLUMN IF NOT EXISTS generated_code  text;
 ALTER TABLE research_tasks ADD COLUMN IF NOT EXISTS key_findings    jsonb;
+ALTER TABLE research_tasks ADD COLUMN IF NOT EXISTS research_spec   jsonb;
 
 CREATE INDEX IF NOT EXISTS idx_research_tasks_status     ON research_tasks(status);
 CREATE INDEX IF NOT EXISTS idx_research_tasks_type       ON research_tasks(type);
