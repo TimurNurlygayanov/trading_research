@@ -537,7 +537,7 @@ def api_ideas_grouped(limit: int = Query(default=100, le=200)) -> JSONResponse:
         # 1. Fetch recent user ideas (with strategy_id FK to root strategy)
         ideas_res = (
             sb.table("user_ideas")
-            .select("id, idea_text, status, strategy_id, created_at")
+            .select("id, title, description, status, strategy_id, created_at")
             .order("created_at", desc=True)
             .limit(limit)
             .execute()
@@ -577,9 +577,14 @@ def api_ideas_grouped(limit: int = Query(default=100, le=200)) -> JSONResponse:
                 default=None,
             )
 
+            title = idea.get("title") or ""
+            description = idea.get("description") or ""
+            idea_text = title + ("\n" + description if description and description != title else "")
             result.append({
                 "idea_id":       idea["id"],
-                "idea_text":     idea.get("idea_text", ""),
+                "idea_text":     idea_text,
+                "title":         title,
+                "description":   description,
                 "idea_status":   idea.get("status", ""),
                 "created_at":    idea.get("created_at", ""),
                 "total":         len(strategies),
@@ -837,6 +842,8 @@ _DASHBOARD_HTML = r"""<!DOCTYPE html>
   .pill-total   { background: #1e293b; color: #94a3b8; }
   .pill-best    { background: #1e1b4b; color: #818cf8; }
   .idea-strategies { display: none; border-top: 1px solid #1f2937; }
+  tr.child-row { background: #0b1120; }
+  tr.child-row:hover { background: #0f1729 !important; }
   .idea-card.open .idea-strategies { display: block; }
   .idea-strat-table { width: 100%; border-collapse: collapse; font-size: 0.82rem; }
   .idea-strat-table td { padding: 9px 20px; border-bottom: 1px solid #0d1117; color: #94a3b8; vertical-align: middle; }
@@ -1104,31 +1111,101 @@ const STATUS_LABELS = {
 };
 function statusLabel(s) { return STATUS_LABELS[s] || s; }
 
+// Track which campaign roots are expanded
+const expandedRoots = new Set();
+
+function stratRow(r, isChild) {
+  const sharpe    = fmtNum(r.backtest_sharpe);
+  const oosSharpe = fmtNum(r.oos_sharpe);
+  const dd        = r.max_drawdown != null ? (r.max_drawdown * 100).toFixed(1) + '%' : '—';
+  const wr        = r.win_rate != null ? (r.win_rate * 100).toFixed(1) + '%' : '—';
+  const spy       = r.signals_per_year != null ? Math.round(r.signals_per_year) : '—';
+  const leak      = r.leakage_score != null ? r.leakage_score.toFixed(1) : '—';
+  const leakCls   = r.leakage_score >= 7 ? 'pos' : r.leakage_score >= 4 ? 'neu' : 'neg';
+  const sharpeCls = r.backtest_sharpe > 1 ? 'pos' : r.backtest_sharpe > 0 ? 'neu' : 'neg';
+  const oosCls    = r.oos_sharpe > 0.8 ? 'pos' : r.oos_sharpe > 0 ? 'neu' : 'neg';
+  const updated   = r.updated_at ? r.updated_at.slice(0,16).replace('T',' ') : '—';
+  const badgeCls  = 's-' + (r.status || 'idea').replace(/_/g,'-');
+  const tagsHtml  = (r.tags || []).map(t =>
+    `<span style="background:#1e293b;border-radius:99px;padding:1px 8px;font-size:.7rem;
+                  color:#93c5fd;margin-right:3px;white-space:nowrap">${esc(t)}</span>`
+  ).join('');
+  const indent = isChild
+    ? 'padding-left:28px;color:#94a3b8;font-size:.82rem'
+    : '';
+  const prefix = isChild ? '<span style="color:#374151;margin-right:6px">↳</span>' : '';
+  return `<tr class="data-row${isChild ? ' child-row' : ''}" onclick="openPanel('${r.id}')">
+    <td style="max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;${indent}" title="${esc(r.name)}">${prefix}${esc(r.name)}</td>
+    <td><span class="badge ${badgeCls}">${statusLabel(r.status)}</span></td>
+    <td style="max-width:140px">${tagsHtml || '<span style="color:#374151">—</span>'}</td>
+    <td class="metric ${sharpeCls}">${sharpe}</td>
+    <td class="metric ${oosCls}">${oosSharpe}</td>
+    <td class="metric">${dd}</td>
+    <td class="metric">${wr}</td>
+    <td class="metric">${spy}</td>
+    <td class="metric ${leakCls}">${leak}</td>
+    <td style="color:#475569;font-size:.78rem;white-space:nowrap">${updated}</td>
+  </tr>`;
+}
+
 function renderTable(rows) {
   const tbody = document.getElementById('tbody');
   if (!rows.length) {
     tbody.innerHTML = '<tr><td colspan="10" class="empty">No strategies yet in this status.</td></tr>';
     return;
   }
-  tbody.innerHTML = rows.map(r => {
-    const sharpe    = fmtNum(r.backtest_sharpe);
-    const oosSharpe = fmtNum(r.oos_sharpe);
-    const dd        = r.max_drawdown != null ? (r.max_drawdown * 100).toFixed(1) + '%' : '—';
-    const wr        = r.win_rate != null ? (r.win_rate * 100).toFixed(1) + '%' : '—';
-    const spy       = r.signals_per_year != null ? Math.round(r.signals_per_year) : '—';
-    const leak      = r.leakage_score != null ? r.leakage_score.toFixed(1) : '—';
-    const leakCls   = r.leakage_score >= 7 ? 'pos' : r.leakage_score >= 4 ? 'neu' : 'neg';
-    const sharpeCls = r.backtest_sharpe > 1 ? 'pos' : r.backtest_sharpe > 0 ? 'neu' : 'neg';
-    const oosCls    = r.oos_sharpe > 0.8 ? 'pos' : r.oos_sharpe > 0 ? 'neu' : 'neg';
-    const updated   = r.updated_at ? r.updated_at.slice(0,16).replace('T',' ') : '—';
-    const badgeCls  = 's-' + (r.status || 'idea').replace(/_/g,'-');
-    const tagsHtml  = (r.tags || []).map(t =>
+
+  // Group: map rootId → children[]
+  const childrenOf = {};
+  const rootRows   = [];
+  const standalone = [];
+
+  for (const r of rows) {
+    if (r.campaign_id) {
+      (childrenOf[r.campaign_id] = childrenOf[r.campaign_id] || []).push(r);
+    } else if (r.is_campaign_root) {
+      rootRows.push(r);
+    } else {
+      standalone.push(r);
+    }
+  }
+
+  let html = '';
+  // Standalone strategies (no campaign) — show as before
+  for (const r of standalone) {
+    html += stratRow(r, false);
+  }
+
+  // Campaign roots + their children
+  for (const root of rootRows) {
+    const children = childrenOf[root.id] || [];
+    const expanded = expandedRoots.has(root.id);
+    const chevron  = expanded ? '▾' : '▸';
+    const countBadge = children.length
+      ? `<span style="background:#1e3a5f;color:#7dd3fc;border-radius:99px;padding:1px 7px;
+                      font-size:.7rem;margin-left:6px;cursor:pointer"
+              onclick="event.stopPropagation();toggleRoot('${root.id}')">${chevron} ${children.length} variations</span>`
+      : '';
+
+    // Root row — inject expand toggle into name cell
+    const sharpe    = fmtNum(root.backtest_sharpe);
+    const oosSharpe = fmtNum(root.oos_sharpe);
+    const dd        = root.max_drawdown != null ? (root.max_drawdown * 100).toFixed(1) + '%' : '—';
+    const wr        = root.win_rate != null ? (root.win_rate * 100).toFixed(1) + '%' : '—';
+    const spy       = root.signals_per_year != null ? Math.round(root.signals_per_year) : '—';
+    const leak      = root.leakage_score != null ? root.leakage_score.toFixed(1) : '—';
+    const leakCls   = root.leakage_score >= 7 ? 'pos' : root.leakage_score >= 4 ? 'neu' : 'neg';
+    const sharpeCls = root.backtest_sharpe > 1 ? 'pos' : root.backtest_sharpe > 0 ? 'neu' : 'neg';
+    const oosCls    = root.oos_sharpe > 0.8 ? 'pos' : root.oos_sharpe > 0 ? 'neu' : 'neg';
+    const updated   = root.updated_at ? root.updated_at.slice(0,16).replace('T',' ') : '—';
+    const badgeCls  = 's-' + (root.status || 'idea').replace(/_/g,'-');
+    const tagsHtml  = (root.tags || []).map(t =>
       `<span style="background:#1e293b;border-radius:99px;padding:1px 8px;font-size:.7rem;
                     color:#93c5fd;margin-right:3px;white-space:nowrap">${esc(t)}</span>`
     ).join('');
-    return `<tr class="data-row" onclick="openPanel('${r.id}')">
-      <td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(r.name)}">${esc(r.name)}</td>
-      <td><span class="badge ${badgeCls}">${statusLabel(r.status)}</span></td>
+    html += `<tr class="data-row" onclick="openPanel('${root.id}')">
+      <td style="max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(root.name)}">${esc(root.name)}${countBadge}</td>
+      <td><span class="badge ${badgeCls}">${statusLabel(root.status)}</span></td>
       <td style="max-width:140px">${tagsHtml || '<span style="color:#374151">—</span>'}</td>
       <td class="metric ${sharpeCls}">${sharpe}</td>
       <td class="metric ${oosCls}">${oosSharpe}</td>
@@ -1138,7 +1215,28 @@ function renderTable(rows) {
       <td class="metric ${leakCls}">${leak}</td>
       <td style="color:#475569;font-size:.78rem;white-space:nowrap">${updated}</td>
     </tr>`;
-  }).join('');
+
+    if (expanded) {
+      for (const child of children) {
+        html += stratRow(child, true);
+      }
+    }
+  }
+
+  // Orphan children (root not in current page — treat as standalone)
+  for (const [rootId, children] of Object.entries(childrenOf)) {
+    if (!rootRows.find(r => r.id === rootId)) {
+      for (const child of children) html += stratRow(child, false);
+    }
+  }
+
+  tbody.innerHTML = html || '<tr><td colspan="10" class="empty">No strategies yet in this status.</td></tr>';
+}
+
+function toggleRoot(rootId) {
+  if (expandedRoots.has(rootId)) expandedRoots.delete(rootId);
+  else expandedRoots.add(rootId);
+  renderTable(strategiesData);
 }
 
 function renderIdeas(ideas) {
