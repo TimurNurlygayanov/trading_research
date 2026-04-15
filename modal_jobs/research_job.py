@@ -211,22 +211,15 @@ def _execute_analysis(code: str, df, question: str) -> dict:
     import pandas as pd
     from scipy import stats as scipy_stats
 
-    # Build a safe namespace with data science tools
+    # Build a namespace with data science tools.
+    # __import__ is required for any `import` statement inside the executed code;
+    # without it every `import pandas_ta`, `import warnings`, etc. raises ImportError.
+    # The code runs inside Modal's isolated container so this is safe.
     namespace = {
         "pd": pd,
         "np": np,
         "scipy_stats": scipy_stats,
-        "__builtins__": {
-            k: __builtins__[k] if isinstance(__builtins__, dict) else getattr(__builtins__, k)
-            for k in [
-                "print", "len", "range", "enumerate", "zip", "list", "dict",
-                "set", "tuple", "str", "int", "float", "bool", "abs", "round",
-                "min", "max", "sum", "sorted", "reversed", "isinstance", "type",
-                "hasattr", "getattr", "repr", "format", "any", "all",
-            ]
-            if isinstance(__builtins__, dict) and k in __builtins__
-               or not isinstance(__builtins__, dict) and hasattr(__builtins__, k)
-        },
+        "__builtins__": __builtins__,
     }
 
     # Capture stdout
