@@ -108,7 +108,15 @@ def run_research_task(task_id: str) -> dict:
                 df.to_parquet(cache_file)
                 ohlcv_cache.commit()
 
-        # 3. Execute analysis code in sandboxed namespace
+        # 3. Validate syntax before executing (catches LLM truncation early)
+        try:
+            compile(code, "<research_analysis>", "exec")
+        except SyntaxError as se:
+            raise ValueError(
+                f"Generated analysis code has a syntax error (likely truncated by token limit): "
+                f"{se}"
+            ) from se
+
         result = _execute_analysis(code, df=df, question=question)
 
         # 4. Persist results

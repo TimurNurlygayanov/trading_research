@@ -51,7 +51,7 @@ def generate_research_code(
     from agents.utils import call_claude
     response = call_claude(
         model=MODEL,
-        max_tokens=4096,
+        max_tokens=8192,
         system=RESEARCHER_SYSTEM,
         messages=[{"role": "user", "content": user_msg}],
     )
