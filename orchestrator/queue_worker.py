@@ -96,6 +96,39 @@ def _dispatch_validator_job(strategy_id: str) -> None:
 
 
 _RESEARCH_MAX_RETRIES = 3
+_RESEARCH_STUCK_TIMEOUT_MINUTES = 13  # Modal timeout is 10 min; 13 min means it's definitely dead
+
+
+def _recover_stuck_research_tasks() -> int:
+    """
+    Reset research tasks stuck in 'running' back to 'failed' so the retry
+    loop can pick them up.  Modal's function timeout is 10 minutes; if a
+    task is still 'running' after 25 minutes the Modal container crashed
+    without updating the DB.
+    """
+    from datetime import datetime, timezone, timedelta
+
+    cutoff = (
+        datetime.now(timezone.utc) - timedelta(minutes=_RESEARCH_STUCK_TIMEOUT_MINUTES)
+    ).isoformat()
+
+    running = db.get_research_tasks(status="running", limit=20)
+    recovered = 0
+    for task in running:
+        updated_at = task.get("updated_at") or ""
+        if updated_at < cutoff:
+            db.update_research_task(task["id"], {
+                "status":       "failed",
+                "modal_job_id": None,
+                "error_log": (
+                    f"Task timed out: still 'running' after "
+                    f"{_RESEARCH_STUCK_TIMEOUT_MINUTES} min "
+                    f"(Modal job likely crashed without updating DB)."
+                ),
+            })
+            recovered += 1
+            log.info("research_task_timeout_recovered task_id=%s", task["id"])
+    return recovered
 
 
 def _retry_failed_research_tasks() -> int:
@@ -784,6 +817,19 @@ def _cleanup_old_failed_strategies() -> int:
     return archived
 
 
+def _is_promising_quick_test(strategy: dict) -> bool:
+    """Return True if quick test showed real trades + meaningful Sharpe on any timeframe.
+
+    Used to distinguish 'optimization problem' from 'genuine bad strategy' when a
+    quality-rejection gate fires after the full backtest pipeline.
+    """
+    tf_data = strategy.get("quick_test_all_timeframes") or {}
+    for m in tf_data.values():
+        if isinstance(m, dict) and m.get("trades", 0) >= 10 and m.get("sharpe", 0) >= 0.3:
+            return True
+    return False
+
+
 def _process_failed_strategies() -> int:
     """
     Inspect recently-failed strategies and attempt automatic recovery.
@@ -813,7 +859,7 @@ def _process_failed_strategies() -> int:
         sb.table("strategies")
         .select("id, name, status, error_log, backtest_code, hypothesis, "
                 "entry_logic, retry_count, auto_fix_count, quick_test_all_timeframes, "
-                "updated_at")
+                "hyperparams, updated_at")
         .eq("status", "failed")
         .lt("updated_at", too_recent_cutoff)   # only strategies that failed >15 min ago
         .order("updated_at", desc=True)
@@ -836,7 +882,58 @@ def _process_failed_strategies() -> int:
         error_class = classify_error(error_log)
 
         if error_class == "quality_rejection":
-            continue  # legitimate failure, leave it
+            # If this strategy looked promising in quick test but failed optimization,
+            # give the optimizer analyst one shot before giving up permanently.
+            # Gate: only on the first failure (retry_count==0) to avoid infinite loops.
+            if retry_count == 0 and _is_promising_quick_test(strategy):
+                from agents.code_fixer import analyze_optimization_failure
+                try:
+                    check_budget("code_fixer")
+                except BudgetExceeded as be:
+                    log.warning("budget_exceeded_opt_analyst",
+                                strategy_id=strategy_id, error=str(be))
+                    continue
+                try:
+                    analysis = analyze_optimization_failure(strategy, error_log)
+                    if analysis and analysis.get("action") == "simplify":
+                        new_hp = analysis.get("hyperparams") or {}
+                        if new_hp:
+                            db.update_strategy(strategy_id, {
+                                "status":         "implemented",
+                                "hyperparams":    new_hp,
+                                "error_log":      None,
+                                "modal_job_id":   None,
+                                "retry_count":    retry_count + 1,
+                                "auto_fix_count": fix_count + 1,
+                            })
+                            add_pipeline_note(
+                                strategy_id,
+                                f"Optimization analyst: param space simplified to "
+                                f"{list(new_hp.keys())} — retrying full backtest. "
+                                f"Original failure: {error_log[:150]}"
+                            )
+                            _dispatch_backtest_job(strategy_id)
+                            log.info("opt_analyst_simplify", strategy_id=strategy_id)
+                            acted += 1
+                            continue
+
+                    # Analyst confirmed rejection (or returned nothing useful)
+                    reason = (analysis or {}).get(
+                        "reason", "Optimization results confirm no generalizable edge."
+                    )
+                    add_pipeline_note(
+                        strategy_id,
+                        f"Optimization analyst: confirmed genuine rejection — {reason}"
+                    )
+                    # Bump retry_count to ceiling so cleanup archives it promptly
+                    db.update_strategy(strategy_id, {
+                        "retry_count": _MAX_AUTO_RETRIES,
+                    })
+                    log.info("opt_analyst_confirmed_rejection", strategy_id=strategy_id)
+                except Exception as exc:
+                    log.error("opt_analyst_error",
+                              strategy_id=strategy_id, error=str(exc))
+            continue  # quality rejection — leave as failed
 
         try:
             if error_class == "infrastructure":
@@ -886,6 +983,15 @@ def _process_failed_strategies() -> int:
                             )
                     if tf_summary:
                         extra_ctx = "Multi-timeframe test results (default params):\n" + "\n".join(tf_summary)
+
+                # For optimization regressions: include the params that caused 0 trades
+                # so the LLM can pinpoint which param value broke the strategy.
+                if "optimization_regression" in error_log.lower():
+                    hyperparams = strategy.get("hyperparams")
+                    if hyperparams:
+                        import json as _json
+                        opt_ctx = f"Failed optimized params (caused 0 trades): {_json.dumps(hyperparams)}"
+                        extra_ctx = f"{extra_ctx}\n{opt_ctx}" if extra_ctx else opt_ctx
 
                 fixed_code = fix_strategy_code(
                     code=code,
@@ -968,6 +1074,7 @@ def process_queue() -> None:
     recovered_ideas       = _recover_stuck_idea_strategies()
     filtered_processed    = _process_filtered_strategies()
     research_unblocked    = _process_awaiting_research_strategies()
+    research_recovered    = _recover_stuck_research_tasks()
     research_retried      = _retry_failed_research_tasks()
     research_generated    = _auto_generate_research_tasks()
     research_dispatched   = _dispatch_pending_research_tasks()
@@ -986,6 +1093,7 @@ def process_queue() -> None:
         recovered_ideas=recovered_ideas,
         filtered_processed=filtered_processed,
         research_unblocked=research_unblocked,
+        research_recovered=research_recovered,
         research_retried=research_retried,
         research_generated=research_generated,
         research_dispatched=research_dispatched,

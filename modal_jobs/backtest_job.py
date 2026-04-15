@@ -525,6 +525,32 @@ def run_backtest_pipeline(strategy_id: str) -> dict:
         )
         db.update_strategy(strategy_id, {"best_timeframe": primary_tf})
 
+        # Early-exit: if optimization found only 0-trade parameter combos, failing here
+        # gives a specific "optimization_regression" error the code_fixer can act on —
+        # much better than letting walk-forward produce a generic quality-rejection message.
+        if best_r["trades"] == 0:
+            quick_test_all = strategy.get("quick_test_all_timeframes") or {}
+            qt_max_trades = max(
+                (m.get("trades", 0) for m in quick_test_all.values() if isinstance(m, dict)),
+                default=0,
+            )
+            reason = (
+                f"optimization_regression: optimizer produced 0 trades with best params "
+                f"{best_params} on {primary_tf}. "
+                f"Quick test had {qt_max_trades} trades with default params. "
+                f"Likely causes: param space too wide (hitting 0-trade regions), "
+                f"NaN indicator values for some param values, or session filter "
+                f"becoming too restrictive with non-default params."
+            )
+            db.update_strategy(strategy_id, {
+                "status":       "failed",
+                "error_log":    reason,
+                "hyperparams":  best_params,
+                "modal_job_id": None,
+            })
+            add_pipeline_note(strategy_id, f"Optimization regression — {reason}")
+            return {"passed": False, "reason": reason}
+
         add_pipeline_note(strategy_id,
             f"Train period: {train_df.index[0].strftime('%Y-%m-%d')} → "
             f"{train_df.index[-1].strftime('%Y-%m-%d')} "

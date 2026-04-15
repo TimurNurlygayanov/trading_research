@@ -70,6 +70,20 @@ async def lifespan(app: FastAPI):
 
     _scheduled_budget_log()
 
+    # Immediately recover research tasks that were stuck when this process died.
+    # Don't wait for the first 10-min queue cycle — do it right now at startup.
+    try:
+        from orchestrator.queue_worker import (
+            _recover_stuck_research_tasks,
+            _dispatch_pending_research_tasks,
+        )
+        recovered = _recover_stuck_research_tasks()
+        if recovered:
+            log.info("startup_research_recovered", count=recovered)
+        _dispatch_pending_research_tasks()
+    except Exception as exc:
+        log.error("startup_research_recovery_failed", error=str(exc))
+
     from datetime import datetime, timedelta
     scheduler.add_job(_scheduled_queue_worker, trigger="interval", minutes=10,
                       id="queue_worker", replace_existing=True,
@@ -77,6 +91,10 @@ async def lifespan(app: FastAPI):
     scheduler.add_job(_scheduled_research_cycle, trigger="interval",
                       hours=int(os.environ.get("RESEARCH_INTERVAL_HOURS", 4)),
                       id="research_cycle", replace_existing=True)
+    # Dedicated research watchdog: runs every 3 min so stuck tasks are caught
+    # well within one Modal timeout window, without running the full queue cycle.
+    scheduler.add_job(_scheduled_research_watchdog, trigger="interval", minutes=3,
+                      id="research_watchdog", replace_existing=True)
     scheduler.add_job(_scheduled_budget_log, trigger="interval", hours=1,
                       id="budget_log", replace_existing=True)
     scheduler.start()
@@ -3393,6 +3411,29 @@ def _scheduled_queue_worker() -> None:
         process_queue()
     except Exception:
         log.error("scheduled_queue_worker_crash", traceback=traceback.format_exc())
+
+
+def _scheduled_research_watchdog() -> None:
+    """
+    Lightweight research health check that runs every 3 minutes.
+    Recovers stuck tasks, retries failed ones, and dispatches any pending ones.
+    Intentionally separate from the full queue cycle so research isn't blocked
+    by slow strategy-processing steps.
+    """
+    try:
+        from orchestrator.queue_worker import (
+            _recover_stuck_research_tasks,
+            _retry_failed_research_tasks,
+            _dispatch_pending_research_tasks,
+        )
+        recovered  = _recover_stuck_research_tasks()
+        retried    = _retry_failed_research_tasks()
+        dispatched = _dispatch_pending_research_tasks()
+        if recovered or retried or dispatched:
+            log.info("research_watchdog", recovered=recovered,
+                     retried=retried, dispatched=dispatched)
+    except Exception:
+        log.error("research_watchdog_failed", traceback=traceback.format_exc())
 
 
 def _scheduled_research_cycle() -> None:
