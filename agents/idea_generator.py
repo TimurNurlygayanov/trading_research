@@ -24,7 +24,6 @@ import time
 import xml.etree.ElementTree as ET
 from typing import Any
 
-import anthropic
 import requests
 from dotenv import load_dotenv
 

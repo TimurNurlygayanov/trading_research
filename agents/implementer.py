@@ -10,7 +10,6 @@ import logging
 import os
 from typing import Any
 
-import anthropic
 from dotenv import load_dotenv
 
 from db import supabase_client as db
@@ -110,7 +109,7 @@ def run_implementer(
 
         response = call_claude(
             model=MODEL,
-            max_tokens=4096,
+            max_tokens=3000,
             system=IMPLEMENTER_SYSTEM,
             messages=messages,
         )

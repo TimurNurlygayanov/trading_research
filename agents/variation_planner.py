@@ -21,7 +21,6 @@ import json
 import logging
 import os
 
-import anthropic
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -250,7 +249,7 @@ def run_variation_planner(
     try:
         r2 = call_claude(
             model=MODEL,
-            max_tokens=6000,
+            max_tokens=3000,
             system=_GENERATE_SYSTEM.format(n=n_extra, knowledge=knowledge_text),
             messages=[{"role": "user", "content": user_msg}],
         )

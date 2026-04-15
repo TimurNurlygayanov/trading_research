@@ -9,7 +9,6 @@ from __future__ import annotations
 import logging
 import os
 
-import anthropic
 from dotenv import load_dotenv
 
 from db import supabase_client as db

@@ -11,7 +11,6 @@ import logging
 import os
 from typing import Any
 
-import anthropic
 from dotenv import load_dotenv
 
 from db import supabase_client as db
@@ -49,7 +48,7 @@ def run_validator(strategy_id: str) -> dict[str, Any]:
     from agents.utils import call_claude
     response = call_claude(
         model=MODEL,
-        max_tokens=4096,
+        max_tokens=2048,
         system=VALIDATOR_SYSTEM,
         messages=[{"role": "user", "content": user_msg}],
     )

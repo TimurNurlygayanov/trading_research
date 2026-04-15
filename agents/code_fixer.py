@@ -19,7 +19,6 @@ import os
 import re
 from typing import Literal
 
-import anthropic
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -360,7 +359,7 @@ def fix_strategy_code(
         from agents.utils import call_claude
         response = call_claude(
             model=MODEL,
-            max_tokens=4096,
+            max_tokens=3000,
             system=_FIX_SYSTEM,
             messages=[{"role": "user", "content": user_msg}],
         )

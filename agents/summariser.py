@@ -10,7 +10,6 @@ import logging
 import os
 from typing import Any
 
-import anthropic
 import boto3
 from botocore.config import Config
 from dotenv import load_dotenv

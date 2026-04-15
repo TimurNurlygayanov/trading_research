@@ -10,7 +10,6 @@ import logging
 import os
 from typing import Any
 
-import anthropic
 from dotenv import load_dotenv
 
 from db import supabase_client as db

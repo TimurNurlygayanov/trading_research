@@ -187,7 +187,7 @@ def _auto_generate_research_tasks() -> int:
     return created
 
 
-_MAX_CONCURRENT_RESEARCH = 2  # cap to avoid Anthropic token rate limits
+_MAX_CONCURRENT_RESEARCH = 1  # one at a time — 8k output tokens/min is too tight for two
 
 
 def _dispatch_pending_research_tasks() -> int:
