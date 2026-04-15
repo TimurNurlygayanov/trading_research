@@ -71,16 +71,19 @@ async def lifespan(app: FastAPI):
     _scheduled_budget_log()
 
     # Immediately recover research tasks that were stuck when this process died.
-    # Don't wait for the first 10-min queue cycle — do it right now at startup.
+    # Full sequence: running→failed, failed→pending, pending→dispatched.
+    # Don't wait for the first 10-min queue cycle.
     try:
         from orchestrator.queue_worker import (
             _recover_stuck_research_tasks,
+            _retry_failed_research_tasks,
             _dispatch_pending_research_tasks,
         )
-        recovered = _recover_stuck_research_tasks()
-        if recovered:
-            log.info("startup_research_recovered", count=recovered)
-        _dispatch_pending_research_tasks()
+        recovered  = _recover_stuck_research_tasks()
+        retried    = _retry_failed_research_tasks()
+        dispatched = _dispatch_pending_research_tasks()
+        log.info("startup_research_recovery",
+                 recovered=recovered, retried=retried, dispatched=dispatched)
     except Exception as exc:
         log.error("startup_research_recovery_failed", error=str(exc))
 
@@ -137,6 +140,31 @@ def health() -> dict:
 # ---------------------------------------------------------------------------
 # Dashboard API
 # ---------------------------------------------------------------------------
+
+@app.post("/api/research/recover")
+def api_research_recover() -> JSONResponse:
+    """
+    Force-recover all stuck research tasks right now.
+    Runs the full sequence: running→failed, failed→pending, pending→dispatched.
+    Call this from the UI or curl whenever tasks are visibly stuck.
+    """
+    try:
+        from orchestrator.queue_worker import (
+            _recover_stuck_research_tasks,
+            _retry_failed_research_tasks,
+            _dispatch_pending_research_tasks,
+        )
+        recovered  = _recover_stuck_research_tasks()
+        retried    = _retry_failed_research_tasks()
+        dispatched = _dispatch_pending_research_tasks()
+        log.info("manual_research_recover",
+                 recovered=recovered, retried=retried, dispatched=dispatched)
+        return JSONResponse({"ok": True, "recovered": recovered,
+                             "retried": retried, "dispatched": dispatched})
+    except Exception as exc:
+        log.error("manual_research_recover_failed", error=str(exc))
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
+
 
 @app.get("/api/stats")
 def api_stats() -> JSONResponse:

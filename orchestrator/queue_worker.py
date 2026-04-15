@@ -103,19 +103,27 @@ def _recover_stuck_research_tasks() -> int:
     """
     Reset research tasks stuck in 'running' back to 'failed' so the retry
     loop can pick them up.  Modal's function timeout is 10 minutes; if a
-    task is still 'running' after 25 minutes the Modal container crashed
-    without updating the DB.
+    task is still 'running' after _RESEARCH_STUCK_TIMEOUT_MINUTES the Modal
+    container crashed without updating the DB.
     """
     from datetime import datetime, timezone, timedelta
+    from dateutil import parser as _dateparser  # already available via pandas dep
 
-    cutoff = (
-        datetime.now(timezone.utc) - timedelta(minutes=_RESEARCH_STUCK_TIMEOUT_MINUTES)
-    ).isoformat()
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=_RESEARCH_STUCK_TIMEOUT_MINUTES)
 
     running = db.get_research_tasks(status="running", limit=20)
+    log.info("research_watchdog_check running_count=%s", len(running))
     recovered = 0
     for task in running:
-        updated_at = task.get("updated_at") or ""
+        updated_at_raw = task.get("updated_at") or task.get("created_at") or ""
+        try:
+            updated_at = _dateparser.parse(updated_at_raw)
+            if updated_at.tzinfo is None:
+                updated_at = updated_at.replace(tzinfo=timezone.utc)
+        except Exception:
+            # Can't parse timestamp — treat as stuck
+            updated_at = datetime.min.replace(tzinfo=timezone.utc)
+
         if updated_at < cutoff:
             db.update_research_task(task["id"], {
                 "status":       "failed",
@@ -127,7 +135,8 @@ def _recover_stuck_research_tasks() -> int:
                 ),
             })
             recovered += 1
-            log.info("research_task_timeout_recovered task_id=%s", task["id"])
+            log.info("research_task_timeout_recovered task_id=%s updated_at=%s",
+                     task["id"], updated_at_raw)
     return recovered
 
 
