@@ -26,6 +26,16 @@ def get_client() -> Client:
     return _client
 
 
+def reset_client() -> None:
+    """Force the next get_client() call to create a fresh Supabase client.
+
+    Call this after catching a connection-level exception to recover from
+    stale sockets or pool exhaustion without restarting the process.
+    """
+    global _client
+    _client = None
+
+
 # ── strategies ──────────────────────────────────────────────────────────────
 
 def insert_strategy(data: dict[str, Any]) -> dict[str, Any]:

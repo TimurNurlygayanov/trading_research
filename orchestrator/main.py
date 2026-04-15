@@ -126,7 +126,8 @@ def health() -> dict:
         today_spend = db.get_daily_spend()
         remaining = get_remaining_budget()
     except Exception as exc:
-        log.warning("health_db_error", error=str(exc))
+        log.warning("health_db_error", error=str(exc), traceback=_traceback.format_exc())
+        db.reset_client()  # force fresh connection on next request
         today_spend = None
         remaining = None
 
@@ -162,7 +163,7 @@ def api_research_recover() -> JSONResponse:
         return JSONResponse({"ok": True, "recovered": recovered,
                              "retried": retried, "dispatched": dispatched})
     except Exception as exc:
-        log.error("manual_research_recover_failed", error=str(exc))
+        log.error("manual_research_recover_failed", error=str(exc), traceback=_traceback.format_exc())
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
 
 
@@ -187,6 +188,7 @@ def api_stats() -> JSONResponse:
         remaining = get_remaining_budget()
     except Exception as exc:
         log.error("api_stats_error", error=str(exc), traceback=_traceback.format_exc())
+        db.reset_client()
         return JSONResponse({"error": str(exc)}, status_code=500)
 
     return JSONResponse({
@@ -245,6 +247,7 @@ def api_restart_strategy(strategy_id: str, background_tasks: BackgroundTasks) ->
                 status_code=400,
             )
     except Exception as exc:
+        log.error("api_restart_strategy_error", strategy_id=strategy_id, error=str(exc), traceback=_traceback.format_exc())
         return JSONResponse({"error": str(exc)}, status_code=500)
 
 
@@ -280,7 +283,7 @@ def api_approve_strategy(strategy_id: str, background_tasks: BackgroundTasks) ->
         log.info("strategy_approved_for_optimization", strategy_id=strategy_id)
         return JSONResponse({"ok": True})
     except Exception as exc:
-        log.error("approve_strategy_error", strategy_id=strategy_id, error=str(exc))
+        log.error("approve_strategy_error", strategy_id=strategy_id, error=str(exc), traceback=_traceback.format_exc())
         return JSONResponse({"error": str(exc)}, status_code=500)
 
 
@@ -322,7 +325,7 @@ async def api_revise_strategy(
                  message=message[:80])
         return JSONResponse({"ok": True, "message": "Revision queued — re-running quick test."})
     except Exception as exc:
-        log.error("revise_strategy_error", strategy_id=strategy_id, error=str(exc))
+        log.error("revise_strategy_error", strategy_id=strategy_id, error=str(exc), traceback=_traceback.format_exc())
         return JSONResponse({"error": str(exc)}, status_code=500)
 
 
@@ -368,7 +371,7 @@ def api_campaign_children(strategy_id: str) -> JSONResponse:
             "passed":     passed,
         })
     except Exception as exc:
-        log.error("api_campaign_children_error", strategy_id=strategy_id, error=str(exc))
+        log.error("api_campaign_children_error", strategy_id=strategy_id, error=str(exc), traceback=_traceback.format_exc())
         return JSONResponse({"error": str(exc)}, status_code=500)
 
 
@@ -407,6 +410,7 @@ def api_retry_strategy(strategy_id: str, background_tasks: BackgroundTasks) -> J
         background_tasks.add_task(_scheduled_queue_worker)
         return JSONResponse({"ok": True, "retry_status": retry_status})
     except Exception as exc:
+        log.error("api_retry_strategy_error", strategy_id=strategy_id, error=str(exc), traceback=_traceback.format_exc())
         return JSONResponse({"error": str(exc)}, status_code=500)
 
 
@@ -515,6 +519,7 @@ async def api_update_strategy(strategy_id: str, request: Request,
         background_tasks.add_task(_scheduled_queue_worker)
         return JSONResponse({"ok": True})
     except Exception as exc:
+        log.error("api_update_strategy_error", strategy_id=strategy_id, error=str(exc), traceback=_traceback.format_exc())
         return JSONResponse({"error": str(exc)}, status_code=500)
 
 
@@ -530,6 +535,7 @@ def api_delete_strategy(strategy_id: str) -> JSONResponse:
         log.info("strategy_deleted", strategy_id=strategy_id)
         return JSONResponse({"ok": True})
     except Exception as exc:
+        log.error("api_delete_strategy_error", strategy_id=strategy_id, error=str(exc), traceback=_traceback.format_exc())
         return JSONResponse({"error": str(exc)}, status_code=500)
 
 
@@ -556,6 +562,7 @@ async def api_add_comment(strategy_id: str, request: Request) -> JSONResponse:
         db.update_strategy(strategy_id, {"comments": existing})
         return JSONResponse({"ok": True, "comments": existing})
     except Exception as exc:
+        log.error("api_add_comment_error", strategy_id=strategy_id, error=str(exc), traceback=_traceback.format_exc())
         return JSONResponse({"error": str(exc)}, status_code=500)
 
 
@@ -567,6 +574,7 @@ async def api_update_tags(strategy_id: str, request: Request) -> JSONResponse:
         db.update_strategy(strategy_id, {"tags": tags})
         return JSONResponse({"ok": True, "tags": tags})
     except Exception as exc:
+        log.error("api_update_tags_error", strategy_id=strategy_id, error=str(exc), traceback=_traceback.format_exc())
         return JSONResponse({"error": str(exc)}, status_code=500)
 
 
@@ -643,6 +651,7 @@ def api_ideas_grouped(limit: int = Query(default=100, le=200)) -> JSONResponse:
 
         return JSONResponse({"ideas": result})
     except Exception as exc:
+        log.error("api_ideas_grouped_error", error=str(exc), traceback=_traceback.format_exc())
         return JSONResponse({"ideas": [], "error": str(exc)}, status_code=500)
 
 
@@ -673,6 +682,7 @@ def api_strategies(
         return JSONResponse({"strategies": result.data or [], "offset": offset, "limit": limit})
     except Exception as exc:
         log.error("api_strategies_error", error=str(exc), traceback=_traceback.format_exc())
+        db.reset_client()
         return JSONResponse({"error": str(exc)}, status_code=500)
 
 
@@ -685,6 +695,7 @@ def api_strategy_detail(strategy_id: str) -> JSONResponse:
             return JSONResponse({"error": "not found"}, status_code=404)
         return JSONResponse(strategy)
     except Exception as exc:
+        log.error("api_strategy_detail_error", strategy_id=strategy_id, error=str(exc), traceback=_traceback.format_exc())
         return JSONResponse({"error": str(exc)}, status_code=500)
 
 
@@ -746,6 +757,7 @@ def api_dismiss_generated_idea(idea_id: str) -> JSONResponse:
         db.update_generated_idea(idea_id, {"status": "dismissed"})
         return JSONResponse({"ok": True})
     except Exception as exc:
+        log.error("api_dismiss_idea_error", idea_id=idea_id, error=str(exc), traceback=_traceback.format_exc())
         return JSONResponse({"error": str(exc)}, status_code=500)
 
 
@@ -774,7 +786,7 @@ def api_data_cache() -> JSONResponse:
         datasets = db.get_data_cache()
         return JSONResponse({"datasets": datasets})
     except Exception as exc:
-        log.error("api_data_cache_error", error=str(exc))
+        log.error("api_data_cache_error", error=str(exc), traceback=_traceback.format_exc())
         return JSONResponse({"error": str(exc)}, status_code=500)
 
 
@@ -785,7 +797,7 @@ def api_data_cache_bars(symbol: str, timeframe: str) -> JSONResponse:
         bars = db.get_data_cache_bars(symbol.upper(), timeframe.lower())
         return JSONResponse({"bars": bars})
     except Exception as exc:
-        log.error("api_data_cache_bars_error", symbol=symbol, error=str(exc))
+        log.error("api_data_cache_bars_error", symbol=symbol, error=str(exc), traceback=_traceback.format_exc())
         return JSONResponse({"error": str(exc)}, status_code=500)
 
 
@@ -2492,7 +2504,7 @@ def submit_idea(
         background_tasks.add_task(_scheduled_queue_worker)
         return RedirectResponse(url="/dashboard", status_code=303)
     except Exception as exc:
-        log.error("idea_submit_failed", error=str(exc))
+        log.error("idea_submit_failed", error=str(exc), traceback=_traceback.format_exc())
         return HTMLResponse(_render_ideas_page(f"Error saving idea: {exc}", "error"))
 
 
@@ -2982,6 +2994,7 @@ def api_generate_research_tasks(background_tasks: BackgroundTasks) -> JSONRespon
         from agents.indicator_researcher import generate_research_tasks
         created = generate_research_tasks()
     except Exception as exc:
+        log.error("api_generate_research_error", error=str(exc), traceback=_traceback.format_exc())
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
     return JSONResponse({"ok": True, "created": created})
 
@@ -3001,6 +3014,7 @@ def api_get_knowledge(
         )
         return JSONResponse({"entries": entries})
     except Exception as exc:
+        log.error("api_knowledge_error", error=str(exc), traceback=_traceback.format_exc())
         return JSONResponse({"entries": [], "error": str(exc)}, status_code=500)
 
 
@@ -3019,6 +3033,7 @@ def api_research_stats() -> JSONResponse:
             "queue_running": len(running_tasks),
         })
     except Exception as exc:
+        log.error("api_research_stats_error", error=str(exc), traceback=_traceback.format_exc())
         return JSONResponse({"total": 0, "error": str(exc)}, status_code=500)
 
 
@@ -3037,6 +3052,7 @@ def api_research_tasks(
         )
         return JSONResponse({"tasks": tasks})
     except Exception as exc:
+        log.error("api_research_tasks_error", error=str(exc), traceback=_traceback.format_exc())
         return JSONResponse({"tasks": [], "error": str(exc)}, status_code=500)
 
 
@@ -3439,6 +3455,7 @@ def _scheduled_queue_worker() -> None:
         process_queue()
     except Exception:
         log.error("scheduled_queue_worker_crash", traceback=traceback.format_exc())
+        db.reset_client()  # stale connection may have caused the crash; reset for next cycle
 
 
 def _scheduled_research_watchdog() -> None:
@@ -3487,7 +3504,8 @@ def _scheduled_budget_log() -> None:
             limit_usd=max_spend,
         )
     except Exception as exc:
-        log.warning("budget_log_failed", error=str(exc))
+        log.warning("budget_log_failed", error=str(exc), traceback=traceback.format_exc())
+        db.reset_client()
 
 
 
