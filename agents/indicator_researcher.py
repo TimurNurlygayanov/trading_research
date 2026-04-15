@@ -859,8 +859,12 @@ def _insert_proposals(proposals: list[dict], existing_titles: set[str], tag: str
     return created
 
 
-def _call_llm_for_specs(prompt: str, max_tokens: int = 3000) -> list[dict]:
-    """Call Claude and parse the JSON array response."""
+def _call_llm_for_specs(prompt: str, max_tokens: int = 6000) -> list[dict]:
+    """Call Claude and parse the JSON array response.
+
+    If the response is truncated (hits max_tokens), salvage any complete JSON
+    objects from the prefix of the array rather than returning nothing.
+    """
     from agents.utils import call_claude
     response = call_claude(
         model=MODEL,
@@ -876,7 +880,33 @@ def _call_llm_for_specs(prompt: str, max_tokens: int = 3000) -> list[dict]:
     try:
         return json.loads(raw)
     except Exception as exc:
+        # Try to salvage complete objects from a truncated array.
+        # Walk backwards from the last complete '}' and close the array.
+        salvaged = _salvage_partial_json_array(raw)
+        if salvaged:
+            log.warning(
+                "llm_spec_parse_failed_salvaged error=%s salvaged=%s",
+                exc, len(salvaged),
+            )
+            return salvaged
         log.warning("llm_spec_parse_failed error=%s raw=%s", exc, raw[:300])
+        return []
+
+
+def _salvage_partial_json_array(raw: str) -> list[dict]:
+    """Extract valid JSON objects from a truncated JSON array string."""
+    # Find the last complete '}' in the string, then close the array after it.
+    last_brace = raw.rfind("}")
+    if last_brace == -1:
+        return []
+    candidate = raw[: last_brace + 1].rstrip().rstrip(",") + "\n]"
+    # Make sure it starts with '['
+    if not candidate.lstrip().startswith("["):
+        candidate = "[" + candidate
+    try:
+        result = json.loads(candidate)
+        return result if isinstance(result, list) else []
+    except Exception:
         return []
 
 
@@ -925,7 +955,7 @@ Respond ONLY with a JSON array. Each element:
 
 No markdown, no explanation — raw JSON array only."""
 
-    proposals = _call_llm_for_specs(prompt, max_tokens=3000)
+    proposals = _call_llm_for_specs(prompt, max_tokens=6000)
     created = _insert_proposals(proposals, existing_titles, "llm")
     log.info("llm_combo_tasks_created created=%s requested=%s", created, n)
     return created
@@ -980,7 +1010,7 @@ Respond ONLY with a JSON array. Each element:
 
 No markdown, no explanation — raw JSON only."""
 
-    proposals = _call_llm_for_specs(prompt, max_tokens=3000)
+    proposals = _call_llm_for_specs(prompt, max_tokens=6000)
     created = _insert_proposals(proposals, existing_titles, "sweep")
     log.info("param_sweep_tasks_created created=%s", created)
     return created
