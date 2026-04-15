@@ -92,6 +92,8 @@ def run_pre_filter(strategy_id: str) -> dict[str, Any]:
     # Apply user bonus
     if strategy.get("source") == "user":
         result["score"] = min(10.0, result.get("score", 0) + 2.0)
+        if not isinstance(result.get("score_breakdown"), dict):
+            result["score_breakdown"] = {}
         result["score_breakdown"]["user_bonus"] = 2
 
     score = float(result.get("score", 0))
