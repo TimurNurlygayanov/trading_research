@@ -2588,6 +2588,15 @@ _RESEARCH_HTML = r"""<!DOCTYPE html>
   .btn-secondary { background: #1e2533; border: 1px solid #374151; border-radius: 8px;
                    color: #94a3b8; font-size: 0.85rem; padding: 8px 16px; cursor: pointer; }
   .btn-secondary:hover { color: #f1f5f9; border-color: #6366f1; }
+  .btn-act { border: none; border-radius: 5px; font-size: 0.72rem; font-weight: 600;
+             padding: 3px 8px; cursor: pointer; margin-right: 4px; white-space: nowrap; }
+  .btn-act-warn   { background: #3b2f00; color: #fcd34d; }
+  .btn-act-warn:hover   { background: #4d3d00; }
+  .btn-act-green  { background: #14532d; color: #86efac; }
+  .btn-act-green:hover  { background: #166534; }
+  .btn-act-danger { background: #7f1d1d; color: #fca5a5; }
+  .btn-act-danger:hover { background: #991b1b; }
+  .kb-actions { display: flex; gap: 4px; margin-top: 6px; }
 
   .empty   { text-align: center; padding: 60px 0; color: #475569; font-size: 0.9rem; }
   .loading { text-align: center; padding: 40px 0; color: #475569; }
@@ -2640,10 +2649,10 @@ _RESEARCH_HTML = r"""<!DOCTYPE html>
 
   <!-- Knowledge base -->
   <div class="filter-bar">
-    <button class="filter-chip all active" onclick="setFilter('all',this)">All</button>
-    <button class="filter-chip works"   onclick="setFilter('works',this)">Works</button>
-    <button class="filter-chip fails"   onclick="setFilter('fails',this)">Fails</button>
-    <button class="filter-chip partial" onclick="setFilter('partial',this)">Partial</button>
+    <button class="filter-chip all"          onclick="setFilter('all',this)">All</button>
+    <button class="filter-chip works active" onclick="setFilter('works',this)">Works</button>
+    <button class="filter-chip fails"        onclick="setFilter('fails',this)">Fails</button>
+    <button class="filter-chip partial"      onclick="setFilter('partial',this)">Partial</button>
     <input class="search-input" id="search" placeholder="Filter by indicator…"
            oninput="onSearch()" />
   </div>
@@ -2653,7 +2662,7 @@ _RESEARCH_HTML = r"""<!DOCTYPE html>
   <div class="section-hdr" style="margin-top:40px">
     Research Queue
     <span style="font-size:0.78rem;font-weight:400;color:#475569">
-      (latest 30 indicator research tasks)
+      (pending &amp; running)
     </span>
   </div>
   <div id="queue-wrap" class="loading">Loading…</div>
@@ -2687,12 +2696,14 @@ _RESEARCH_HTML = r"""<!DOCTYPE html>
 </div>
 
 <script>
-let allEntries = [];
-let currentCat = 'all';
+// Per-category cache. Fetched on first use; 'all' is derived from the others.
+const LIMITS = { works: 100, partial: 20, fails: 20 };
+const _cache = {};   // { works: [...], partial: [...], fails: [...] }
+let currentCat = 'works';
 let searchVal  = '';
 
 async function init() {
-  await Promise.all([loadStats(), loadKnowledge(), loadQueue()]);
+  await Promise.all([loadStats(), loadCategory('works'), loadQueue()]);
 }
 
 async function loadStats() {
@@ -2708,32 +2719,50 @@ async function loadStats() {
   } catch(e) {}
 }
 
-async function loadKnowledge() {
+// Fetch a single category if not already cached; re-renders after load.
+async function loadCategory(cat) {
+  if (_cache[cat]) { renderKnowledge(); return; }
   try {
-    const r = await fetch('/api/knowledge?limit=100');
+    const r = await fetch(`/api/knowledge?category=${cat}&limit=${LIMITS[cat] || 20}`);
     const d = await r.json();
-    allEntries = d.entries || [];
+    _cache[cat] = d.entries || [];
     renderKnowledge();
   } catch(e) {
     document.getElementById('kb-grid').innerHTML = '<div class="empty">Failed to load knowledge base.</div>';
   }
 }
 
+// Called when user clicks a filter chip.
+async function setFilter(cat, btn) {
+  currentCat = cat;
+  document.querySelectorAll('.filter-chip').forEach(c => c.classList.remove('active'));
+  btn.classList.add('active');
+  if (cat === 'all') {
+    // Load any missing categories in parallel, then render.
+    const needed = ['works','partial','fails'].filter(c => !_cache[c]);
+    await Promise.all(needed.map(c => loadCategory(c)));
+    renderKnowledge();
+  } else {
+    await loadCategory(cat);
+  }
+}
+
+// Return the entries currently relevant given currentCat.
+function currentEntries() {
+  if (currentCat === 'all') {
+    return [...(_cache.works||[]), ...(_cache.partial||[]), ...(_cache.fails||[])];
+  }
+  return _cache[currentCat] || [];
+}
+
 async function loadQueue() {
   try {
-    const r = await fetch('/api/research/tasks?type=indicator_research&limit=30');
+    const r = await fetch('/api/research/tasks?type=indicator_research&status=active&limit=50');
     const d = await r.json();
     renderQueue(d.tasks || []);
   } catch(e) {
     document.getElementById('queue-wrap').innerHTML = '<div class="empty">Failed to load queue.</div>';
   }
-}
-
-function setFilter(cat, btn) {
-  currentCat = cat;
-  document.querySelectorAll('.filter-chip').forEach(c => c.classList.remove('active'));
-  btn.classList.add('active');
-  renderKnowledge();
 }
 
 function onSearch() {
@@ -2743,16 +2772,15 @@ function onSearch() {
 
 function renderKnowledge() {
   const el = document.getElementById('kb-grid');
-  let entries = allEntries;
-  if (currentCat !== 'all') entries = entries.filter(e => e.category === currentCat);
-  if (searchVal)             entries = entries.filter(e =>
+  let entries = currentEntries();
+  if (searchVal) entries = entries.filter(e =>
     (e.indicator || '').toLowerCase().includes(searchVal) ||
     (e.summary   || '').toLowerCase().includes(searchVal));
 
   if (!entries.length) {
     el.className = '';
     el.innerHTML = '<div class="empty">No entries match the current filter.<br>'
-      + (allEntries.length === 0 ? 'Click "Run indicator research" to generate and queue tests.' : '') + '</div>';
+      + (Object.keys(_cache).length === 0 ? 'Click "Run indicator research" to generate and queue tests.' : '') + '</div>';
     return;
   }
   el.className = 'kb-grid';
@@ -2785,6 +2813,10 @@ function renderCard(e) {
   </div>
   <div class="kb-summary">${summary}</div>
   <div style="font-size:.68rem;color:#374151;margin-top:2px">${ts}</div>
+  <div class="kb-actions">
+    <button class="btn-act btn-act-green" onclick="kbToStrategy('${e.id}',this)">→ Strategy</button>
+    <button class="btn-act btn-act-danger" onclick="deleteKb('${e.id}',this)">✕ Delete</button>
+  </div>
 </div>`;
 }
 
@@ -2795,26 +2827,29 @@ function renderQueue(tasks) {
   const el = document.getElementById('queue-wrap');
   if (!tasks.length) {
     el.className = '';
-    el.innerHTML = '<div class="empty">No indicator research tasks yet.<br>Click "Run indicator research" to generate them.</div>';
+    el.innerHTML = '<div class="empty">No pending or running tasks.</div>';
     return;
   }
   el.className = '';
   const rows = tasks.map((t, i) => {
-    const status  = t.status || 'pending';
-    const title   = (t.title || '').replace('[Indicator] ', '');
-    const ts      = (t.created_at || '').slice(0, 16).replace('T', ' ');
-    const summary = esc((t.result_summary || '').slice(0, 100) + (t.result_summary && t.result_summary.length > 100 ? '…' : ''));
-    return `<tr onclick="openTaskModal(${i})" title="Click to view details">
-      <td class="q-title">${esc(title)}</td>
-      <td><span class="q-status qs-${status}">${status}</span></td>
-      <td>${summary}</td>
-      <td style="white-space:nowrap;color:#374151">${ts}</td>
+    const status = t.status || 'pending';
+    const title  = (t.title || '').replace('[Indicator] ', '');
+    const ts     = (t.created_at || '').slice(0, 16).replace('T', ' ');
+    return `<tr>
+      <td class="q-title" onclick="openTaskModal(${i})" style="cursor:pointer">${esc(title)}</td>
+      <td onclick="openTaskModal(${i})" style="cursor:pointer"><span class="q-status qs-${status}">${status}</span></td>
+      <td style="white-space:nowrap;color:#374151" onclick="openTaskModal(${i})" style="cursor:pointer">${ts}</td>
+      <td style="white-space:nowrap">
+        <button class="btn-act btn-act-warn"   onclick="restartTask('${t.id}')"        title="Re-queue">↺ Restart</button>
+        <button class="btn-act btn-act-green"  onclick="taskToStrategy('${t.id}',this)" title="Convert to strategy">→ Strategy</button>
+        <button class="btn-act btn-act-danger" onclick="deleteTask('${t.id}',this)"    title="Delete">✕</button>
+      </td>
     </tr>`;
   }).join('');
   el.innerHTML = `
 <table class="queue-table">
   <thead><tr>
-    <th>Indicator / Signal</th><th>Status</th><th>Summary</th><th>Created</th>
+    <th>Indicator / Signal</th><th>Status</th><th>Created</th><th>Actions</th>
   </tr></thead>
   <tbody>${rows}</tbody>
 </table>`;
@@ -2889,6 +2924,62 @@ async function generateTasks() {
   } finally {
     btn.disabled = false;
     btn.textContent = '⚗ Run indicator research';
+  }
+}
+
+async function restartTask(id) {
+  const r = await fetch(`/api/research/tasks/${id}/restart`, {method:'POST'});
+  const d = await r.json();
+  if (d.ok) { showToast('Task re-queued'); loadQueue(); }
+  else showToast(d.error || 'Failed', true);
+}
+
+async function deleteTask(id, btn) {
+  if (!confirm('Delete this research task?')) return;
+  btn.disabled = true;
+  const r = await fetch(`/api/research/tasks/${id}`, {method:'DELETE'});
+  const d = await r.json();
+  if (d.ok) { showToast('Deleted'); loadQueue(); }
+  else { showToast(d.error || 'Failed', true); btn.disabled = false; }
+}
+
+async function taskToStrategy(id, btn) {
+  btn.disabled = true;
+  btn.textContent = '…';
+  const r = await fetch(`/api/research/tasks/${id}/to-strategy`, {method:'POST'});
+  const d = await r.json();
+  if (d.ok) showToast('Strategy idea created — check the Ideas queue');
+  else showToast(d.error || 'Failed', true);
+  btn.disabled = false;
+  btn.textContent = '→ Strategy';
+}
+
+async function kbToStrategy(id, btn) {
+  btn.disabled = true;
+  btn.textContent = '…';
+  const r = await fetch(`/api/knowledge/${id}/to-strategy`, {method:'POST'});
+  const d = await r.json();
+  if (d.ok) showToast('Strategy idea created — check the Ideas queue');
+  else showToast(d.error || 'Failed', true);
+  btn.disabled = false;
+  btn.textContent = '→ Strategy';
+}
+
+async function deleteKb(id, btn) {
+  if (!confirm('Delete this knowledge entry?')) return;
+  btn.disabled = true;
+  const r = await fetch(`/api/knowledge/${id}`, {method:'DELETE'});
+  const d = await r.json();
+  if (d.ok) {
+    // Remove from cache and re-render without a new network request.
+    for (const cat of Object.keys(_cache)) {
+      _cache[cat] = _cache[cat].filter(e => e.id !== id);
+    }
+    showToast('Deleted');
+    renderKnowledge();
+  } else {
+    showToast(d.error || 'Failed', true);
+    btn.disabled = false;
   }
 }
 
@@ -2991,6 +3082,77 @@ def api_research_tasks(
     except Exception as exc:
         log.error("api_research_tasks_error", error=str(exc), traceback=_traceback.format_exc())
         return JSONResponse({"tasks": [], "error": str(exc)}, status_code=500)
+
+
+@app.delete("/api/research/tasks/{task_id}")
+def api_delete_research_task(task_id: str) -> JSONResponse:
+    try:
+        db.delete_research_task(task_id)
+        return JSONResponse({"ok": True})
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+@app.post("/api/research/tasks/{task_id}/restart")
+def api_restart_research_task(task_id: str) -> JSONResponse:
+    try:
+        db.update_research_task(task_id, {
+            "status": "pending",
+            "error_log": None,
+            "modal_job_id": None,
+        })
+        return JSONResponse({"ok": True})
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+@app.post("/api/research/tasks/{task_id}/to-strategy")
+def api_research_task_to_strategy(task_id: str) -> JSONResponse:
+    try:
+        task = db.get_research_task(task_id)
+        if not task:
+            return JSONResponse({"error": "not found"}, status_code=404)
+        title = (task.get("title") or task.get("question") or "Research finding")[:80]
+        summary = task.get("result_summary") or ""
+        description = f"Based on research finding: {title}\n\n{summary}".strip()[:2000]
+        idea = db.insert_user_idea(title=title, description=description, priority=3)
+        return JSONResponse({"ok": True, "idea_id": idea["id"]})
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+@app.delete("/api/knowledge/{entry_id}")
+def api_delete_knowledge_entry(entry_id: str) -> JSONResponse:
+    try:
+        db.delete_knowledge_entry(entry_id)
+        return JSONResponse({"ok": True})
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+@app.post("/api/knowledge/{entry_id}/to-strategy")
+def api_knowledge_to_strategy(entry_id: str) -> JSONResponse:
+    try:
+        sb = db.get_client()
+        result = sb.table("knowledge_base").select("*").eq("id", entry_id).execute()
+        if not result.data:
+            return JSONResponse({"error": "not found"}, status_code=404)
+        e = result.data[0]
+        ind     = e.get("indicator") or "Unknown indicator"
+        tf      = e.get("timeframe") or ""
+        asset   = e.get("asset") or ""
+        summary = e.get("summary") or ""
+        sharpe  = e.get("sharpe_ref")
+        title   = f"{ind}{' ' + tf if tf else ''}{' on ' + asset if asset else ''}"[:80]
+        sharpe_str = f" (Sharpe {sharpe:+.2f})" if sharpe is not None else ""
+        description = (
+            f"Research finding: {title}{sharpe_str}\n\n{summary}\n\n"
+            "Convert this research finding into a complete backtestable trading strategy."
+        ).strip()[:2000]
+        idea = db.insert_user_idea(title=title, description=description, priority=3)
+        return JSONResponse({"ok": True, "idea_id": idea["id"]})
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=500)
 
 
 # ---------------------------------------------------------------------------

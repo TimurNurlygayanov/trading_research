@@ -269,15 +269,38 @@ def get_research_tasks(
     # Exclude report_text and generated_code — they can be 10-50 KB each and are
     # not needed for list views. Use get_research_task() for full single-row data.
     q = sb.table("research_tasks").select(
-        "id, title, type, status, question, result_summary, "
+        "id, title, type, status, question, result_summary, error_log, "
         "key_findings, research_spec, retry_count, created_at, updated_at"
     )
-    if status != "all":
+    if status == "active":
+        q = q.in_("status", ["pending", "running"])
+    elif status != "all":
         q = q.eq("status", status)
     if task_type:
         q = q.eq("type", task_type)
     result = q.order("created_at", desc=True).limit(limit).execute()
     return result.data or []
+
+
+def delete_research_task(task_id: str) -> None:
+    sb = get_client()
+    sb.table("research_tasks").delete().eq("id", task_id).execute()
+
+
+def delete_knowledge_entry(entry_id: str) -> None:
+    sb = get_client()
+    sb.table("knowledge_base").delete().eq("id", entry_id).execute()
+
+
+def insert_user_idea(title: str, description: str, priority: int = 5) -> dict[str, Any]:
+    sb = get_client()
+    result = sb.table("user_ideas").insert({
+        "title": title,
+        "description": description,
+        "status": "pending",
+        "priority": priority,
+    }).execute()
+    return result.data[0]
 
 
 def get_knowledge_entries(
