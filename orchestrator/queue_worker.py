@@ -212,7 +212,9 @@ def _dispatch_pending_research_tasks() -> int:
         task_type = task.get("type", "market_analysis")
         try:
             import modal
-            if task_type == "indicator_research":
+            # indicator_research requires a research_spec; fall back to the
+            # general researcher if one is missing (handles misrouted tasks).
+            if task_type == "indicator_research" and task.get("research_spec"):
                 fn_name = "run_indicator_research_task"
             else:
                 fn_name = "run_research_task"
