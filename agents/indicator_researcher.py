@@ -660,7 +660,7 @@ def generate_research_tasks(limit: int = len(INDICATOR_SPECS)) -> int:
     """
     from db import supabase_client as db
 
-    existing = db.get_research_tasks(status="all", limit=500, task_type="indicator_research")
+    existing = db.get_research_tasks(status="all", limit=2000, task_type="indicator_research")
     existing_titles = {t["title"] for t in existing}
 
     created = 0
@@ -711,8 +711,13 @@ def generate_llm_combo_tasks(n: int = 15) -> int:
     fails_summary = ", ".join(e["indicator"] for e in fails) or "none yet"
 
     # What titles already exist (to avoid duplicates)
-    existing = db.get_research_tasks(status="all", limit=1000, task_type="indicator_research")
+    existing = db.get_research_tasks(status="all", limit=2000, task_type="indicator_research")
     existing_titles = {t["title"].lower() for t in existing}
+    # Strip the "[Indicator] " prefix for a cleaner list to show the LLM
+    existing_titles_display = sorted(
+        t["title"].removeprefix("[Indicator] ")
+        for t in existing
+    )[:100]  # cap to keep prompt size reasonable
 
     prompt = f"""You are a quantitative FX/commodities researcher.
 
@@ -721,6 +726,9 @@ Based on statistical forward-return tests on EURUSD and XAUUSD (1h, 4h), here is
 INDICATORS WITH EDGE: {works_summary}
 
 INDICATORS THAT FAILED: {fails_summary}
+
+ALREADY RESEARCHED (do NOT propose anything that overlaps with these):
+{chr(10).join(f"- {t}" for t in existing_titles_display)}
 
 Generate exactly {n} NEW indicator combination ideas to test next. Aim for:
 - Novel combos not obviously covered above

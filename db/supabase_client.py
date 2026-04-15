@@ -227,8 +227,14 @@ def get_data_cache_bars(symbol: str, timeframe: str) -> list[dict[str, Any]]:
 
 # ── research_tasks ───────────────────────────────────────────────────────────
 
-def insert_research_task(data: dict[str, Any]) -> dict[str, Any]:
+def insert_research_task(data: dict[str, Any]) -> dict[str, Any] | None:
+    """Insert a research task, skipping silently if the title already exists."""
     sb = get_client()
+    title = data.get("title", "")
+    if title:
+        existing = sb.table("research_tasks").select("id").eq("title", title).limit(1).execute()
+        if existing.data:
+            return None  # duplicate — caller should treat None as "already exists"
     result = sb.table("research_tasks").insert(data).execute()
     return result.data[0]
 
