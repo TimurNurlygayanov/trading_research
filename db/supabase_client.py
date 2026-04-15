@@ -266,7 +266,12 @@ def get_research_tasks(
     task_type: str | None = None,
 ) -> list[dict[str, Any]]:
     sb = get_client()
-    q = sb.table("research_tasks").select("*")
+    # Exclude report_text and generated_code — they can be 10-50 KB each and are
+    # not needed for list views. Use get_research_task() for full single-row data.
+    q = sb.table("research_tasks").select(
+        "id, title, type, status, question, result_summary, "
+        "key_findings, research_spec, retry_count, created_at, updated_at"
+    )
     if status != "all":
         q = q.eq("status", status)
     if task_type:

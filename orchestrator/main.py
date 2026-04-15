@@ -2305,9 +2305,7 @@ async function saveAndRetry(id) {
 // Close panel on Escape
 document.addEventListener('keydown', e => { if (e.key === 'Escape') closePanel(); });
 
-// Auto-refresh every 30s
 loadAll();
-setInterval(loadAll, 30000);
 // Open ideas view if URL hash says so
 if (location.hash === '#ideas') setView('ideas');
 </script>
@@ -2370,13 +2368,6 @@ _IDEAS_HTML = """<!DOCTYPE html>
            font-size: 0.9rem; font-weight: 500; }
   .flash.success { background: #14532d; border: 1px solid #16a34a; color: #bbf7d0; }
   .flash.error   { background: #450a0a; border: 1px solid #dc2626; color: #fecaca; }
-  .feed-hdr { font-size: .75rem; font-weight: 600; color: #475569;
-              text-transform: uppercase; letter-spacing: .07em; margin: 0 0 14px; }
-  .feed-row { background: #1e2533; border: 1px solid #2d3748;
-              border-radius: 10px; padding: 14px 18px; margin-bottom: 10px; }
-  .feed-title { font-weight: 600; color: #f1f5f9; font-size: .95rem; }
-  .feed-desc  { color: #94a3b8; font-size: .82rem; margin: 4px 0; }
-  .feed-meta  { font-size: .75rem; color: #475569; }
   .badge { display: inline-block; padding: 2px 9px; border-radius: 99px;
            font-size: .72rem; font-weight: 600; margin-left: 8px; vertical-align: middle; }
   .badge-pending   { background: #1e3a5f; color: #93c5fd; }
@@ -2412,7 +2403,6 @@ _IDEAS_HTML = """<!DOCTYPE html>
     </form>
   </div>
 
-  {feed_section}
 </div>
 </body>
 </html>"""
@@ -2420,59 +2410,7 @@ _IDEAS_HTML = """<!DOCTYPE html>
 
 def _render_ideas_page(flash: str = "", flash_type: str = "") -> str:
     flash_html = f'<div class="flash {flash_type}">{flash}</div>' if flash else ""
-
-    feed_items = ""
-    try:
-        sb = db.get_client()
-        # Recent strategy ideas (user_ideas inbox)
-        idea_rows = (
-            sb.table("user_ideas")
-            .select("id, title, description, status, created_at")
-            .order("created_at", desc=True)
-            .limit(15)
-            .execute()
-        ).data or []
-        for r in idea_rows:
-            ts = (r.get("created_at") or "")[:10]
-            preview = (r.get("description") or "")[:100].replace("<", "&lt;")
-            if len(r.get("description") or "") > 100:
-                preview += "…"
-            badge = f'<span class="badge badge-{r["status"]}">{r["status"]}</span>'
-            feed_items += f"""<div class="feed-row">
-              <div class="feed-title"><span class="type-strategy">strategy</span> {badge}</div>
-              <div class="feed-desc">{preview}</div>
-              <div class="feed-meta">{ts}</div>
-            </div>"""
-    except Exception:
-        pass
-
-    try:
-        tasks = db.get_research_tasks(status="all", limit=15)
-        for t in tasks:
-            ts = (t.get("created_at") or "")[:10]
-            preview = (t.get("result_summary") or t.get("question") or "")[:100].replace("<", "&lt;")
-            if len(preview) == 100:
-                preview += "…"
-            status = t.get("status", "pending")
-            badge = f'<span class="badge badge-{status}">{status}</span>'
-            feed_items += f"""<div class="feed-row">
-              <div class="feed-title"><span class="type-research">research</span>
-                {(t.get("title") or "")[:70]} {badge}</div>
-              <div class="feed-desc">{preview}</div>
-              <div class="feed-meta">{ts}</div>
-            </div>"""
-    except Exception:
-        pass
-
-    feed_section = ""
-    if feed_items:
-        feed_section = f'<div class="feed-hdr">Recent Submissions</div>{feed_items}'
-
-    return (
-        _IDEAS_HTML
-        .replace("{flash}", flash_html)
-        .replace("{feed_section}", feed_section)
-    )
+    return _IDEAS_HTML.replace("{flash}", flash_html)
 
 
 @app.get("/ideas", response_class=HTMLResponse)
@@ -2755,7 +2693,6 @@ let searchVal  = '';
 
 async function init() {
   await Promise.all([loadStats(), loadKnowledge(), loadQueue()]);
-  setInterval(init, 30000);
 }
 
 async function loadStats() {
@@ -2773,7 +2710,7 @@ async function loadStats() {
 
 async function loadKnowledge() {
   try {
-    const r = await fetch('/api/knowledge?limit=300');
+    const r = await fetch('/api/knowledge?limit=100');
     const d = await r.json();
     allEntries = d.entries || [];
     renderKnowledge();
