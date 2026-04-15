@@ -359,3 +359,63 @@ def get_daily_spend(for_date: date | None = None) -> float:
         .execute()
     )
     return sum(row["cost_usd"] for row in result.data)
+
+
+# ── indicator_library ────────────────────────────────────────────────────────
+
+def save_to_indicator_library(
+    spec_id: str,
+    name: str,
+    display_name: str,
+    category: str,
+    description: str,
+    code: str,
+    best_params: dict,
+    best_sharpe: float | None,
+    source_task_id: str,
+) -> None:
+    sb = get_client()
+    sb.table("indicator_library").upsert({
+        "spec_id": spec_id,
+        "name": name,
+        "display_name": display_name,
+        "category": category,
+        "description": description,
+        "code": code,
+        "best_params": best_params,
+        "best_sharpe": best_sharpe,
+        "source_task_id": source_task_id,
+    }, on_conflict="spec_id").execute()
+
+
+def get_indicator_library(category: str | None = None, limit: int = 200) -> list[dict]:
+    sb = get_client()
+    q = sb.table("indicator_library").select(
+        "id, spec_id, name, display_name, category, description, best_params, best_sharpe, created_at"
+    )
+    if category:
+        q = q.eq("category", category)
+    result = q.order("best_sharpe", desc=True, nullsfirst=False).limit(limit).execute()
+    return result.data or []
+
+
+def get_indicator_code(spec_id: str) -> str | None:
+    sb = get_client()
+    result = sb.table("indicator_library").select("code").eq("spec_id", spec_id).execute()
+    return result.data[0]["code"] if result.data else None
+
+
+# ── system_config ────────────────────────────────────────────────────────────
+
+def get_config(key: str) -> str | None:
+    sb = get_client()
+    result = sb.table("system_config").select("value").eq("key", key).execute()
+    return result.data[0]["value"] if result.data else None
+
+
+def set_config(key: str, value: str) -> None:
+    sb = get_client()
+    sb.table("system_config").upsert(
+        {"key": key, "value": value, "updated_at": datetime.utcnow().isoformat()},
+        on_conflict="key",
+    ).execute()

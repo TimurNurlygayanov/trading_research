@@ -376,3 +376,38 @@ CREATE POLICY allow_all ON user_ideas       FOR ALL USING (true) WITH CHECK (tru
 CREATE POLICY allow_all ON generated_ideas  FOR ALL USING (true) WITH CHECK (true);
 CREATE POLICY allow_all ON knowledge_base   FOR ALL USING (true) WITH CHECK (true);
 CREATE POLICY allow_all ON spend_log        FOR ALL USING (true) WITH CHECK (true);
+
+-- =============================================================================
+-- Table: indicator_library  (reusable indicator implementations from research)
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS indicator_library (
+  id             uuid         PRIMARY KEY DEFAULT gen_random_uuid(),
+  spec_id        text         UNIQUE NOT NULL,   -- matches research_spec.spec_id
+  name           text         NOT NULL,          -- indicator family name, e.g. "wick_ratio"
+  display_name   text         NOT NULL,          -- human title
+  category       text         NOT NULL,          -- momentum/trend/volatility/volume/structure/custom
+  description    text,                           -- ENTRY/STOP/RR/EXIT spec description
+  code           text,                           -- full analyze_indicator(df, **params) function
+  best_params    jsonb,                          -- optimal params found during research
+  best_sharpe    float,                          -- best sharpe_ref from knowledge_base
+  source_task_id uuid         REFERENCES research_tasks(id) ON DELETE SET NULL,
+  created_at     timestamptz  NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_indicator_library_category ON indicator_library(category);
+CREATE INDEX IF NOT EXISTS idx_indicator_library_name     ON indicator_library(name);
+
+ALTER TABLE indicator_library ENABLE ROW LEVEL SECURITY;
+CREATE POLICY allow_all ON indicator_library FOR ALL USING (true) WITH CHECK (true);
+
+-- =============================================================================
+-- Table: system_config  (single-row key/value store for persistent system state)
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS system_config (
+  key        text PRIMARY KEY,
+  value      text,
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+
+ALTER TABLE system_config ENABLE ROW LEVEL SECURITY;
+CREATE POLICY allow_all ON system_config FOR ALL USING (true) WITH CHECK (true);

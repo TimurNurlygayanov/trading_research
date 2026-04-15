@@ -24,7 +24,7 @@ from backtest.leakage_detector import check_leakage
 load_dotenv()
 log = logging.getLogger(__name__)
 
-MODEL = "claude-opus-4-5"  # Highest quality for code generation — fewer retries saves total cost
+MODEL = "claude-sonnet-4-6"  # Detailed template + leakage detector backstop → Sonnet quality is sufficient; 5× cheaper than Opus
 MAX_RETRIES = 2
 MIN_LEAKAGE_SCORE = 7.0
 
@@ -61,6 +61,9 @@ def run_implementer(
     knowledge = db.get_knowledge_summary(limit=20)
     knowledge_text = _format_knowledge(knowledge)
 
+    library = db.get_indicator_library(limit=50)
+    library_text = _format_indicator_library(library)
+
     pre_filter_data = _parse_pre_filter_notes(strategy.get("pre_filter_notes", ""))
 
     def _esc(s: str) -> str:
@@ -81,6 +84,7 @@ def run_implementer(
             timeframes=", ".join(pre_filter_data.get("suggested_timeframes", ["1h", "4h"])),
             symbols=", ".join(pre_filter_data.get("suggested_symbols", ["EURUSD", "GBPUSD"])),
             knowledge_base_context=knowledge_text,
+            indicator_library_context=library_text,
         )
     else:
         user_msg = IMPLEMENTER_USER_TEMPLATE.format(
@@ -93,6 +97,7 @@ def run_implementer(
             symbols=", ".join(pre_filter_data.get("suggested_symbols", ["EURUSD", "GBPUSD"])),
             knowledge_base_context=knowledge_text,
             research_context=research_context,
+            indicator_library_context=library_text,
         )
 
     from agents.utils import call_claude
@@ -358,6 +363,21 @@ def _create_research_tasks(strategy_id: str, tasks_raw: list[dict]) -> list[str]
         # Tasks remain in 'pending' — queue worker will retry dispatch
 
     return task_ids
+
+
+def _format_indicator_library(entries: list[dict]) -> str:
+    if not entries:
+        return "No indicator library entries yet."
+    lines = ["Available indicator implementations (inline the code directly, do not import):"]
+    for e in entries:
+        sharpe_str = f" | best_sharpe={e['best_sharpe']:.2f}" if e.get("best_sharpe") else ""
+        lines.append(
+            f"- [{e['category']}] {e['display_name']} (spec_id={e['spec_id']}{sharpe_str}): "
+            f"{e.get('description', '')[:120]}"
+        )
+        if e.get("best_params"):
+            lines.append(f"  Best params: {e['best_params']}")
+    return "\n".join(lines)
 
 
 def _format_knowledge(entries: list[dict]) -> str:

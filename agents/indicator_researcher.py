@@ -686,86 +686,150 @@ def generate_research_tasks(limit: int = len(INDICATOR_SPECS)) -> int:
     return created
 
 
-def generate_llm_combo_tasks(n: int = 15) -> int:
-    """
-    Ask Claude to propose n novel indicator combo ideas not yet in research_tasks.
-    Returns the number of new tasks created.
+_MEMO_KEY        = "research_memo"
+_MEMO_COUNT_KEY  = "research_memo_kb_count"
+_MEMO_REFRESH_THRESHOLD = 20   # regenerate after this many new KB entries
 
-    Called by the queue_worker when the pending queue runs low, keeping the
-    research pipeline running indefinitely.
+
+def generate_research_meta_summary() -> str:
+    """
+    Read every knowledge_base entry and ask Claude to write a compact (~400-word)
+    research memo that captures: what works, what fails, what's partially explored,
+    and what unexplored territory remains.
+
+    Stored in system_config so future LLM calls use it instead of raw KB data.
+    Always fits in the prompt regardless of how large the KB grows.
+    Returns the memo text.
     """
     from db import supabase_client as db
 
-    # Build context: what indicators have shown edge (top by sharpe_ref)
-    try:
-        kb_entries = db.get_knowledge_entries(limit=50)
-    except Exception:
-        kb_entries = []
+    kb_entries = db.get_knowledge_entries(limit=2000)
+    if not kb_entries:
+        return ""
 
-    works = [e for e in kb_entries if e.get("category") == "works"][:20]
-    fails = [e for e in kb_entries if e.get("category") == "fails"][:10]
-    works_summary = "; ".join(
-        f"{e['indicator']} ({e.get('timeframe','?')}): sharpe~{e.get('sharpe_ref',0):.2f}"
-        for e in works
-    ) or "none yet"
-    fails_summary = ", ".join(e["indicator"] for e in fails) or "none yet"
+    # Build a compact full listing for Claude to analyse
+    lines = []
+    for e in sorted(kb_entries, key=lambda x: x.get("sharpe_ref") or -999, reverse=True):
+        sharpe = e.get("sharpe_ref")
+        sharpe_str = f"{sharpe:+.2f}" if sharpe is not None else "?"
+        lines.append(
+            f"{e.get('category','?'):8s} | sharpe {sharpe_str:6s} | "
+            f"{e.get('indicator','?'):30s} | {e.get('timeframe','?'):4s} "
+            f"{e.get('asset','?'):8s} | {(e.get('summary') or '')[:120]}"
+        )
+    full_data = "\n".join(lines)
 
-    # What titles already exist (to avoid duplicates)
-    existing = db.get_research_tasks(status="all", limit=2000, task_type="indicator_research")
-    existing_titles = {t["title"].lower() for t in existing}
-    # Strip the "[Indicator] " prefix for a cleaner list to show the LLM
-    existing_titles_display = sorted(
-        t["title"].removeprefix("[Indicator] ")
-        for t in existing
-    )[:100]  # cap to keep prompt size reasonable
+    prompt = f"""You are a quantitative research director summarising a systematic study of FX/commodity indicators.
 
-    prompt = f"""You are a quantitative FX/commodities researcher.
+Below is the complete knowledge base from statistical forward-return tests on EURUSD and XAUUSD.
+Format: category | sharpe | indicator | timeframe asset | summary
 
-Based on statistical forward-return tests on EURUSD and XAUUSD (1h, 4h), here is what we know:
+{full_data}
 
-INDICATORS WITH EDGE: {works_summary}
+Write a concise research memo in exactly this structure (no fluff, no markdown headers, plain text):
 
-INDICATORS THAT FAILED: {fails_summary}
+PROVEN EDGE (works category, sorted by sharpe):
+- List each indicator family with best sharpe and what made it work
 
-ALREADY RESEARCHED (do NOT propose anything that overlaps with these):
-{chr(10).join(f"- {t}" for t in existing_titles_display)}
+TESTED, NO EDGE (fails category):
+- Summarise by family — don't list every variant, just the pattern
 
-Generate exactly {n} NEW indicator combination ideas to test next. Aim for:
-- Novel combos not obviously covered above
-- Mix of mean-reversion, trend-following, and volatility-based ideas
-- 2–3 indicator combinations where one provides the signal and another provides confirmation or a filter
-- Specific parameter values in the description (exact periods, thresholds, entry/exit rules)
+PARTIAL / WORTH REFINING:
+- Highest-potential partial results with specific suggestions for improvement
 
-Respond ONLY with a JSON array. Each element must have:
-  "spec_id": unique snake_case identifier (e.g. "RSI_STOCH_divergence_14_14")
-  "indicator": short indicator combo name (e.g. "RSI+STOCH")
-  "category": one of: momentum, trend, volatility, volume, structure, combo
-  "title": short human-readable title (under 60 chars)
-  "description": precise entry/exit rules with exact parameter values. Entry must produce +1 (long) or -1 (short) signals for pandas forward-return testing.
+KEY INSIGHTS (patterns across all results):
+- 2-4 cross-cutting observations (e.g. "trend filters always help", "volume confirms well on 4h")
 
-No markdown, no explanation — only the raw JSON array."""
+UNEXPLORED TERRITORY (what has NOT been tested yet):
+- Specific ideas: multi-timeframe confluence, custom formulas, microstructure signals, etc.
 
+Keep the whole memo under 500 words. Be specific and data-driven."""
+
+    response = _call_llm_for_specs.__wrapped__(prompt, 1200) if hasattr(_call_llm_for_specs, '__wrapped__') else None
+    # Use call_claude directly here since we want text, not JSON
     from agents.utils import call_claude
-    response = call_claude(
+    resp = call_claude(
         model=MODEL,
-        max_tokens=2000,
+        max_tokens=1200,
         messages=[{"role": "user", "content": prompt}],
     )
-    raw = response.content[0].text.strip()
+    memo = resp.content[0].text.strip()
 
-    # Strip markdown code fences if present
-    if raw.startswith("```"):
-        raw = raw.split("```")[1]
-        if raw.startswith("json"):
-            raw = raw[4:]
-        raw = raw.strip()
+    db.set_config(_MEMO_KEY, memo)
+    db.set_config(_MEMO_COUNT_KEY, str(len(kb_entries)))
+    log.info("research_memo_generated kb_entries=%s chars=%s", len(kb_entries), len(memo))
+    return memo
 
+
+def _get_or_refresh_memo(kb_count: int) -> str:
+    """
+    Return the stored research memo, regenerating it if stale (>N new KB entries
+    since last generation) or missing.
+    """
+    from db import supabase_client as db
     try:
-        proposals = json.loads(raw)
-    except Exception as exc:
-        log.warning("llm_combo_parse_failed error=%s raw=%s", exc, raw[:200])
-        return 0
+        memo       = db.get_config(_MEMO_KEY) or ""
+        last_count = int(db.get_config(_MEMO_COUNT_KEY) or "0")
+    except Exception:
+        memo, last_count = "", 0
 
+    if not memo or (kb_count - last_count) >= _MEMO_REFRESH_THRESHOLD:
+        memo = generate_research_meta_summary()
+
+    return memo
+
+
+def _load_research_context() -> tuple[list[dict], list[dict], list[dict], set[str], list[dict], str]:
+    """Shared helper: load KB entries + existing task titles + research memo."""
+    from db import supabase_client as db
+    try:
+        kb_entries = db.get_knowledge_entries(limit=2000)
+    except Exception:
+        kb_entries = []
+    works    = sorted([e for e in kb_entries if e.get("category") == "works"],
+                      key=lambda e: e.get("sharpe_ref") or 0, reverse=True)[:20]
+    partials = sorted([e for e in kb_entries if e.get("category") == "partial"],
+                      key=lambda e: e.get("sharpe_ref") or 0, reverse=True)[:20]
+    fails    = [e for e in kb_entries if e.get("category") == "fails"][:10]
+    # existing_titles: de-dup guard for insertion only — not shown to the LLM
+    existing = db.get_research_tasks(status="all", limit=5000, task_type="indicator_research")
+    existing_titles = {t["title"].lower() for t in existing}
+    memo = _get_or_refresh_memo(len(kb_entries))
+    return works, partials, fails, existing_titles, kb_entries, memo
+
+
+def _build_tested_summary(kb_entries: list[dict]) -> str:
+    """
+    Compact summary of everything in the knowledge_base, grouped by indicator.
+    Each line: "INDICATOR: tested X variants → result (best sharpe Y)"
+    Fits ~239 entries in ~30 lines. Used as the LLM's "already tried" context.
+    """
+    from collections import defaultdict
+    groups: dict[str, list[dict]] = defaultdict(list)
+    for e in kb_entries:
+        ind = (e.get("indicator") or "unknown").split("+")[0].strip()
+        groups[ind].append(e)
+
+    lines = []
+    for ind in sorted(groups):
+        entries = groups[ind]
+        n = len(entries)
+        best = max(entries, key=lambda e: e.get("sharpe_ref") or -999)
+        worst = min(entries, key=lambda e: e.get("sharpe_ref") or 999)
+        cats = {e.get("category", "?") for e in entries}
+        sharpe_range = (
+            f"sharpe {worst.get('sharpe_ref', 0):.2f}…{best.get('sharpe_ref', 0):.2f}"
+        )
+        tfs = {e.get("timeframe", "") for e in entries if e.get("timeframe")}
+        tf_str = "/".join(sorted(tfs)) if tfs else "?"
+        cat_str = "/".join(sorted(cats))
+        lines.append(f"{ind} [{tf_str}]: {n} variants tested → {cat_str} ({sharpe_range})")
+    return "\n".join(lines) or "none yet"
+
+
+def _insert_proposals(proposals: list[dict], existing_titles: set[str], tag: str) -> int:
+    """Insert a list of LLM-proposed specs as pending research_task rows."""
+    from db import supabase_client as db
     created = 0
     for p in proposals:
         if not isinstance(p, dict):
@@ -775,7 +839,7 @@ No markdown, no explanation — only the raw JSON array."""
             continue
         try:
             spec = {
-                "spec_id":    p.get("spec_id", f"llm_{created}"),
+                "spec_id":    p.get("spec_id", f"{tag}_{created}"),
                 "indicator":  p.get("indicator", "unknown"),
                 "category":   p.get("category", "combo"),
                 "title":      p.get("title", ""),
@@ -791,9 +855,134 @@ No markdown, no explanation — only the raw JSON array."""
             existing_titles.add(title.lower())
             created += 1
         except Exception as exc:
-            log.warning("llm_combo_insert_failed error=%s", exc)
+            log.warning("%s_insert_failed error=%s", tag, exc)
+    return created
 
+
+def _call_llm_for_specs(prompt: str, max_tokens: int = 3000) -> list[dict]:
+    """Call Claude and parse the JSON array response."""
+    from agents.utils import call_claude
+    response = call_claude(
+        model=MODEL,
+        max_tokens=max_tokens,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    raw = response.content[0].text.strip()
+    if raw.startswith("```"):
+        raw = raw.split("```")[1]
+        if raw.startswith("json"):
+            raw = raw[4:]
+        raw = raw.strip()
+    try:
+        return json.loads(raw)
+    except Exception as exc:
+        log.warning("llm_spec_parse_failed error=%s raw=%s", exc, raw[:300])
+        return []
+
+
+def generate_llm_combo_tasks(n: int = 15) -> int:
+    """
+    Ask Claude to invent n novel research ideas — including custom indicator formulas,
+    not just combinations of known indicators.
+    Runs when the static catalogue is exhausted and param sweeps are done.
+    Returns number of new tasks created.
+    """
+    works, partials, fails, existing_titles, kb_entries, memo = _load_research_context()
+
+    prompt = f"""You are a quantitative FX/commodities researcher inventing novel market signals.
+
+RESEARCH MEMO (complete summary of everything tested so far — do NOT repeat anything covered here):
+{memo or _build_tested_summary(kb_entries)}
+→ Treat every indicator family mentioned above as fully explored. Propose only genuinely new territory.
+
+Generate exactly {n} NEW research ideas. Be creative and original — mix these types:
+
+TYPE A — INVENTED INDICATOR (most valuable): Design a brand-new indicator formula that
+  doesn't exist in pandas_ta. Examples: "candle body consistency over N bars",
+  "ratio of upper to lower wick over a rolling window", "price velocity divergence
+  (EMA of returns vs actual return)", "intrabar range compression index".
+  Be specific: give the formula, how to compute long/short signals from it.
+
+TYPE B — DEEP COMBO: Combine 3+ indicators in a non-obvious way, using one for regime
+  detection, one for signal, one for timing. Avoid repeating already-tested combos.
+
+TYPE C — MARKET STRUCTURE: Signals based on price geometry, not indicators.
+  E.g. "higher-high + higher-low sequence over N bars", "inside bar breakout with
+  ATR expansion confirmation", "engulfing candle at prior swing level".
+
+Include at least 3 of TYPE A, 3 of TYPE C, rest can be TYPE B.
+
+Respond ONLY with a JSON array. Each element:
+  "spec_id": unique snake_case id
+  "indicator": short name (e.g. "wick_ratio" or "RSI+BB+regime")
+  "category": one of: momentum / trend / volatility / volume / structure / custom
+  "title": under 60 chars
+  "description": MUST contain all four of these sections:
+    ENTRY: exact condition that produces +1 (long) or -1 (short) signal, with param values
+    STOP: how the stop loss is placed (e.g. "1.5×ATR below entry")
+    RR: risk:reward ratio (e.g. "1:2 — TP at 3×ATR")
+    EXIT: any early exit condition beyond SL/TP (e.g. "close at session end", "exit if RSI reverses", or "none — SL/TP only")
+
+No markdown, no explanation — raw JSON array only."""
+
+    proposals = _call_llm_for_specs(prompt, max_tokens=3000)
+    created = _insert_proposals(proposals, existing_titles, "llm")
     log.info("llm_combo_tasks_created created=%s requested=%s", created, n)
+    return created
+
+
+def generate_param_sweep_tasks(n_partials: int = 5, variations_per: int = 5) -> int:
+    """
+    For the top partial-result knowledge_base entries, ask Claude to generate
+    refined parameter variations and alternative signal rules.
+    Called before falling back to full LLM invention — cheaper and more targeted.
+    Returns number of new tasks created.
+    """
+    works, partials, _, existing_titles, kb_entries, memo = _load_research_context()
+
+    if not partials:
+        return 0
+
+    top_partials = partials[:n_partials]
+    partials_text = "\n".join(
+        f"- {p['indicator']} ({p.get('timeframe','?')} {p.get('asset','?')}): "
+        f"sharpe~{p.get('sharpe_ref', 0):.2f} | {(p.get('summary') or '')[:150]}"
+        for p in top_partials
+    )
+    works_text = "; ".join(
+        f"{e['indicator']} sharpe~{e.get('sharpe_ref',0):.2f}" for e in works[:10]
+    ) or "none yet"
+
+    total = n_partials * variations_per
+    prompt = f"""You are a quantitative researcher designing follow-up experiments.
+
+These indicators showed MARGINAL EDGE (partial results) in forward-return tests on EURUSD/XAUUSD:
+{partials_text}
+
+KNOWN WORKING INDICATORS (for reference): {works_text}
+
+For each partial result above, generate {variations_per} refined follow-up experiments.
+Each variation should try ONE of: different threshold, different period, added filter,
+different entry confirmation rule, session/regime restriction, or a combined exit approach.
+
+Generate exactly {total} tasks total ({variations_per} per partial result listed).
+
+Respond ONLY with a JSON array. Each element:
+  "spec_id": unique snake_case id (e.g. "RSI_14_os25_ema200_filter")
+  "indicator": short indicator name
+  "category": one of: momentum / trend / volatility / volume / structure / combo
+  "title": under 60 chars
+  "description": MUST contain all four of these sections:
+    ENTRY: exact condition that produces +1 (long) or -1 (short) signal, with param values
+    STOP: how the stop loss is placed (e.g. "1.5×ATR below entry")
+    RR: risk:reward ratio (e.g. "1:2 — TP at 3×ATR")
+    EXIT: any early exit beyond SL/TP (e.g. "close if indicator reverses", "none — SL/TP only")
+
+No markdown, no explanation — raw JSON only."""
+
+    proposals = _call_llm_for_specs(prompt, max_tokens=3000)
+    created = _insert_proposals(proposals, existing_titles, "sweep")
+    log.info("param_sweep_tasks_created created=%s", created)
     return created
 
 
@@ -926,6 +1115,32 @@ def run_indicator_research(task_id: str, cache_dir: str = "/ohlcv_cache") -> dic
             "generated_code": code,
             "error_log":    None,
         })
+
+        # 6. Save to indicator library (only if at least one 'works'/'partial' result)
+        good_entries = [e for e in knowledge_entries if e.get("category") in ("works", "partial")]
+        if good_entries and code:
+            # Pick best sharpe from knowledge entries
+            best_sharpe_val = max(
+                (e.get("sharpe_ref") or 0.0 for e in good_entries), default=None
+            )
+            # Best params: take from the globally-best combo
+            best_params_val = best_by_combo.get(best_combo, {}).get("params") or {}
+            try:
+                db.save_to_indicator_library(
+                    spec_id=spec.get("spec_id", spec["indicator"]),
+                    name=spec["indicator"],
+                    display_name=spec.get("title", spec["indicator"]),
+                    category=spec.get("category", "custom"),
+                    description=spec.get("description", ""),
+                    code=code,
+                    best_params=best_params_val,
+                    best_sharpe=best_sharpe_val if best_sharpe_val and best_sharpe_val > 0 else None,
+                    source_task_id=task_id,
+                )
+                log.info("indicator_library saved spec_id=%s sharpe=%.3f",
+                         spec.get("spec_id", spec["indicator"]), best_sharpe_val or 0)
+            except Exception as lib_exc:
+                log.warning("indicator_library save failed: %s", lib_exc)
 
         return {
             "passed":            True,

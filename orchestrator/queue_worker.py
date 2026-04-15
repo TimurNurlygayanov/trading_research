@@ -160,24 +160,38 @@ def _retry_failed_research_tasks() -> int:
 
 def _auto_generate_research_tasks() -> int:
     """
-    Keep the research queue populated.
-    1. Drain the static spec catalogue first.
-    2. Once all static specs are done/running, ask Claude for novel combos.
-    Only runs when the pending queue is below a threshold.
+    Keep the research queue populated using three modes in priority order:
+      1. Static catalogue (free, fast)
+      2. Param sweeps of best partial results (LLM, targeted)
+      3. LLM invention: novel indicators + combos (LLM, creative)
+    Only runs when the pending queue is below the threshold.
     """
     pending_count = len(db.get_research_tasks(status="pending", limit=30))
     if pending_count >= 20:
         return 0  # queue is healthy, nothing to do
 
-    from agents.indicator_researcher import generate_research_tasks, generate_llm_combo_tasks
+    from agents.indicator_researcher import (
+        generate_research_tasks,
+        generate_param_sweep_tasks,
+        generate_llm_combo_tasks,
+    )
 
-    # Phase 1: fill from static catalogue
+    # Phase 1: static catalogue
     created = generate_research_tasks()
     if created > 0:
         log.info("auto_generate_research_static created=%s", created)
         return created
 
-    # Phase 2: catalogue exhausted — ask Claude for novel combos
+    # Phase 2: param sweeps of partial results
+    try:
+        created = generate_param_sweep_tasks(n_partials=5, variations_per=5)
+        if created > 0:
+            log.info("auto_generate_research_sweeps created=%s", created)
+            return created
+    except Exception as exc:
+        log.warning("auto_generate_research_sweeps_failed error=%s", exc)
+
+    # Phase 3: full LLM invention
     try:
         created = generate_llm_combo_tasks(n=15)
         if created > 0:

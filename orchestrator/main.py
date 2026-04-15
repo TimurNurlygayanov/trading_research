@@ -2598,6 +2598,23 @@ _RESEARCH_HTML = r"""<!DOCTYPE html>
   .btn-act-danger:hover { background: #991b1b; }
   .kb-actions { display: flex; gap: 4px; margin-top: 6px; }
 
+  /* ── Indicator Library ── */
+  .lib-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 14px;
+              margin-bottom: 40px; }
+  .lib-card { background: #111827; border: 1px solid #1f2937; border-radius: 12px;
+              padding: 18px; display: flex; flex-direction: column; gap: 8px; }
+  .lib-card:hover { border-color: #374151; }
+  .lib-name { font-size: 0.95rem; font-weight: 700; color: #f1f5f9;
+              font-family: "SF Mono","Fira Code",monospace; }
+  .lib-display { font-size: 0.78rem; color: #64748b; margin-top: 2px; }
+  .lib-desc { font-size: 0.82rem; color: #94a3b8; line-height: 1.5; flex: 1; }
+  .lib-params { font-size: 0.72rem; color: #475569; font-family: "SF Mono",monospace;
+                background: #0d1117; border-radius: 6px; padding: 4px 8px;
+                white-space: pre-wrap; word-break: break-all; }
+  .lib-sharpe { font-size: 0.72rem; font-weight: 600; font-family: "SF Mono",monospace; }
+  .lib-sharpe.pos { color: #4ade80; }
+  .lib-sharpe.neu { color: #64748b; }
+
   .empty   { text-align: center; padding: 60px 0; color: #475569; font-size: 0.9rem; }
   .loading { text-align: center; padding: 40px 0; color: #475569; }
   .toast { position: fixed; bottom: 24px; right: 24px; background: #059669;
@@ -2616,6 +2633,9 @@ _RESEARCH_HTML = r"""<!DOCTYPE html>
   <a href="/research" class="active">Research</a>
   <a href="/data">Data</a>
   <div class="nav-right">
+    <button class="btn-secondary" id="memo-btn" onclick="refreshMemo(this)" style="margin-right:8px">
+      ↻ Refresh memo
+    </button>
     <button class="btn-secondary" id="gen-btn" onclick="generateTasks()">
       ⚗ Run indicator research
     </button>
@@ -2666,6 +2686,16 @@ _RESEARCH_HTML = r"""<!DOCTYPE html>
     </span>
   </div>
   <div id="queue-wrap" class="loading">Loading…</div>
+
+  <!-- Indicator Library -->
+  <div class="section-hdr" style="margin-top:48px">
+    Indicator Library
+    <span style="font-size:0.78rem;font-weight:400;color:#475569">
+      battle-tested implementations saved from research
+    </span>
+    <span style="margin-left:auto;font-size:0.78rem;font-weight:400;color:#64748b" id="lib-count"></span>
+  </div>
+  <div id="lib-grid" class="loading">Loading…</div>
 </div>
 
 <div class="toast" id="toast"></div>
@@ -2703,7 +2733,7 @@ let currentCat = 'works';
 let searchVal  = '';
 
 async function init() {
-  await Promise.all([loadStats(), loadCategory('works'), loadQueue()]);
+  await Promise.all([loadStats(), loadCategory('works'), loadQueue(), loadLibrary()]);
 }
 
 async function loadStats() {
@@ -2910,6 +2940,22 @@ function closeModal(e) {
   }
 }
 
+async function refreshMemo(btn) {
+  btn.disabled = true;
+  btn.textContent = 'Generating…';
+  try {
+    const r = await fetch('/api/research/refresh-memo', {method: 'POST'});
+    const d = await r.json();
+    if (d.ok) showToast(`Memo updated (${d.chars} chars).`);
+    else showToast(d.error || 'Failed', true);
+  } catch(e) {
+    showToast('Failed', true);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '↻ Refresh memo';
+  }
+}
+
 async function generateTasks() {
   const btn = document.getElementById('gen-btn');
   btn.disabled = true;
@@ -2917,7 +2963,8 @@ async function generateTasks() {
   try {
     const r = await fetch('/api/research/generate', {method: 'POST'});
     const d = await r.json();
-    showToast(`Created ${d.created} new research tasks. They will start shortly.`);
+    const modeLabel = {static_catalogue:'static catalogue', param_sweeps:'param sweeps', llm_invention:'LLM invention'}[d.mode] || d.mode || '?';
+    showToast(d.created > 0 ? `Created ${d.created} tasks via ${modeLabel}.` : `No new tasks (all ${modeLabel} already covered).`);
     setTimeout(() => { loadStats(); loadQueue(); }, 1500);
   } catch(e) {
     showToast('Failed to generate tasks', true);
@@ -2983,6 +3030,45 @@ async function deleteKb(id, btn) {
   }
 }
 
+async function loadLibrary() {
+  try {
+    const r = await fetch('/api/indicator-library');
+    const d = await r.json();
+    const entries = d.entries || [];
+    const el = document.getElementById('lib-grid');
+    document.getElementById('lib-count').textContent = `${entries.length} entries`;
+    if (!entries.length) {
+      el.className = '';
+      el.innerHTML = '<div class="empty">No library entries yet. '
+        + 'They are saved automatically when indicator research finds a "works" or "partial" result.</div>';
+      return;
+    }
+    el.className = 'lib-grid';
+    el.innerHTML = entries.map(e => {
+      const sharpe = e.best_sharpe;
+      const sharpeCls = sharpe && sharpe > 0 ? 'pos' : 'neu';
+      const sharpeStr = sharpe ? (sharpe > 0 ? '+' : '') + parseFloat(sharpe).toFixed(2) : '—';
+      const params = e.best_params && Object.keys(e.best_params).length
+        ? JSON.stringify(e.best_params, null, 2) : null;
+      const ts = (e.created_at || '').slice(0, 10);
+      return `<div class="lib-card">
+  <div>
+    <div class="lib-name">${esc(e.spec_id)}</div>
+    <div class="lib-display">${esc(e.display_name)} &middot; <span class="cat-badge cat-${esc(e.category||'custom')}" style="display:inline">${esc(e.category||'custom')}</span></div>
+  </div>
+  <div class="kb-meta">
+    <span class="lib-sharpe ${sharpeCls}">Sharpe ${sharpeStr}</span>
+    <span style="margin-left:auto;font-size:.68rem;color:#374151">${ts}</span>
+  </div>
+  ${e.description ? `<div class="lib-desc">${esc(e.description.slice(0,200))}</div>` : ''}
+  ${params ? `<div class="lib-params">${esc(params)}</div>` : ''}
+</div>`;
+    }).join('');
+  } catch(e) {
+    document.getElementById('lib-grid').innerHTML = '<div class="empty">Failed to load library.</div>';
+  }
+}
+
 function showToast(msg, isError) {
   const t = document.getElementById('toast');
   t.textContent = msg;
@@ -3012,19 +3098,50 @@ def research_page() -> HTMLResponse:
 
 @app.post("/api/research/generate")
 def api_generate_research_tasks(background_tasks: BackgroundTasks) -> JSONResponse:
-    """Create pending research_task rows for all untested indicator specs."""
-    def _run():
-        from agents.indicator_researcher import generate_research_tasks
-        return generate_research_tasks()
-    background_tasks.add_task(_run)
-    # Also run synchronously to get count immediately
+    """
+    Fill the research queue using three modes in order:
+      1. Static catalogue (free, exhausted once)
+      2. Param sweeps of best partial results (LLM, targeted)
+      3. Full invention: novel indicators + combos (LLM, creative)
+    """
     try:
-        from agents.indicator_researcher import generate_research_tasks
+        from agents.indicator_researcher import (
+            generate_research_tasks,
+            generate_param_sweep_tasks,
+            generate_llm_combo_tasks,
+        )
+        # Mode 1: static catalogue
         created = generate_research_tasks()
+        mode = "static_catalogue"
+        # Mode 2: param sweeps of partial results
+        if created == 0:
+            created = generate_param_sweep_tasks(n_partials=5, variations_per=5)
+            mode = "param_sweeps"
+        # Mode 3: LLM invention
+        if created == 0:
+            created = generate_llm_combo_tasks(n=15)
+            mode = "llm_invention"
     except Exception as exc:
         log.error("api_generate_research_error", error=str(exc), traceback=_traceback.format_exc())
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
-    return JSONResponse({"ok": True, "created": created})
+    return JSONResponse({"ok": True, "created": created, "mode": mode})
+
+
+@app.get("/api/indicator-library")
+def api_get_indicator_library(
+    category: str = Query(default=""),
+    limit: int = Query(default=200),
+) -> JSONResponse:
+    """Return indicator library entries."""
+    try:
+        entries = db.get_indicator_library(
+            category=category if category else None,
+            limit=min(limit, 500),
+        )
+        return JSONResponse({"entries": entries})
+    except Exception as exc:
+        log.error("api_indicator_library_error", error=str(exc), traceback=_traceback.format_exc())
+        return JSONResponse({"entries": [], "error": str(exc)}, status_code=500)
 
 
 @app.get("/api/knowledge")
@@ -3044,6 +3161,18 @@ def api_get_knowledge(
     except Exception as exc:
         log.error("api_knowledge_error", error=str(exc), traceback=_traceback.format_exc())
         return JSONResponse({"entries": [], "error": str(exc)}, status_code=500)
+
+
+@app.post("/api/research/refresh-memo")
+def api_refresh_research_memo() -> JSONResponse:
+    """Force-regenerate the research memo from all current KB entries."""
+    try:
+        from agents.indicator_researcher import generate_research_meta_summary
+        memo = generate_research_meta_summary()
+        return JSONResponse({"ok": True, "chars": len(memo), "preview": memo[:300]})
+    except Exception as exc:
+        log.error("api_refresh_memo_error", error=str(exc), traceback=_traceback.format_exc())
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
 
 
 @app.get("/api/research/stats")

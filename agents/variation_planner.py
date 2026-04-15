@@ -26,7 +26,7 @@ from dotenv import load_dotenv
 load_dotenv()
 log = logging.getLogger(__name__)
 
-MODEL = "claude-opus-4-5"  # Best design decisions come from the strongest model
+MODEL = "claude-sonnet-4-6"  # Creative JSON planning, not raw code — Sonnet is sufficient; 5× cheaper than Opus
 
 # Phase 1: decompose the seed idea into its components
 _DECOMPOSE_SYSTEM = """You are a quantitative trading strategy researcher.

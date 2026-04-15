@@ -247,12 +247,20 @@ class {{StrategyName}}Strategy(Strategy):
     Edge / hypothesis:
         <One sentence — why should this strategy be profitable?>
 
-    Entry logic:
-        Long:  <exact condition using indicator names>
-        Short: <exact condition using indicator names>
+    Entry signal:
+        Long:  <exact condition, e.g. "RSI[-2] crosses above 30 AND price[-2] > EMA200[-2]">
+        Short: <exact condition, e.g. "RSI[-2] crosses below 70 AND price[-2] < EMA200[-2]">
 
-    Exit logic:
-        <ATR-based SL/TP, or trailing stop, etc.>
+    Stop loss:
+        <e.g. "sl_atr × ATR below entry price (long) / above entry price (short)">
+
+    Risk : Reward:
+        <e.g. "1 : tp_atr/sl_atr — default 1 : 1.33 (sl_atr=1.5, tp_atr=2.0)">
+
+    Early exit conditions:
+        <e.g. "None — purely SL/TP driven" OR
+              "Exit long if RSI crosses back below 50 before TP hit" OR
+              "Close position at session end (end_hour) regardless of P&L">
 
     Key parameters (tuned by Optuna):
         <param_name>: <what it controls>
@@ -356,6 +364,9 @@ Knowledge base (what works and fails):
 Research results available (pre-computed analysis for this strategy):
 {research_context}
 
+Indicator library (battle-tested implementations from prior research — inline these directly into the strategy class when relevant; do NOT import them as modules):
+{indicator_library_context}
+
 Generate the complete strategy code following the template. Return JSON only."""
 
 
@@ -371,6 +382,9 @@ Recommended symbols: {symbols}
 
 Knowledge base (what works and fails):
 {knowledge_base_context}
+
+Indicator library (battle-tested implementations from prior research — inline these directly into the strategy class when relevant; do NOT import them as modules):
+{indicator_library_context}
 
 You have TWO options:
 

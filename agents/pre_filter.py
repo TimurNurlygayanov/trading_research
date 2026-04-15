@@ -19,7 +19,7 @@ from agents.utils import full_description, add_pipeline_note
 load_dotenv()
 log = logging.getLogger(__name__)
 
-MODEL = "claude-sonnet-4-6"  # Scoring quality matters — weak analysis sends bad ideas downstream
+MODEL = "claude-haiku-4-5-20251001"  # Explicit 0-2 rubric + structured JSON output → Haiku sufficient; 12× cheaper than Sonnet
 MIN_SCORE_TO_PROCEED = 6.0
 
 
