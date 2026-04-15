@@ -182,9 +182,19 @@ def run_indicator_research_task(task_id: str) -> dict:
     """
     Run a systematic indicator forward-return analysis task.
     Called for research_tasks with type='indicator_research'.
+    Falls back to run_research_task logic if the task has no research_spec
+    (handles tasks that were misrouted due to a stale type field).
     """
     import sys
     sys.path.insert(0, "/root")
+
+    from db import supabase_client as _db
+    task = _db.get_research_task(task_id)
+    if not task or not task.get("research_spec"):
+        # Not a proper indicator_research task — delegate to the general researcher.
+        # .local() runs the function body in-process (no new Modal spawn).
+        return run_research_task.local(task_id)
+
     from agents.indicator_researcher import run_indicator_research
     return run_indicator_research(task_id, cache_dir=CACHE_DIR)
 
