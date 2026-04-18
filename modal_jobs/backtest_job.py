@@ -340,7 +340,7 @@ def run_quick_backtest(strategy_id: str) -> dict:
     image=image,
     cpu=8,
     memory=8192,
-    timeout=1200,  # 20 minutes — enough headroom with caching + fewer trials
+    timeout=2700,  # 45 minutes — covers up to 3 TFs × 10-min budget + walk-forward + OOS + MC
     secrets=[modal.Secret.from_name("trading-research-secrets")],
     volumes={CACHE_DIR: ohlcv_cache},
 )
@@ -451,21 +451,30 @@ def run_backtest_pipeline(strategy_id: str) -> dict:
 
         # 5. Determine which timeframes are worth optimizing.
         # Use quick-test results: any TF that produced at least 1 trade is viable.
-        # Skip TFs with 0 trades — there is nothing to optimize.
+        # Sort by trade count descending so higher-signal TFs run first.
+        # Cap at 3 TFs — more than that and the time budget runs out.
+        import time as _time
         quick_test_all = strategy.get("quick_test_all_timeframes") or {}
         viable_tfs = [
             tf for tf, m in quick_test_all.items()
             if isinstance(m, dict) and m.get("trades", 0) > 0
         ]
-        # Sort by trade count descending so higher-signal TFs run first
         viable_tfs.sort(key=lambda tf: quick_test_all[tf].get("trades", 0), reverse=True)
         if not viable_tfs:
             viable_tfs = [primary_tf]  # fallback if quick-test data is missing
+        viable_tfs = viable_tfs[:3]   # cap: optimizing >3 TFs risks timeout
+
+        # Per-TF time budget: 2700s total - 900s overhead (data/WF/OOS/MC) = 1800s for opt
+        _OPT_BUDGET_PER_TF = 1800 / len(viable_tfs)  # seconds
 
         add_pipeline_note(strategy_id,
             f"Viable timeframes for optimization: {viable_tfs} "
-            f"(skipping TFs with 0 trades)."
+            f"(capped at 3, budget {_OPT_BUDGET_PER_TF:.0f}s each)."
         )
+
+        # Pre-flight constants — detect O(n²) / near-infinite loops before wasting budget
+        _PREFLIGHT_BARS = 500
+        _MAX_PREFLIGHT_SECS = 12.0   # 12s on 500 bars → ~hours on full dataset
 
         # 6. Optimize on every viable timeframe; pick the winner by best train Sharpe.
         tf_opt_results: dict = {}   # tf → {best_params, sharpe, trades, train_df, oos_df}
@@ -482,8 +491,38 @@ def run_backtest_pipeline(strategy_id: str) -> dict:
                     ohlcv_cache.commit()
 
                 opt_train_df, opt_oos_df = split_train_oos(opt_df)
+
+                # ── Pre-flight: time one run on a tiny sample ─────────────────
+                # Catches infinite loops and O(n²) strategies before committing
+                # the full optimization budget.
+                _probe_df = opt_train_df.iloc[:_PREFLIGHT_BARS]
+                _t0 = _time.time()
+                try:
+                    run_backtest(strategy_class, _probe_df, params={}, enforce_gates=False)
+                except Exception:
+                    pass  # errors caught later in the real run
+                _probe_secs = _time.time() - _t0
+
+                if _probe_secs > _MAX_PREFLIGHT_SECS:
+                    _est_full_min = _probe_secs * len(opt_train_df) / _PREFLIGHT_BARS / 60
+                    add_pipeline_note(
+                        strategy_id,
+                        f"  {opt_tf}: pre-flight SLOW ({_probe_secs:.1f}s on "
+                        f"{_PREFLIGHT_BARS} bars, estimated {_est_full_min:.0f}min full run). "
+                        f"Likely O(n^2) loop or pandas call inside next(). Skipping {opt_tf}."
+                    )
+                    continue
+
+                add_pipeline_note(
+                    strategy_id,
+                    f"  {opt_tf}: pre-flight OK ({_probe_secs:.2f}s on {_PREFLIGHT_BARS} bars). "
+                    f"Starting optimization ({_OPT_BUDGET_PER_TF:.0f}s budget, up to 50 trials)."
+                )
+
                 opt_params, _ = optimize_strategy(
-                    strategy_class, opt_train_df, opt_space, n_trials=50, n_jobs=4
+                    strategy_class, opt_train_df, opt_space,
+                    n_trials=50, n_jobs=4,
+                    timeout_seconds=_OPT_BUDGET_PER_TF,
                 )
                 opt_result = run_backtest(
                     strategy_class, opt_train_df, params=opt_params, enforce_gates=False

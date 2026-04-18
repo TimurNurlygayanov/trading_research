@@ -98,6 +98,11 @@ def _dispatch_validator_job(strategy_id: str) -> None:
 _RESEARCH_MAX_RETRIES = 3
 _RESEARCH_STUCK_TIMEOUT_MINUTES = 13  # Modal timeout is 10 min; 13 min means it's definitely dead
 
+# Strategy job timeouts — Modal kills containers silently, leaving stale status + modal_job_id.
+# Set slightly above the Modal function timeout so we don't reset jobs that are still running.
+_BACKTEST_STUCK_TIMEOUT_MINUTES = 52   # Modal timeout is 45 min (2700s)
+_QUICK_TEST_STUCK_TIMEOUT_MINUTES = 20  # Modal timeout is 15 min (900s)
+
 
 def _recover_stuck_research_tasks() -> int:
     """
@@ -140,6 +145,52 @@ def _recover_stuck_research_tasks() -> int:
     return recovered
 
 
+def _recover_stuck_strategy_jobs() -> int:
+    """
+    Reset strategies stuck in 'backtesting' or 'quick_testing' after Modal timeout.
+
+    Modal kills the container without running the except block, so the DB is left
+    with a stale status and modal_job_id. This watchdog detects that and resets
+    to 'failed' so the auto-fix handler can retry or notify the user.
+    """
+    from datetime import datetime, timezone, timedelta
+    from dateutil import parser as _dateparser
+
+    recovered = 0
+    sb = db.get_client()
+
+    for status, timeout_min in [
+        ("backtesting",  _BACKTEST_STUCK_TIMEOUT_MINUTES),
+        ("quick_testing", _QUICK_TEST_STUCK_TIMEOUT_MINUTES),
+    ]:
+        cutoff = datetime.now(timezone.utc) - timedelta(minutes=timeout_min)
+        result = (
+            sb.table("strategies")
+            .select("id, name, modal_job_id, updated_at")
+            .eq("status", status)
+            .not_.is_("modal_job_id", "null")
+            .lt("updated_at", cutoff.isoformat())
+            .limit(10)
+            .execute()
+        )
+        for s in (result.data or []):
+            sid = s["id"]
+            db.update_strategy(sid, {
+                "status":       "failed",
+                "modal_job_id": None,
+                "error_log": (
+                    f"Job timed out: stuck in '{status}' for >{timeout_min} min. "
+                    "Modal container was killed without updating the DB. "
+                    "Auto-retrying via failed strategy handler."
+                ),
+            })
+            recovered += 1
+            log.info("strategy_job_timeout_recovered",
+                     strategy_id=sid, status=status, timeout_min=timeout_min)
+
+    return recovered
+
+
 def _retry_failed_research_tasks() -> int:
     """Reset failed research tasks (retry_count < max) back to pending."""
     failed = db.get_research_tasks(status="failed", limit=50)
@@ -173,7 +224,6 @@ def _auto_generate_research_tasks() -> int:
     from agents.indicator_researcher import (
         generate_research_tasks,
         generate_param_sweep_tasks,
-        generate_llm_combo_tasks,
     )
 
     # Phase 1: static catalogue
@@ -191,14 +241,17 @@ def _auto_generate_research_tasks() -> int:
     except Exception as exc:
         log.warning("auto_generate_research_sweeps_failed error=%s", exc)
 
-    # Phase 3: full LLM invention
+    # Phase 3: agenda-driven research (structured hypotheses, not random combos)
     try:
-        created = generate_llm_combo_tasks(n=15)
+        from agents.research_agenda import process_all_agendas
+        created = process_all_agendas(limit_per_agenda=5)  # drip-feed 5 tasks per agenda per cycle
         if created > 0:
-            log.info("auto_generate_research_llm created=%s", created)
+            log.info("auto_generate_research_agenda created=%s", created)
+            return created
     except Exception as exc:
-        log.warning("auto_generate_research_llm_failed error=%s", exc)
-    return created
+        log.warning("auto_generate_research_agenda_failed error=%s", exc)
+
+    return 0
 
 
 _MAX_CONCURRENT_RESEARCH = 1  # one at a time — 8k output tokens/min is too tight for two
@@ -1097,6 +1150,7 @@ def process_queue() -> None:
 
     ideas_processed       = _process_user_ideas()
     recovered_ideas       = _recover_stuck_idea_strategies()
+    strategy_jobs_recovered = _recover_stuck_strategy_jobs()
     filtered_processed    = _process_filtered_strategies()
     research_unblocked    = _process_awaiting_research_strategies()
     research_recovered    = _recover_stuck_research_tasks()
@@ -1116,6 +1170,7 @@ def process_queue() -> None:
         "queue_worker_done",
         ideas_processed=ideas_processed,
         recovered_ideas=recovered_ideas,
+        strategy_jobs_recovered=strategy_jobs_recovered,
         filtered_processed=filtered_processed,
         research_unblocked=research_unblocked,
         research_recovered=research_recovered,

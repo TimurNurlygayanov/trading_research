@@ -42,6 +42,7 @@ def optimize_strategy(
     seed: int = 42,
     direction: str = "maximize",
     metric: str = "sharpe",
+    timeout_seconds: float | None = None,
 ) -> tuple[dict[str, Any], optuna.Study]:
     """
     Optimize strategy hyperparameters on training data.
@@ -89,7 +90,13 @@ def optimize_strategy(
 
         return value if not (value != value) else -10.0  # handle NaN
 
-    study.optimize(objective, n_trials=n_trials, n_jobs=n_jobs, show_progress_bar=False)
+    study.optimize(
+        objective,
+        n_trials=n_trials,
+        timeout=timeout_seconds,   # stop after this many seconds even if n_trials not reached
+        n_jobs=n_jobs,
+        show_progress_bar=False,
+    )
 
     best_params = study.best_params if study.best_trial else {}
     logging.info(

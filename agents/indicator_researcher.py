@@ -1048,8 +1048,13 @@ def run_indicator_research(task_id: str, cache_dir: str = "/ohlcv_cache") -> dic
 
         # Determine research type
         spec_type = spec.get("spec_type", "entry_research")
-        is_exit = spec_type == "exit_research"
-        fn_name  = "analyze_exit_strategy" if is_exit else "analyze_indicator"
+        is_exit      = spec_type == "exit_research"
+        is_limit_ord = spec_type == "limit_order_research"
+        fn_name = (
+            "analyze_exit_strategy"       if is_exit else
+            "analyze_limit_order_entry"   if is_limit_ord else
+            "analyze_indicator"
+        )
 
         # 1. Generate parameterized analysis code + param space
         code, param_space = _generate_analysis_code(
@@ -1071,12 +1076,14 @@ def run_indicator_research(task_id: str, cache_dir: str = "/ohlcv_cache") -> dic
             combo_key = f"{symbol}_{tf}"
             try:
                 sweep, best = _sweep_params(code, df, param_space, fn_name=fn_name)
-                # Exit research: need at least 10 trades; check via "baseline" count
-                min_count = (
-                    (best["stats"].get("baseline") or {}).get("count", 0)
-                    if is_exit else
-                    best["stats"].get("fwd_5", {}).get("count", 0)
-                ) if best else 0
+                # Determine minimum count check by research type
+                if best:
+                    if is_exit:
+                        min_count = (best["stats"].get("baseline") or {}).get("count", 0)
+                    else:
+                        min_count = (best["stats"].get("fwd_5") or {}).get("count", 0)
+                else:
+                    min_count = 0
                 if best and min_count >= 10:
                     sweep_results[combo_key] = sweep
                     best_by_combo[combo_key] = best
@@ -1403,17 +1410,155 @@ for i in df.index[df['entry_long']]:
 No markdown. No explanation."""
 
 
+_LIMIT_ORDER_CODE_GEN_SYSTEM = r"""You write Python limit/stop order entry analysis functions.
+
+Unlike entry research (which enters at market price), limit order research:
+1. Calculates a PENDING ORDER level per signal bar
+2. Scans forward up to max_wait_bars to check if price reaches that level (fill)
+3. After fill, measures forward returns at 5/10/20/50 bars from the fill bar
+4. Compares outcomes to immediate market entry at the signal bar (baseline)
+
+You will output TWO parts separated by "###PARAM_SPACE###":
+
+PART 1 — Function `analyze_limit_order_entry(df, **params)`.
+PART 2 — JSON dict PARAM_SPACE defining the sweep grid.
+
+=== PART 1 REQUIREMENTS ===
+```python
+import pandas as pd
+import pandas_ta as ta
+import numpy as np
+from scipy import stats as _sp
+
+def analyze_limit_order_entry(df: pd.DataFrame, **params) -> dict:
+    df = df.copy()
+    df.columns = [c.title() for c in df.columns]
+
+    # === PARAMS ===
+    max_wait_bars = params.get('max_wait_bars', 10)  # bars to wait for fill
+    order_offset_atr = params.get('order_offset_atr', 0.3)  # ATR mult away from signal bar
+    order_type = params.get('order_type', 'limit')  # 'limit' = counter-trend, 'stop' = momentum
+
+    # === SIGNAL ===
+    # Define the signal that triggers the pending order
+    # (use same approach as entry_research — indicator cross, level touch, etc.)
+    df['signal'] = 0  # +1 = want to go long, -1 = want to go short
+
+    # === PENDING ORDER LEVEL ===
+    # limit: entry_level = signal_bar_low - offset (buy cheaper on pullback)
+    # stop:  entry_level = signal_bar_high + offset (buy on momentum confirm)
+    atr = ta.atr(df['High'], df['Low'], df['Close'], length=14)
+    # df['pending_level'] = ... (calculate per bar based on order_type and offset)
+
+    # === TRADE SIMULATION ===
+    # For each signal bar, try to fill the pending order within max_wait_bars.
+    # Then measure forward returns from fill bar (not from signal bar).
+    market_trades = []   # immediate market entry (baseline)
+    limit_trades  = []   # pending order entry
+
+    for idx in df.index[df['signal'] != 0]:
+        iloc_i = df.index.get_loc(idx)
+        direction = df.at[idx, 'signal']
+        sig_close = df.at[idx, 'Close']
+        offset = (atr.at[idx] if not np.isnan(atr.at[idx]) else sig_close * 0.001) * order_offset_atr
+
+        # Pending level
+        if direction == 1:
+            pending_px = sig_close - offset if order_type == 'limit' else sig_close + offset
+        else:
+            pending_px = sig_close + offset if order_type == 'limit' else sig_close - offset
+
+        # Market entry: measure fwd returns from next bar (iloc_i+1)
+        for h in [5, 10, 20, 50]:
+            fwd_idx = iloc_i + 1 + h
+            if fwd_idx < len(df):
+                ret = np.log(df['Close'].iloc[fwd_idx] / df['Close'].iloc[iloc_i + 1]) * direction
+                market_trades.append({'horizon': h, 'ret': ret})
+
+        # Pending entry: scan forward for fill
+        fill_iloc = None
+        for j in range(iloc_i + 1, min(iloc_i + max_wait_bars + 1, len(df))):
+            bar = df.iloc[j]
+            if direction == 1 and bar['Low'] <= pending_px:
+                fill_iloc = j
+                break
+            elif direction == -1 and bar['High'] >= pending_px:
+                fill_iloc = j
+                break
+
+        if fill_iloc is not None:
+            for h in [5, 10, 20, 50]:
+                fwd_idx = fill_iloc + h
+                if fwd_idx < len(df):
+                    ret = np.log(df['Close'].iloc[fwd_idx] / pending_px) * direction
+                    limit_trades.append({'horizon': h, 'ret': ret, 'fill_bar': fill_iloc - iloc_i})
+
+    # === STATS BLOCK ===
+    total_signals = int((df['signal'] != 0).sum())
+    fill_count = len(set(t['fill_bar'] for t in limit_trades)) if limit_trades else 0
+
+    def _horizon_stats(trades, h):
+        rets = [t['ret'] for t in trades if t['horizon'] == h]
+        s = pd.Series(rets)
+        if len(s) < 10:
+            return dict(count=len(s), hit_rate=None, avg_log_return=None,
+                        profit_factor=None, tstat=None)
+        wins = s[s > 0]; losses = s[s < 0]
+        pf = float(wins.sum() / abs(losses.sum())) if len(losses) > 0 and losses.sum() != 0 else None
+        t, _ = _sp.ttest_1samp(s.values, 0)
+        return dict(count=len(s), hit_rate=float((s > 0).mean()),
+                    avg_log_return=float(s.mean()), profit_factor=pf, tstat=float(t))
+
+    result = dict(
+        total_signals=total_signals,
+        fill_rate=round(fill_count / max(total_signals, 1), 4),
+        avg_wait_bars=float(np.mean([t['fill_bar'] for t in limit_trades])) if limit_trades else None,
+    )
+    for h in [5, 10, 20, 50]:
+        result[f'fwd_{h}']        = _horizon_stats(limit_trades,  h)   # limit entry returns
+        result[f'market_fwd_{h}'] = _horizon_stats(market_trades, h)   # baseline market returns
+
+    return result
+```
+
+=== PARAM_SPACE ===
+Always include:
+  "order_type": ["limit", "stop"]   — test both counter-trend and momentum entry
+  "order_offset_atr": [0.1, 0.2, 0.5, 1.0]  — how far from signal bar
+  "max_wait_bars": [5, 10, 20]      — patience before cancelling
+
+=== INTERPRETATION ===
+fwd_N (limit entry) vs market_fwd_N:
+  Better fill quality = limit avg_log_return > market avg_log_return at same horizon.
+  But fill_rate < 1.0 means missed trades — net edge = fill_rate × per-trade improvement.
+
+=== OUTPUT FORMAT ===
+<function code>
+###PARAM_SPACE###
+{"param_name": [...]}
+
+No markdown. No explanation."""
+
+
 def _generate_analysis_code(indicator: str, description: str, spec_type: str = "entry_research") -> tuple[str, dict]:
     """Returns (code_str, param_space_dict)."""
-    system = _EXIT_CODE_GEN_SYSTEM if spec_type == "exit_research" else _CODE_GEN_SYSTEM
+    if spec_type == "exit_research":
+        system   = _EXIT_CODE_GEN_SYSTEM
+        fn_label = "EXIT STRATEGY"
+        fn_instruction = "Write analyze_exit_strategy(df, **params) testing this exit rule vs baseline."
+    elif spec_type == "limit_order_research":
+        system   = _LIMIT_ORDER_CODE_GEN_SYSTEM
+        fn_label = "SETUP"
+        fn_instruction = "Write analyze_limit_order_entry(df, **params) simulating this pending order entry."
+    else:
+        system   = _CODE_GEN_SYSTEM
+        fn_label = "INDICATOR"
+        fn_instruction = "Write the parameterized analyze_indicator(df, **params) and PARAM_SPACE."
+
     user_msg = (
-        f"EXIT STRATEGY: {indicator}\n"
+        f"{fn_label}: {indicator}\n"
         f"DESCRIPTION: {description}\n\n"
-        "Write analyze_exit_strategy(df, **params) testing this exit rule vs baseline."
-    ) if spec_type == "exit_research" else (
-        f"INDICATOR: {indicator}\n"
-        f"SIGNAL LOGIC: {description}\n\n"
-        "Write the parameterized analyze_indicator(df, **params) and PARAM_SPACE."
+        f"{fn_instruction}"
     )
 
     from agents.utils import call_claude
