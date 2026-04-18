@@ -32,7 +32,9 @@ log = logging.getLogger(__name__)
 MODEL = "claude-sonnet-4-6"   # generates code AND interprets results
 
 # Asset/timeframe combos to test each indicator on
-_TEST_ASSETS = [("EURUSD", "1h"), ("EURUSD", "4h"), ("XAUUSD", "1h")]
+# 5m added so indicators are evaluated on intraday granularity, not just 1h/4h.
+# 1m excluded: ~2.6M bars causes Modal memory/timeout issues at current config.
+_TEST_ASSETS = [("EURUSD", "5m"), ("EURUSD", "1h"), ("EURUSD", "4h"), ("XAUUSD", "1h")]
 
 # ---------------------------------------------------------------------------
 # Indicator spec catalogue
@@ -1208,7 +1210,14 @@ The function MUST:
 2. Compute indicators using pandas_ta
 3. Set df['signal'] = +1 (long), -1 (short), or 0
    — signal fires only on the bar where condition becomes true (use .shift(1) for prior value)
-4. Return the stats block EXACTLY as shown (do not modify stats code)
+4. ALWAYS include a `regime_filter` param (bool, default True). When True:
+   - Compute EMA(200) on the Close series as the daily trend proxy.
+   - Long signals (+1) are only kept when Close > EMA(200) (uptrend).
+   - Short signals (-1) are only kept when Close < EMA(200) (downtrend).
+   - This eliminates counter-trend trades that look good in forward-return tests
+     but would be killed by regime mismatch in live trading (e.g. shorting during
+     a strong uptrend). Always include regime_filter=True in the PARAM_SPACE sweep.
+5. Return the stats block EXACTLY as shown (do not modify stats code)
 
 ```python
 import pandas as pd
@@ -1273,8 +1282,9 @@ def analyze_indicator(df: pd.DataFrame, **params) -> dict:
 === PART 2 — PARAM_SPACE JSON ===
 A dict mapping param name → list of values to sweep.
 Keep it under 50 total combinations (product of all lists).
+Always include "regime_filter": [false, true] so the sweep compares filtered vs unfiltered.
 Example:
-{"period": [10, 14, 21], "threshold": [25, 30, 35]}
+{"period": [10, 14, 21], "threshold": [25, 30, 35], "regime_filter": [false, true]}
 
 === OUTPUT FORMAT ===
 <function code here>

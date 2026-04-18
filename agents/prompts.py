@@ -144,6 +144,7 @@ MANDATORY CLASS ATTRIBUTES (all tunable by Optuna):
 - start_hour: int = 7           (session start, UTC hour)
 - end_hour: int = 20            (session end, UTC hour)
 - max_daily_losses: int = 3     (risk management — max losing trades per day)
+- max_bars_exit: int = 0        (0 = disabled; >0 = close trade after N bars — aligns exit to research horizon fwd_5/10/20/50)
 
 IF using SuperTrend, also add:
 - st_period: int = 7            (SuperTrend ATR period)
@@ -223,6 +224,7 @@ Return a JSON object with these exact keys:
   "code": "<complete Python code as string>",
   "param_space": {{
     "<param_name>": ["int"|"float"|"categorical", <low>, <high>],
+    "max_bars_exit": ["int", 0, 50],
     ...
   }},
   "hypothesis": "<one paragraph explaining the edge>",
@@ -276,6 +278,7 @@ class {{StrategyName}}Strategy(Strategy):
     start_hour: int = 7
     end_hour: int = 20
     max_daily_losses: int = 3
+    max_bars_exit: int = 0       # 0 = disabled; >0 = close after N bars (aligns to research horizon)
 
     def init(self) -> None:
         close = pd.Series(self.data.Close)
@@ -320,6 +323,12 @@ class {{StrategyName}}Strategy(Strategy):
         price = self.data.Close[-1]
         sl_dist = self.sl_atr * atr
         tp_dist = self.tp_atr * atr
+
+        # ── Time-based exit: close trades held beyond research horizon ──────
+        if self.max_bars_exit > 0:
+            for trade in self.trades:
+                if (len(self.data) - trade.entry_bar) >= self.max_bars_exit:
+                    trade.close()
 
         # ── Entry signals (use [-2] — previous bar confirmed signal) ────────
         # [ENTRY LOGIC HERE — read from self.indicator[-2]]
