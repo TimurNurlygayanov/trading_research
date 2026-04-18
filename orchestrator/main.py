@@ -2639,6 +2639,9 @@ _RESEARCH_HTML = r"""<!DOCTYPE html>
     <button class="btn-secondary" id="gen-btn" onclick="generateTasks()">
       ⚗ Run indicator research
     </button>
+    <button class="btn-secondary" id="agenda-btn" onclick="seedAgendas()" style="margin-left:8px">
+      &#128196; Seed agendas
+    </button>
   </div>
 </nav>
 
@@ -2974,6 +2977,23 @@ async function generateTasks() {
   }
 }
 
+async function seedAgendas() {
+  const btn = document.getElementById('agenda-btn');
+  btn.disabled = true;
+  btn.textContent = 'Generating…';
+  try {
+    const r = await fetch('/api/research/generate-agenda', {method: 'POST'});
+    const d = await r.json();
+    showToast(d.created > 0 ? `Created ${d.created} agenda tasks.` : 'No new agenda tasks (all agendas at target).');
+    setTimeout(() => { loadStats(); loadQueue(); }, 1500);
+  } catch(e) {
+    showToast('Failed to seed agendas', true);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '&#128196; Seed agendas';
+  }
+}
+
 async function restartTask(id) {
   const r = await fetch(`/api/research/tasks/${id}/restart`, {method:'POST'});
   const d = await r.json();
@@ -3102,13 +3122,12 @@ def api_generate_research_tasks(background_tasks: BackgroundTasks) -> JSONRespon
     Fill the research queue using three modes in order:
       1. Static catalogue (free, exhausted once)
       2. Param sweeps of best partial results (LLM, targeted)
-      3. Full invention: novel indicators + combos (LLM, creative)
+      3. Agenda-driven research (structured hypotheses from RESEARCH_AGENDAS)
     """
     try:
         from agents.indicator_researcher import (
             generate_research_tasks,
             generate_param_sweep_tasks,
-            generate_llm_combo_tasks,
         )
         # Mode 1: static catalogue
         created = generate_research_tasks()
@@ -3117,14 +3136,30 @@ def api_generate_research_tasks(background_tasks: BackgroundTasks) -> JSONRespon
         if created == 0:
             created = generate_param_sweep_tasks(n_partials=5, variations_per=5)
             mode = "param_sweeps"
-        # Mode 3: LLM invention
+        # Mode 3: agenda-driven research
         if created == 0:
-            created = generate_llm_combo_tasks(n=15)
-            mode = "llm_invention"
+            from agents.research_agenda import process_all_agendas
+            created = process_all_agendas(limit_per_agenda=5)
+            mode = "agenda"
     except Exception as exc:
         log.error("api_generate_research_error", error=str(exc), traceback=_traceback.format_exc())
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
     return JSONResponse({"ok": True, "created": created, "mode": mode})
+
+
+@app.post("/api/research/generate-agenda")
+def api_generate_agenda_tasks() -> JSONResponse:
+    """
+    Force-generate agenda tasks regardless of queue size.
+    Generates up to 5 tasks per agenda per call.
+    """
+    try:
+        from agents.research_agenda import process_all_agendas
+        created = process_all_agendas(limit_per_agenda=5)
+    except Exception as exc:
+        log.error("api_generate_agenda_error", error=str(exc), traceback=_traceback.format_exc())
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
+    return JSONResponse({"ok": True, "created": created})
 
 
 @app.get("/api/indicator-library")
