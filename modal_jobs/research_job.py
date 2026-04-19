@@ -174,7 +174,7 @@ def run_research_task(task_id: str) -> dict:
     image=image,
     cpu=4,
     memory=8192,
-    timeout=600,
+    timeout=1800,  # 30 minutes
     secrets=[modal.Secret.from_name("trading-research-secrets")],
     volumes={CACHE_DIR: ohlcv_cache},
 )

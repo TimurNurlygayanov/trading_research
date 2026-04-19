@@ -114,7 +114,7 @@ def run_implementer(
 
         response = call_claude(
             model=MODEL,
-            max_tokens=3000,
+            max_tokens=8000,
             system=IMPLEMENTER_SYSTEM,
             messages=messages,
         )
@@ -133,8 +133,11 @@ def run_implementer(
                 messages.append({
                     "role": "user",
                     "content": (
-                        "Your response could not be parsed as valid JSON. "
-                        "Please return ONLY a valid JSON object."
+                        "Your response was truncated or contains invalid JSON (unterminated string). "
+                        "The strategy code was cut off mid-way. "
+                        "Please return the COMPLETE strategy as a single valid JSON object. "
+                        "Keep the code concise — avoid long docstrings, use short variable names if needed. "
+                        "Return ONLY the JSON object, no other text."
                     ),
                 })
                 continue

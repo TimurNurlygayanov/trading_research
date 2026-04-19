@@ -53,11 +53,92 @@ image = (
 ohlcv_cache = modal.Volume.from_name("trading-research-ohlcv-cache", create_if_missing=True)
 CACHE_DIR = "/ohlcv_cache"
 
+QUICK_TEST_TIMEFRAMES = ["4h", "1h", "15m", "5m", "1m"]
+QUICK_TEST_SYMBOLS    = ["EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD", "NZDUSD"]
+
+
 @app.function(
     image=image,
     cpu=2,
-    memory=8192,
-    timeout=900,  # 15 minutes — tests all timeframes sequentially
+    memory=4096,
+    timeout=600,  # 10 min — one symbol × all timeframes
+    secrets=[modal.Secret.from_name("trading-research-secrets")],
+    volumes={CACHE_DIR: ohlcv_cache},
+)
+def _run_symbol_quick_test(strategy_code: str, symbol: str, timeframes: list) -> dict:
+    """
+    Run default-param backtest for one symbol across all timeframes.
+    Called in parallel (one per symbol) by run_quick_backtest.
+    Returns {tf: metrics_dict}.
+    """
+    import os, math
+    import pandas as pd
+    from backtesting import Strategy
+    from backtest.data_fetcher import fetch_ohlcv, split_train_oos
+    from backtest.engine import run_backtest
+
+    def _clean(v, nd=4):
+        if v is None: return None
+        try:
+            f = float(v)
+            return None if (math.isnan(f) or math.isinf(f)) else round(f, nd)
+        except (TypeError, ValueError):
+            return None
+
+    namespace: dict = {}
+    exec(compile(strategy_code, "<strategy>", "exec"), namespace)
+    strategy_class = next(
+        (v for v in namespace.values()
+         if isinstance(v, type) and issubclass(v, Strategy) and v is not Strategy),
+        None,
+    )
+    if not strategy_class:
+        return {tf: {"error": "No Strategy subclass found", "sharpe": -999.0}
+                for tf in timeframes}
+
+    results = {}
+    cache_needs_commit = False
+    for tf in timeframes:
+        try:
+            cache_file = f"{CACHE_DIR}/{symbol}_{tf}.parquet"
+            if os.path.exists(cache_file):
+                df = pd.read_parquet(cache_file)
+            else:
+                df = fetch_ohlcv(symbol, tf, start="2015-01-01", end="2026-12-31")
+                os.makedirs(CACHE_DIR, exist_ok=True)
+                df.to_parquet(cache_file)
+                cache_needs_commit = True
+
+            train_df, _ = split_train_oos(df)
+            result = run_backtest(strategy_class, train_df, params={}, enforce_gates=False)
+            results[tf] = {
+                "sharpe":           _clean(result.sharpe),
+                "equity_sharpe":    _clean(result.equity_sharpe),
+                "trades":           result.total_trades,
+                "win_rate":         _clean(result.win_rate),
+                "drawdown":         _clean(result.max_drawdown),
+                "profit_factor":    _clean(result.profit_factor, 3),
+                "signals_per_year": _clean(result.signals_per_year, 1),
+                "bars":             len(train_df),
+                "start":            train_df.index[0].strftime("%Y-%m-%d"),
+                "end":              train_df.index[-1].strftime("%Y-%m-%d"),
+            }
+        except Exception as exc:
+            results[tf] = {"error": str(exc)[:200], "sharpe": -999.0}
+
+    if cache_needs_commit:
+        try:
+            ohlcv_cache.commit()
+        except Exception:
+            pass
+    return results
+
+
+@app.function(
+    image=image,
+    cpu=2,
+    memory=4096,
+    timeout=900,  # 15 min — just orchestrates + HTML report; workers do the heavy lifting
     secrets=[modal.Secret.from_name("trading-research-secrets")],
     volumes={CACHE_DIR: ohlcv_cache},
 )
@@ -72,15 +153,10 @@ def run_quick_backtest(strategy_id: str) -> dict:
     import pandas as pd
     from backtesting import Strategy
 
-    # Symbols and timeframes tested with default params — ordered so partial
-    # results are still useful if the job times out near the end.
-    QUICK_TEST_TIMEFRAMES = ["4h", "1h", "15m", "5m", "1m"]
-    QUICK_TEST_SYMBOLS    = ["EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD", "NZDUSD"]
-
     try:
         from db import supabase_client as db
         from agents.utils import add_pipeline_note
-        from backtest.data_fetcher import fetch_ohlcv, split_train_oos
+        from backtest.data_fetcher import split_train_oos
         from backtest.engine import run_backtest
         from backtest.leakage_detector import check_leakage
 
@@ -97,13 +173,14 @@ def run_quick_backtest(strategy_id: str) -> dict:
         db.update_strategy(strategy_id, {"status": "quick_testing"})
         add_pipeline_note(strategy_id,
             f"Quick test started — {len(QUICK_TEST_SYMBOLS)} symbols × "
-            f"{len(QUICK_TEST_TIMEFRAMES)} timeframes, default params, no optimization.")
+            f"{len(QUICK_TEST_TIMEFRAMES)} timeframes in parallel, default params.")
 
-        # Leakage check (fast, before any data work)
+        # Leakage check (fast, before spawning workers)
         leakage_result = check_leakage(code)
         if not leakage_result.passed:
             db.update_strategy(strategy_id, {
                 "status": "failed",
+                "modal_job_id": None,
                 "leakage_score": leakage_result.score,
                 "leakage_issues": leakage_result.issues,
                 "error_log": (
@@ -117,7 +194,7 @@ def run_quick_backtest(strategy_id: str) -> dict:
             return {"passed": False, "reason": "leakage_check_failed",
                     "issues": leakage_result.issues}
 
-        # Execute the strategy class once (shared across all runs)
+        # Exec strategy class locally for the HTML report later
         namespace: dict = {}
         exec(compile(code, "<strategy>", "exec"), namespace)
         strategy_classes = {
@@ -127,69 +204,34 @@ def run_quick_backtest(strategy_id: str) -> dict:
         if not strategy_classes:
             raise ValueError("No Strategy subclass found in generated code")
         expected_name = indicators_meta.get("strategy_class", "")
-        if expected_name and expected_name in strategy_classes:
-            strategy_class = strategy_classes[expected_name]
-        else:
-            strategy_class = next(iter(strategy_classes.values()))
+        strategy_class = (
+            strategy_classes[expected_name]
+            if expected_name and expected_name in strategy_classes
+            else next(iter(strategy_classes.values()))
+        )
 
-        # ── Run backtest on every symbol × timeframe ──────────────────────────
-        def _clean(v, ndigits=4):
-            """Round float; replace NaN/inf with None so JSONB accepts it."""
-            import math
-            if v is None:
-                return None
-            try:
-                f = float(v)
-                return None if (math.isnan(f) or math.isinf(f)) else round(f, ndigits)
-            except (TypeError, ValueError):
-                return None
-
-        # all_sym_results[sym][tf] = metrics dict
+        # ── Spawn one worker per symbol in parallel ───────────────────────────
+        handles = [
+            _run_symbol_quick_test.spawn(code, sym, QUICK_TEST_TIMEFRAMES)
+            for sym in QUICK_TEST_SYMBOLS
+        ]
         all_sym_results: dict = {}
-        # tf_dates[(sym, tf)] = (start_str, end_str, n_bars)
-        tf_dates: dict = {}
-        cache_needs_commit = False
-
-        for sym in QUICK_TEST_SYMBOLS:
-            all_sym_results[sym] = {}
-            for tf in QUICK_TEST_TIMEFRAMES:
-                try:
-                    cache_file = f"{CACHE_DIR}/{sym}_{tf}.parquet"
-                    if os.path.exists(cache_file):
-                        df = pd.read_parquet(cache_file)
-                    else:
-                        df = fetch_ohlcv(sym, tf, start="2015-01-01", end="2026-12-31")
-                        os.makedirs(CACHE_DIR, exist_ok=True)
-                        df.to_parquet(cache_file)
-                        cache_needs_commit = True
-
-                    train_df, _ = split_train_oos(df)
-                    tf_dates[(sym, tf)] = (
-                        train_df.index[0].strftime("%Y-%m-%d"),
-                        train_df.index[-1].strftime("%Y-%m-%d"),
-                        len(train_df),
-                    )
-                    result = run_backtest(strategy_class, train_df, params={},
-                                          enforce_gates=False)
-
-                    all_sym_results[sym][tf] = {
-                        "sharpe":           _clean(result.sharpe),
-                        "equity_sharpe":    _clean(result.equity_sharpe),
-                        "trades":           result.total_trades,
-                        "win_rate":         _clean(result.win_rate),
-                        "drawdown":         _clean(result.max_drawdown),
-                        "profit_factor":    _clean(result.profit_factor, 3),
-                        "signals_per_year": _clean(result.signals_per_year, 1),
-                        "bars":             len(train_df),
-                    }
-                except Exception as tf_err:
-                    all_sym_results[sym][tf] = {"error": str(tf_err)[:200], "sharpe": -999.0}
-
-        if cache_needs_commit:
+        for sym, handle in zip(QUICK_TEST_SYMBOLS, handles):
             try:
-                ohlcv_cache.commit()
-            except Exception:
-                pass
+                all_sym_results[sym] = handle.get()
+            except Exception as exc:
+                all_sym_results[sym] = {
+                    tf: {"error": str(exc)[:200], "sharpe": -999.0}
+                    for tf in QUICK_TEST_TIMEFRAMES
+                }
+
+        # Extract date info from results (workers include start/end)
+        tf_dates: dict = {}
+        for sym in QUICK_TEST_SYMBOLS:
+            for tf in QUICK_TEST_TIMEFRAMES:
+                m = all_sym_results[sym].get(tf, {})
+                if "start" in m and "end" in m:
+                    tf_dates[(sym, tf)] = (m["start"], m["end"], m.get("bars", 0))
 
         # ── Pick the best (symbol, timeframe) by Sharpe ───────────────────────
         # Require at least 10 trades to be valid.
