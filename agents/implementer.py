@@ -306,18 +306,78 @@ def _parse_json_response(text: str, strategy_id: str) -> dict | None:
     if "```json" in text:
         text = text.split("```json")[1].split("```")[0].strip()
     elif "```" in text:
-        # Find the first ``` block that looks like JSON
         parts = text.split("```")
-        for part in parts[1::2]:  # Odd indices are code block content
+        for part in parts[1::2]:
             stripped = part.strip()
             if stripped.startswith("{"):
                 text = stripped
                 break
+
+    # Fast path
     try:
         return json.loads(text)
     except json.JSONDecodeError as e:
-        log.error(f"JSON parse error for {strategy_id}: {e}\nText prefix: {text[:300]}")
+        pass
+
+    # Repair: replace unescaped double-quotes inside the "code" value.
+    # Strategy: find the "code": "..." span and re-escape its contents.
+    repaired = _repair_code_field(text)
+    if repaired:
+        try:
+            return json.loads(repaired)
+        except json.JSONDecodeError:
+            pass
+
+    log.error(f"JSON parse error for {strategy_id}\nText prefix: {text[:300]}")
+    return None
+
+
+def _repair_code_field(text: str) -> str | None:
+    """
+    Repair unescaped double-quotes inside the "code" JSON value.
+
+    The LLM sometimes emits Python code containing " without escaping as \\".
+    We locate the code field boundaries using the next known JSON key,
+    replace unescaped " with ' inside the raw content, then splice back.
+    """
+    import re
+
+    m_start = re.search(r'"code"\s*:\s*"', text)
+    if not m_start:
         return None
+    code_start = m_start.end()
+
+    # next_key matches the closing " of the code value followed by the next key
+    next_key = re.search(
+        r'",\s*"(?:param_space|hypothesis|indicators_used|notes|strategy_name|recommended)',
+        text[code_start:],
+    )
+    if not next_key:
+        return None
+
+    # code_end is the position of the closing " (not past it)
+    code_end = code_start + next_key.start()
+    raw_code = text[code_start:code_end]  # content without surrounding quotes
+
+    # 1. Replace unescaped " with ' (single-quote instruction in the prompt)
+    #    A " preceded by \ is a valid JSON escape (\") — leave it alone.
+    fixed = re.sub(r'(?<!\\)"', "'", raw_code)
+
+    # 2. Escape any literal control characters that break JSON strings
+    fixed = (
+        fixed
+        .replace('\\', '\\\\')   # must be first: escape existing backslashes
+        .replace("'", "'")       # single quotes are fine in JSON — no change needed
+        .replace('\n', '\\n')
+        .replace('\r', '\\r')
+        .replace('\t', '\\t')
+    )
+    # Undo double-escaping of sequences that were already valid JSON escapes
+    # e.g. the original \\n (two chars) became \\\\n after the replace above → fix back
+    fixed = re.sub(r'\\\\([nrt"\\])', r'\\\1', fixed)
+
+    # text[code_end:] starts with the original closing " — preserve it
+    return text[:code_start] + fixed + text[code_end:]
 
 
 def _format_research_results(results: list[dict]) -> str:

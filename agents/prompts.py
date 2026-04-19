@@ -217,11 +217,15 @@ LEAKAGE PREVENTION CHECKLIST — verify before generating:
 [ ] trade_on_close=False (set by engine, but don't override)
 
 OUTPUT FORMAT:
+CRITICAL JSON RULE: The "code" field is a JSON string. You MUST use ONLY single quotes
+for ALL Python string literals inside the code (e.g. 'text', f'SUPERT_{x}', not "text").
+Never use double quotes inside the code value — they break JSON parsing.
+
 Return a JSON object with these exact keys:
 {{
   "strategy_name": "<PascalCase name>",
   "strategy_class": "<CamelCase>Strategy",
-  "code": "<complete Python code as string>",
+  "code": "<complete Python code as string — ALL strings inside must use single quotes>",
   "param_space": {{
     "<param_name>": ["int"|"float"|"categorical", <low>, <high>],
     "max_bars_exit": ["int", 0, 50],

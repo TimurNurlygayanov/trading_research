@@ -50,7 +50,7 @@ def run_pre_filter(strategy_id: str) -> dict[str, Any]:
     from agents.utils import call_claude
     response = call_claude(
         model=MODEL,
-        max_tokens=1024,
+        max_tokens=2048,
         system=PRE_FILTER_SYSTEM,
         messages=[{"role": "user", "content": user_msg}],
     )
