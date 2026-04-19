@@ -2402,10 +2402,10 @@ async function showPipelineStatus() {
     const sections = [['Ideas queue', d.ideas || {}], ['Strategies', d.strategies || {}]];
     body.innerHTML = sections.map(([title, counts]) => {
       const rows = Object.entries(counts).sort((a,b) => b[1]-a[1]);
-      if (!rows.length) return \`<div class="ps-section"><h4>\${title}</h4><div style="color:#64748b;font-size:.85rem">empty</div></div>\`;
-      return \`<div class="ps-section"><h4>\${title}</h4>\${rows.map(([st,n]) =>
-        \`<div class="ps-row"><span class="ps-label">\${st}</span><span class="ps-count \${STATUS_COLOR[st]||''}">\${n}</span></div>\`
-      ).join('')}</div>\`;
+      if (!rows.length) return `<div class="ps-section"><h4>${title}</h4><div style="color:#64748b;font-size:.85rem">empty</div></div>`;
+      return `<div class="ps-section"><h4>${title}</h4>${rows.map(([st,n]) =>
+        `<div class="ps-row"><span class="ps-label">${st}</span><span class="ps-count ${STATUS_COLOR[st]||''}">${n}</span></div>`
+      ).join('')}</div>`;
     }).join('');
   } catch(e) {
     body.innerHTML = '<div style="color:#f87171">Failed to load</div>';
