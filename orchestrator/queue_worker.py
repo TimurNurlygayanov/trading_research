@@ -449,7 +449,7 @@ def _process_user_ideas() -> int:
         strategy_id: str | None = None
         try:
             strategy_record = db.insert_strategy({
-                "source": "user",
+                "source": idea.get("source") or "user",
                 "status": "idea",
                 "name": idea.get("title", "Untitled Idea"),
                 "hypothesis": idea.get("description", ""),

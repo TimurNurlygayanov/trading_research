@@ -272,6 +272,30 @@ def run_quick_backtest(strategy_id: str) -> dict:
             if "error" not in all_sym_results[sym][tf]
         ]
         total_trades_across_all = sum(m.get("trades", 0) for m in ran_ok)
+
+        # Fail early if every tested combo has a deeply negative Sharpe — nothing to optimise.
+        # A best Sharpe < -1.0 with default params means the strategy logic is fundamentally
+        # broken (wrong direction, session filter blocking all viable bars, etc.).
+        if ran_ok and total_trades_across_all > 0:
+            best_default_sharpe = max((m.get("sharpe", -999.0) for m in ran_ok), default=-999.0)
+            if best_default_sharpe < -1.0:
+                reason = (
+                    f"Best default-param Sharpe across all combos is {best_default_sharpe:.3f} — "
+                    "too negative to recover through optimization. "
+                    "Likely causes: mean return smaller than round-trip commission, "
+                    "wrong entry direction, or strategy needs fundamentally different logic."
+                )
+                db.update_strategy(strategy_id, {
+                    "status": "failed",
+                    "modal_job_id": None,
+                    "quick_test_all_timeframes": tf_results,
+                    "quick_test_all_symbols": all_sym_results,
+                    "error_log": reason,
+                })
+                add_pipeline_note(strategy_id, f"Quick test FAILED — {reason}")
+                return {"passed": False, "reason": "deeply_negative_sharpe_all_combos",
+                        "best_default_sharpe": best_default_sharpe}
+
         if ran_ok and total_trades_across_all == 0:
             reason = (
                 f"Zero trades on ALL {len(QUICK_TEST_SYMBOLS)} symbols × "
@@ -511,13 +535,18 @@ def run_backtest_pipeline(strategy_id: str) -> dict:
 
         # 4. Build param_space for optimizer
         # LLM may produce either:
-        #   ["int", 5, 30]               → ("int", 5, 30)
-        #   ["float", 1.0, 4.0]          → ("float", 1.0, 4.0)
-        #   ["categorical", 1.2, 1.5, 2] → ("categorical", [1.2, 1.5, 2])
-        #   ["categorical", [1.2, 1.5]]  → ("categorical", [1.2, 1.5])
+        #   ["int", 5, 30]               → ("int", 5, 30)      (optimizable range)
+        #   ["float", 1.0, 4.0]          → ("float", 1.0, 4.0) (optimizable range)
+        #   ["categorical", 1.2, 1.5, 2] → ("categorical", [...]) (optimizable choices)
+        #   ["categorical", [1.2, 1.5]]  → ("categorical", [...]) (optimizable choices)
+        #   1  / 1.5 / "value"           → fixed_params (scalar — pinned for every trial)
         opt_space = {}
+        fixed_params: dict = {}
         for k, v in param_space.items():
             if not isinstance(v, list) or len(v) < 2:
+                # Scalar value: pin it for every trial so class default isn't used
+                if v is not None and not isinstance(v, (dict, list)):
+                    fixed_params[k] = v
                 continue
             kind = v[0]
             if kind == "categorical":
@@ -575,7 +604,7 @@ def run_backtest_pipeline(strategy_id: str) -> dict:
                 _probe_df = opt_train_df.iloc[:_PREFLIGHT_BARS]
                 _t0 = _time.time()
                 try:
-                    run_backtest(strategy_class, _probe_df, params={}, enforce_gates=False)
+                    run_backtest(strategy_class, _probe_df, params=fixed_params, enforce_gates=False)
                 except Exception:
                     pass  # errors caught later in the real run
                 _probe_secs = _time.time() - _t0
@@ -600,6 +629,7 @@ def run_backtest_pipeline(strategy_id: str) -> dict:
                     strategy_class, opt_train_df, opt_space,
                     n_trials=50, n_jobs=4,
                     timeout_seconds=_OPT_BUDGET_PER_TF,
+                    fixed_params=fixed_params or None,
                 )
                 opt_result = run_backtest(
                     strategy_class, opt_train_df, params=opt_params, enforce_gates=False
@@ -709,7 +739,7 @@ def run_backtest_pipeline(strategy_id: str) -> dict:
                 add_pipeline_note(strategy_id, f"Recent data check skipped (error: {_rce}).")
 
         # 6. Walk-forward validation
-        wf_result = walk_forward(strategy_class, train_df, opt_space, n_folds=3, n_trials=10)
+        wf_result = walk_forward(strategy_class, train_df, opt_space, n_folds=3, n_trials=10, fixed_params=fixed_params or None)
         wf_scores = wf_result.oos_sharpes  # list of OOS Sharpe per fold
 
         add_pipeline_note(

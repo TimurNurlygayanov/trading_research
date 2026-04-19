@@ -207,6 +207,18 @@ CRITICAL API RULES:
 - NEVER read self.position.sl or self.position.tp — Position has NO .sl/.tp attributes
 - To modify stops on open trades: for trade in self.trades: trade.sl = new_value
 
+RESEARCH-DERIVED STRATEGIES (when description says "PRIMARY symbol" / "statistical edge" / "prob_research"):
+These strategies are built from measured statistical edges. Follow these rules EXACTLY or the edge is destroyed:
+1. Use ONLY the symbol and timeframe stated in the description — do not generalise
+2. Use max_bars_exit = forward_bars stated in the description as the DEFAULT (not 0).
+   Set param_space for max_bars_exit as ["int", fwd, fwd+2] to allow small variation.
+3. Do NOT add SL/TP unless the description explicitly requests it.
+   If the framework requires a stop, use 5×ATR as a catastrophic-loss backstop ONLY.
+4. set start_hour=0, end_hour=23 (no session filter) — the edge was measured across all hours.
+5. Keep param_space MINIMAL — only the direct condition threshold(s) and max_bars_exit.
+   Do NOT add extra filters (RSI, EMA confirmation, volume, etc.) — they overfit on small samples.
+6. The mean return per trade is small — MORE trades (lower thresholds) beat FEWER trades.
+
 LEAKAGE PREVENTION CHECKLIST — verify before generating:
 [ ] No shift(-N) anywhere
 [ ] No bfill() or fillna(method='backfill')

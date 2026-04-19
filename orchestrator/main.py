@@ -4083,6 +4083,8 @@ _PROB_HTML = r"""<!DOCTYPE html>
         <option value="1d">1D</option>
         <option value="4h">4H</option>
         <option value="1h">1H</option>
+        <option value="5m">5M</option>
+        <option value="1m">1M</option>
       </select>
     </div>
     <div class="filter-group">
@@ -4120,6 +4122,21 @@ _PROB_HTML = r"""<!DOCTYPE html>
         <option value="">All</option>
         <option value="1">p &lt; 0.05 only</option>
         <option value="0.1">p &lt; 0.10 only</option>
+      </select>
+    </div>
+    <div class="filter-group">
+      <label>Timeframe</label>
+      <select id="fTfGroup" onchange="loadResults()">
+        <option value="viable">4h + 1d only (viable after costs)</option>
+        <option value="">All timeframes</option>
+        <option value="1h_only">1h only</option>
+      </select>
+    </div>
+    <div class="filter-group">
+      <label>After-cost viable</label>
+      <select id="fCostViable" onchange="loadResults()">
+        <option value="1">Mean return &gt; 3× commission</option>
+        <option value="">Show all</option>
       </select>
     </div>
     <div style="margin-left:auto; display:flex; align-items:flex-end; gap:10px;">
@@ -4167,10 +4184,11 @@ _PROB_HTML = r"""<!DOCTYPE html>
           <th onclick="sortBy('p_value')">P-value <span class="sort-arrow">↕</span></th>
           <th onclick="sortBy('sharpe')">Sharpe <span class="sort-arrow">↕</span></th>
           <th onclick="sortBy('is_significant')">Sig? <span class="sort-arrow">↕</span></th>
+          <th>Action</th>
         </tr>
       </thead>
       <tbody id="tbody">
-        <tr><td colspan="12" class="empty">Loading…</td></tr>
+        <tr><td colspan="13" class="empty">Loading…</td></tr>
       </tbody>
     </table>
   </div>
@@ -4182,13 +4200,17 @@ let allRows = [];
 let sortCol = 'p_value';
 let sortAsc = true;
 
+const COMMISSION_RT = 0.0004;  // 0.04% round-trip (0.02% per side)
+
 async function loadResults() {
-  const sym  = document.getElementById('fSymbol').value;
-  const tf   = document.getElementById('fTf').value;
-  const cat  = document.getElementById('fCat').value;
-  const fwd  = document.getElementById('fFwd').value;
-  const dir  = document.getElementById('fDir').value;
-  const sig  = document.getElementById('fSig').value;
+  const sym      = document.getElementById('fSymbol').value;
+  const tf       = document.getElementById('fTf').value;
+  const cat      = document.getElementById('fCat').value;
+  const fwd      = document.getElementById('fFwd').value;
+  const dir      = document.getElementById('fDir').value;
+  const sig      = document.getElementById('fSig').value;
+  const tfGroup  = document.getElementById('fTfGroup').value;
+  const costViable = document.getElementById('fCostViable').value;
 
   const params = new URLSearchParams();
   if (sym) params.set('symbol', sym);
@@ -4199,7 +4221,7 @@ async function loadResults() {
   if (sig) params.set('max_p_value', sig);
 
   const tbody = document.getElementById('tbody');
-  tbody.innerHTML = '<tr><td colspan="12" class="empty">Loading…</td></tr>';
+  tbody.innerHTML = '<tr><td colspan="13" class="empty">Loading…</td></tr>';
 
   try {
     const r = await fetch('/api/probabilities/results?' + params);
@@ -4238,11 +4260,20 @@ function sortBy(col) {
   ths.forEach(th => { if (th.getAttribute('onclick') === `sortBy('${col}')`) th.classList.add('sorted'); });
 }
 
+function isViable(r) {
+  return Math.abs(r.mean_return || 0) > COMMISSION_RT * 3;
+}
+
 function renderTable() {
-  const fDir = document.getElementById('fDir').value;
+  const fDir      = document.getElementById('fDir').value;
+  const tfGroup   = document.getElementById('fTfGroup').value;
+  const costFilter = document.getElementById('fCostViable').value;
   let rows = [...allRows];
   if (fDir === 'bull') rows = rows.filter(r => r.hit_rate > 0.5);
   if (fDir === 'bear') rows = rows.filter(r => r.hit_rate < 0.5);
+  if (tfGroup === 'viable') rows = rows.filter(r => r.timeframe === '4h' || r.timeframe === '1d');
+  if (tfGroup === '1h_only') rows = rows.filter(r => r.timeframe === '1h');
+  if (costFilter === '1') rows = rows.filter(r => isViable(r));
 
   rows.sort((a, b) => {
     const va = a[sortCol]; const vb = b[sortCol];
@@ -4254,7 +4285,7 @@ function renderTable() {
 
   const tbody = document.getElementById('tbody');
   if (!rows.length) {
-    tbody.innerHTML = '<tr><td colspan="12" class="empty">No results — run the analysis first or adjust filters.</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="13" class="empty">No results — run the analysis first or adjust filters.</td></tr>';
     return;
   }
   tbody.innerHTML = rows.map(r => {
@@ -4274,10 +4305,19 @@ function renderTable() {
       : '<span class="sig-dot sig-no"></span>No';
     const pFmt = r.p_value != null ? r.p_value.toFixed(4) : '—';
     const tFmt = r.t_stat  != null ? r.t_stat.toFixed(3)  : '—';
+    const mr = r.mean_return != null ? r.mean_return : 0;
+    const viable = isViable(r);
+    const costBadge = viable
+      ? '<span style="color:#4ade80;font-size:0.75rem" title="Mean return > 3× commission — viable after costs">✓ viable</span>'
+      : '<span style="color:#f87171;font-size:0.75rem" title="Mean return < 3× commission — edge smaller than spread">✗ costs</span>';
     const mFmt = r.mean_return != null ? (r.mean_return * 100).toFixed(4) + '%' : '—';
     const sFmt = r.sharpe  != null ? r.sharpe.toFixed(3)  : '—';
     const hrFmt = r.hit_rate != null ? (r.hit_rate * 100).toFixed(1) + '%' : '—';
-    return `<tr>
+    const rowJson = encodeURIComponent(JSON.stringify(r));
+    const stratBtn = viable
+      ? `<button class="create-strat-btn" onclick="createStrategyFromProb(decodeURIComponent('${rowJson}'), this)">→ Strategy</button>`
+      : `<button class="create-strat-btn" disabled title="Edge too small after commission" style="opacity:0.4;cursor:not-allowed">→ Strategy</button>`;
+    return `<tr style="${viable ? '' : 'opacity:0.6'}">
       <td style="max-width:260px;white-space:normal">${r.condition_desc || r.condition_id}</td>
       <td><span class="cat-badge cat-${r.category}">${r.category}</span></td>
       <td>${r.symbol}</td>
@@ -4285,11 +4325,12 @@ function renderTable() {
       <td>${r.forward_bars}b</td>
       <td>${(r.n_samples||0).toLocaleString()}</td>
       <td class="${hrClass}">${hrFmt}</td>
-      <td>${mFmt}</td>
+      <td>${mFmt} ${costBadge}</td>
       <td>${tFmt}</td>
       <td>${pFmt}</td>
       <td>${sFmt}</td>
       <td>${sigDot}</td>
+      <td>${stratBtn}</td>
     </tr>`;
   }).join('');
 }
@@ -4328,6 +4369,34 @@ async function runAnalysis() {
     btn.textContent = '✗ Network error';
     console.error('prob run fetch error:', e);
     setTimeout(() => { btn.disabled = false; btn.textContent = '▶ Run Analysis'; }, 5000);
+  }
+}
+
+async function createStrategyFromProb(rowJson, btn) {
+  let row;
+  try { row = JSON.parse(rowJson); } catch(e) { alert('Failed to parse row data'); return; }
+  btn.disabled = true;
+  btn.textContent = '⏳';
+  try {
+    const resp = await fetch('/api/strategy/from-prob-result', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(row),
+    });
+    const d = await resp.json();
+    if (d.ok) {
+      btn.textContent = '✓ Created';
+      btn.style.background = '#166534';
+      setTimeout(() => { btn.disabled = false; btn.textContent = '→ Strategy'; btn.style.background = ''; }, 4000);
+    } else {
+      btn.textContent = '✗ Error';
+      console.error('from-prob-result error:', d.error);
+      setTimeout(() => { btn.disabled = false; btn.textContent = '→ Strategy'; }, 4000);
+    }
+  } catch(e) {
+    btn.textContent = '✗ Network';
+    console.error(e);
+    setTimeout(() => { btn.disabled = false; btn.textContent = '→ Strategy'; }, 4000);
   }
 }
 
@@ -4380,6 +4449,92 @@ def api_prob_run() -> JSONResponse:
         return JSONResponse({"ok": True, "message": "Probability research job started"})
     except Exception as exc:
         log.error("api_prob_run_error", error=str(exc), traceback=_traceback.format_exc())
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
+
+
+class _ProbResultRow(BaseModel):
+    condition_id: str | None = None
+    condition_desc: str | None = None
+    symbol: str | None = None
+    timeframe: str | None = None
+    forward_bars: int | None = None
+    n_samples: int | None = None
+    hit_rate: float | None = None
+    mean_return: float | None = None
+    t_stat: float | None = None
+    p_value: float | None = None
+    sharpe: float | None = None
+    is_significant: bool | None = None
+    category: str | None = None
+
+
+_COMMISSION_RT = 0.0004  # 0.02% per side × 2 = round-trip cost
+
+
+@app.post("/api/strategy/from-prob-result")
+def api_strategy_from_prob_result(row: _ProbResultRow, background_tasks: BackgroundTasks) -> JSONResponse:
+    """Create a user idea (strategy) from a probability research result."""
+    try:
+        mean_ret = row.mean_return or 0.0
+        # Reject if mean return is < 3× round-trip commission — edge is too thin to survive costs
+        if abs(mean_ret) < _COMMISSION_RT * 3:
+            return JSONResponse({
+                "ok": False,
+                "error": (
+                    f"Edge too thin after costs: mean return {mean_ret*100:.4f}% < "
+                    f"{_COMMISSION_RT*3*100:.4f}% (3× commission). "
+                    f"This edge is statistically real but unprofitable after spread/commission."
+                ),
+            }, status_code=400)
+
+        direction = "bullish" if (row.hit_rate or 0.5) >= 0.5 else "bearish"
+        edge_pct  = abs((row.hit_rate or 0.5) - 0.5) * 100
+        hr_pct    = (row.hit_rate or 0.5) * 100
+        mr_pct    = mean_ret * 100
+        condition = row.condition_desc or row.condition_id or "unknown condition"
+        sig_note  = f"statistically significant (p={row.p_value:.4f})" if row.is_significant else f"not significant (p={row.p_value:.4f})" if row.p_value is not None else "significance unknown"
+        sym       = row.symbol or "EURUSD"
+        tf        = row.timeframe or "1h"
+        fwd       = row.forward_bars or 1
+
+        description = (
+            f"Statistical edge strategy based on probability research findings.\n\n"
+            f"Condition: {condition}\n"
+            f"PRIMARY symbol: {sym} — MUST use this symbol for backtesting and optimization\n"
+            f"PRIMARY timeframe: {tf} — MUST use this timeframe\n"
+            f"Forward bars tested: {fwd}\n\n"
+            f"Edge summary:\n"
+            f"- Direction: {direction} bias with {edge_pct:.1f}% edge over random\n"
+            f"- Hit rate: {hr_pct:.1f}% of occurrences move {direction} over next {fwd} bar(s)\n"
+            f"- Mean return per occurrence: {mr_pct:.4f}% (after-cost minimum: {_COMMISSION_RT*100:.4f}%)\n"
+            f"- Sharpe: {row.sharpe:.3f}\n"
+            f"- T-statistic: {row.t_stat:.3f}, {sig_note}\n"
+            f"- Sample size: {row.n_samples or '?'} occurrences in training data (2015-2022)\n\n"
+            f"CRITICAL IMPLEMENTATION RULES (the research measured raw bar returns — preserve this exactly):\n"
+            f"1. Detect condition '{condition}' at close of each {tf} bar\n"
+            f"2. Enter {direction} at OPEN of the NEXT bar (trade_on_close=False already handles this)\n"
+            f"3. Exit ONLY via max_bars_exit={fwd} (time-based). "
+            f"   DO NOT add SL/TP — they intercept trades before the research horizon and destroy the edge. "
+            f"   Use only a catastrophic-loss stop at 5x ATR if the framework requires one.\n"
+            f"4. NO session filter (start_hour=0, end_hour=23) — the research measured all hours\n"
+            f"5. Keep param_space minimal: only the condition threshold and max_bars_exit (range {max(1,fwd-1)}-{fwd+2})\n"
+            f"6. Do NOT add extra filters (RSI, EMA, volume) — they reduce sample size and overfit"
+        )
+
+        idea = db.insert_user_idea(
+            title=f"Prob edge: {condition[:60]} on {sym} {tf}",
+            description=description,
+            priority=1,
+            source="prob_research",
+        )
+        idea_id = idea.get("id") if idea else None
+
+        background_tasks.add_task(_scheduled_queue_worker)
+
+        log.info("strategy_from_prob_result_created", idea_id=idea_id, condition=condition, symbol=sym, tf=tf, mean_ret=mean_ret)
+        return JSONResponse({"ok": True, "idea_id": idea_id})
+    except Exception as exc:
+        log.error("strategy_from_prob_result_error", error=str(exc), traceback=_traceback.format_exc())
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
 
 

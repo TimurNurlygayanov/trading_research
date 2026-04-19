@@ -35,7 +35,7 @@ ohlcv_cache = modal.Volume.from_name("trading-research-ohlcv-cache", create_if_m
 CACHE_DIR = "/ohlcv_cache"
 
 DEFAULT_SYMBOLS    = ["EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD", "NZDUSD"]
-DEFAULT_TIMEFRAMES = ["4h", "1h", "1d"]  # skip 5m/1m — forward bars too small for multi-day horizons
+DEFAULT_TIMEFRAMES = ["4h", "1h", "5m", "1m", "1d"]
 DEFAULT_FORWARD_BARS = [1, 4, 12, 24]
 
 

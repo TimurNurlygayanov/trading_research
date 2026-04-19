@@ -43,6 +43,7 @@ def optimize_strategy(
     direction: str = "maximize",
     metric: str = "sharpe",
     timeout_seconds: float | None = None,
+    fixed_params: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], optuna.Study]:
     """
     Optimize strategy hyperparameters on training data.
@@ -72,6 +73,9 @@ def optimize_strategy(
 
     def objective(trial: optuna.Trial) -> float:
         params = _suggest_params(trial, param_space)
+        # Merge fixed params under trial params (trial takes precedence)
+        if fixed_params:
+            params = {**fixed_params, **params}
 
         # Constraint: start_hour must be < end_hour
         if "start_hour" in params and "end_hour" in params:
@@ -99,6 +103,9 @@ def optimize_strategy(
     )
 
     best_params = study.best_params if study.best_trial else {}
+    # Merge fixed_params into best_params so downstream (WF/OOS) uses them too
+    if fixed_params:
+        best_params = {**fixed_params, **best_params}
     logging.info(
         f"Optimization complete: {n_trials} trials, best {metric}={study.best_value:.3f}, "
         f"params={best_params}"

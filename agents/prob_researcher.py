@@ -120,6 +120,30 @@ CONDITION_CATALOGUE: list[dict] = [
     {"id": "rsi_below_50",          "desc": "RSI(14) < 50",                                               "cat": "momentum"},
     {"id": "rsi_cross_50_up",       "desc": "RSI(14) crossed above 50",                                   "cat": "momentum"},
     {"id": "rsi_cross_50_dn",       "desc": "RSI(14) crossed below 50",                                   "cat": "momentum"},
+    # combo: BB + RSI — high-conviction mean-reversion signals
+    {"id": "bb_lower_rsi_oversold", "desc": "Close below BB lower band AND RSI(14) < 30",                 "cat": "momentum"},
+    {"id": "bb_upper_rsi_overbought","desc": "Close above BB upper band AND RSI(14) > 70",                "cat": "momentum"},
+    {"id": "bb_lower_rsi_mid",      "desc": "Close below BB lower band AND RSI(14) in [30, 50]",          "cat": "momentum"},
+    # volatility squeeze → expansion
+    {"id": "bb_squeeze",            "desc": "BB width < 25th percentile (volatility squeeze)",             "cat": "volatility"},
+    {"id": "bb_expansion",          "desc": "BB width > 75th percentile (volatility expansion)",           "cat": "volatility"},
+    # EMA distance — extended vs compressed
+    {"id": "far_above_ema50",       "desc": "Close > 1.5× ATR above EMA(50) (extended up)",               "cat": "ema"},
+    {"id": "far_below_ema50",       "desc": "Close < 1.5× ATR below EMA(50) (extended down)",             "cat": "ema"},
+    {"id": "near_ema50",            "desc": "Close within 0.3× ATR of EMA(50) (compressed near MA)",      "cat": "ema"},
+    # calendar / time
+    {"id": "weekday_tuesday",       "desc": "Tuesday",                                                      "cat": "session"},
+    {"id": "weekday_wednesday",     "desc": "Wednesday",                                                    "cat": "session"},
+    {"id": "weekday_thursday",      "desc": "Thursday",                                                     "cat": "session"},
+    {"id": "month_end",             "desc": "Last 3 trading days of the month",                            "cat": "session"},
+    {"id": "month_start",           "desc": "First 3 trading days of the month",                           "cat": "session"},
+    # price structure
+    {"id": "new_5bar_high",         "desc": "Current close is highest of last 5 bars",                    "cat": "candle"},
+    {"id": "new_5bar_low",          "desc": "Current close is lowest of last 5 bars",                     "cat": "candle"},
+    {"id": "new_20bar_high",        "desc": "Current close is highest of last 20 bars",                   "cat": "candle"},
+    {"id": "new_20bar_low",         "desc": "Current close is lowest of last 20 bars",                    "cat": "candle"},
+    {"id": "gap_up",                "desc": "Open > previous close by > 0.1× ATR (gap up)",               "cat": "candle"},
+    {"id": "gap_down",              "desc": "Open < previous close by > 0.1× ATR (gap down)",             "cat": "candle"},
 ]
 
 
@@ -324,6 +348,79 @@ def compute_condition(df: pd.DataFrame, condition_id: str) -> pd.Series:
         if condition_id == "rsi_cross_50_dn":
             rsi = _rsi(close)
             return (rsi < 50) & (rsi.shift(1) >= 50)
+
+        # ── combo: BB + RSI ─────────────────────────────────────────────────
+        if condition_id == "bb_lower_rsi_oversold":
+            return (close < _bb_lower(close)) & (_rsi(close) < 30)
+
+        if condition_id == "bb_upper_rsi_overbought":
+            return (close > _bb_upper(close)) & (_rsi(close) > 70)
+
+        if condition_id == "bb_lower_rsi_mid":
+            rsi = _rsi(close)
+            return (close < _bb_lower(close)) & (rsi >= 30) & (rsi <= 50)
+
+        # ── volatility squeeze / expansion ──────────────────────────────────
+        if condition_id == "bb_squeeze":
+            width = _bb_upper(close) - _bb_lower(close)
+            return width < width.rolling(252, min_periods=30).quantile(0.25)
+
+        if condition_id == "bb_expansion":
+            width = _bb_upper(close) - _bb_lower(close)
+            return width > width.rolling(252, min_periods=30).quantile(0.75)
+
+        # ── EMA distance ────────────────────────────────────────────────────
+        if condition_id == "far_above_ema50":
+            atr = _atr(df)
+            return (close - _ema(close, 50)) > 1.5 * atr
+
+        if condition_id == "far_below_ema50":
+            atr = _atr(df)
+            return (_ema(close, 50) - close) > 1.5 * atr
+
+        if condition_id == "near_ema50":
+            atr = _atr(df)
+            return (close - _ema(close, 50)).abs() < 0.3 * atr
+
+        # ── calendar ────────────────────────────────────────────────────────
+        if condition_id == "weekday_tuesday":
+            return pd.Series(dow == 1, index=df.index)
+
+        if condition_id == "weekday_wednesday":
+            return pd.Series(dow == 2, index=df.index)
+
+        if condition_id == "weekday_thursday":
+            return pd.Series(dow == 3, index=df.index)
+
+        if condition_id == "month_end":
+            # Last 3 calendar days of the month (works on all timeframes)
+            return pd.Series(df.index.to_series().apply(
+                lambda ts: ts.day >= (ts.to_period('M').to_timestamp('M').day - 2)
+            ).values, index=df.index)
+
+        if condition_id == "month_start":
+            return pd.Series(df.index.day <= 3, index=df.index)
+
+        # ── price structure ─────────────────────────────────────────────────
+        if condition_id == "new_5bar_high":
+            return close >= close.rolling(5).max()
+
+        if condition_id == "new_5bar_low":
+            return close <= close.rolling(5).min()
+
+        if condition_id == "new_20bar_high":
+            return close >= close.rolling(20).max()
+
+        if condition_id == "new_20bar_low":
+            return close <= close.rolling(20).min()
+
+        if condition_id == "gap_up":
+            atr = _atr(df)
+            return (open_ - close.shift(1)) > 0.1 * atr
+
+        if condition_id == "gap_down":
+            atr = _atr(df)
+            return (close.shift(1) - open_) > 0.1 * atr
 
         # Unknown condition — return all-False
         print(f"[prob_researcher] Unknown condition_id: {condition_id}")

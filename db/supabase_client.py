@@ -293,13 +293,14 @@ def delete_knowledge_entry(entry_id: str) -> None:
     sb.table("knowledge_base").delete().eq("id", entry_id).execute()
 
 
-def insert_user_idea(title: str, description: str, priority: int = 5) -> dict[str, Any]:
+def insert_user_idea(title: str, description: str, priority: int = 5, source: str = "user") -> dict[str, Any]:
     sb = get_client()
     result = sb.table("user_ideas").insert({
         "title": title,
         "description": description,
         "status": "pending",
         "priority": priority,
+        "source": source,
     }).execute()
     return result.data[0]
 

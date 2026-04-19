@@ -77,6 +77,7 @@ def walk_forward(
     min_oos_sharpe: float = 0.0,
     min_fold_bars: int = 500,
     seed: int = 42,
+    fixed_params: dict | None = None,
 ) -> WalkForwardResult:
     """
     Run anchored walk-forward optimization and out-of-sample evaluation.
@@ -153,6 +154,7 @@ def walk_forward(
                 seed=seed + fold_idx,
                 direction="maximize",
                 metric="sharpe",
+                fixed_params=fixed_params,
             )
             is_sharpe = study.best_value if study.best_trial else 0.0
         except Exception as e:

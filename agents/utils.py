@@ -49,17 +49,17 @@ def _acquire_tpm_slot(max_tokens: int) -> None:
         _expire_tpm_window()
         used = sum(t for _, t in _tpm_window)
 
-        while used + max_tokens > _OUTPUT_TPM_LIMIT:
-            if _tpm_window:
-                sleep_for = (_tpm_window[0][0] + 60.1) - time.monotonic()
-                if sleep_for > 0:
-                    log.info(
-                        "token_budget_wait max_tokens=%d used=%d limit=%d sleep=%.1fs",
-                        max_tokens, used, _OUTPUT_TPM_LIMIT, sleep_for,
-                    )
-                    time.sleep(sleep_for)
-            else:
-                time.sleep(5)
+        # Only throttle if OTHER calls are consuming the budget.
+        # If the window is empty we must proceed — a single request whose
+        # max_tokens exceeds the soft cap would otherwise loop forever.
+        while used > 0 and used + max_tokens > _OUTPUT_TPM_LIMIT:
+            sleep_for = (_tpm_window[0][0] + 60.1) - time.monotonic()
+            if sleep_for > 0:
+                log.info(
+                    "token_budget_wait max_tokens=%d used=%d limit=%d sleep=%.1fs",
+                    max_tokens, used, _OUTPUT_TPM_LIMIT, sleep_for,
+                )
+                time.sleep(sleep_for)
             _expire_tpm_window()
             used = sum(t for _, t in _tpm_window)
 
