@@ -22,6 +22,7 @@ import uvicorn
 from apscheduler.schedulers.background import BackgroundScheduler
 from fastapi import BackgroundTasks, FastAPI, Form, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from pydantic import BaseModel
 
 from db import supabase_client as db
 from orchestrator.budget_guard import get_remaining_budget
