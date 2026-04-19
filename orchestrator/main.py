@@ -656,6 +656,36 @@ def api_ideas_grouped(limit: int = Query(default=100, le=200)) -> JSONResponse:
         return JSONResponse({"ideas": [], "error": str(exc)}, status_code=500)
 
 
+@app.delete("/api/ideas/{idea_id}")
+def api_delete_idea(idea_id: str) -> JSONResponse:
+    """
+    Delete a user idea and all strategies that originated from it
+    (root strategy + campaign children).
+    """
+    try:
+        sb = db.get_client()
+        idea_res = sb.table("user_ideas").select("strategy_id").eq("id", idea_id).execute()
+        if not idea_res.data:
+            return JSONResponse({"ok": False, "error": "Idea not found"}, status_code=404)
+
+        root_id = idea_res.data[0].get("strategy_id")
+        if root_id:
+            # Delete campaign children first (FK: campaign_id → strategies.id)
+            children = sb.table("strategies").select("id").eq("campaign_id", root_id).execute().data or []
+            for child in children:
+                db.delete_strategy(child["id"])
+            db.delete_strategy(root_id)
+
+        sb.table("user_ideas").delete().eq("id", idea_id).execute()
+        log.info("idea_deleted", idea_id=idea_id, root_strategy=root_id,
+                 children_deleted=len(children) if root_id else 0)
+        return JSONResponse({"ok": True})
+    except Exception as exc:
+        log.error("api_delete_idea_error", idea_id=idea_id, error=str(exc),
+                  traceback=_traceback.format_exc())
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
+
+
 @app.get("/api/strategies")
 def api_strategies(
     status: str = Query("all"),
@@ -850,6 +880,23 @@ _DASHBOARD_HTML = r"""<!DOCTYPE html>
   .refresh-btn { background: #1e2533; border: 1px solid #374151; border-radius: 8px;
                  color: #94a3b8; font-size: 0.8rem; padding: 6px 12px; cursor: pointer; }
   .refresh-btn:hover { color: #f1f5f9; }
+  /* Pipeline status modal */
+  .ps-overlay { display:none; position:fixed; inset:0; background:rgba(0,0,0,.6); z-index:1000; align-items:center; justify-content:center; }
+  .ps-overlay.open { display:flex; }
+  .ps-box { background:#1a1f2e; border:1px solid #374151; border-radius:12px; padding:28px 32px; min-width:420px; max-width:600px; }
+  .ps-box h3 { margin:0 0 18px; font-size:1.05rem; color:#f1f5f9; }
+  .ps-section { margin-bottom:16px; }
+  .ps-section h4 { margin:0 0 8px; font-size:.8rem; color:#64748b; text-transform:uppercase; letter-spacing:.05em; }
+  .ps-row { display:flex; justify-content:space-between; align-items:center; padding:4px 0;
+            border-bottom:1px solid #1e293b; font-size:.85rem; }
+  .ps-row:last-child { border-bottom:none; }
+  .ps-label { color:#94a3b8; }
+  .ps-count { font-weight:600; color:#f1f5f9; }
+  .ps-count.yellow { color:#fbbf24; }
+  .ps-count.green  { color:#34d399; }
+  .ps-count.red    { color:#f87171; }
+  .ps-close { float:right; background:none; border:none; color:#64748b; font-size:1.2rem; cursor:pointer; margin-top:-4px; }
+  .ps-close:hover { color:#f1f5f9; }
 
   /* ── layout ── */
   .page { max-width: 1280px; margin: 0 auto; padding: 28px 24px; }
@@ -891,6 +938,9 @@ _DASHBOARD_HTML = r"""<!DOCTYPE html>
   .idea-header:hover { background: #141c2e; }
   .idea-chevron { font-size: 0.85rem; color: #475569; margin-top: 2px; flex-shrink: 0; transition: transform .2s; }
   .idea-card.open .idea-chevron { transform: rotate(90deg); }
+  .idea-delete-btn { flex-shrink:0; background:none; border:1px solid #374151; border-radius:6px;
+    color:#475569; font-size:.8rem; padding:4px 8px; cursor:pointer; margin-left:8px; line-height:1; }
+  .idea-delete-btn:hover { border-color:#ef4444; color:#ef4444; background:#1a0a0a; }
   .idea-body-text { flex: 1; font-size: 0.88rem; color: #e2e8f0; line-height: 1.5; }
   .idea-meta { font-size: 0.72rem; color: #475569; margin-top: 4px; }
   .idea-pills { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 6px; }
@@ -1024,6 +1074,7 @@ _DASHBOARD_HTML = r"""<!DOCTYPE html>
 
   <div class="nav-right">
     <div class="budget-pill">Today: <span id="spend">…</span> / <span id="limit">$8.00</span></div>
+    <button class="refresh-btn" onclick="showPipelineStatus()">Pipeline</button>
     <button class="refresh-btn" onclick="loadAll()">↻ Refresh</button>
   </div>
 </nav>
@@ -1360,6 +1411,8 @@ function renderIdeas(ideas) {
           <div class="idea-meta">${date}</div>
           <div class="idea-pills">${pills}</div>
         </div>
+        <button class="idea-delete-btn" title="Delete idea and all its strategies"
+          onclick="event.stopPropagation(); deleteIdea(${JSON.stringify(idea.idea_id)}, ${idx})">✕</button>
       </div>
       <div class="idea-strategies">${rows}</div>
     </div>`;
@@ -1369,6 +1422,25 @@ function renderIdeas(ideas) {
 function toggleIdea(idx) {
   const card = document.getElementById(`idea-card-${idx}`);
   card.classList.toggle('open');
+}
+
+async function deleteIdea(ideaId, idx) {
+  if (!confirm('Delete this idea and all its strategies? This cannot be undone.')) return;
+  const card = document.getElementById(`idea-card-${idx}`);
+  card.style.opacity = '0.4';
+  try {
+    const r = await fetch(`/api/ideas/${ideaId}`, { method: 'DELETE' });
+    const d = await r.json();
+    if (d.ok) {
+      card.remove();
+    } else {
+      card.style.opacity = '1';
+      alert(d.error || 'Failed to delete idea.');
+    }
+  } catch(e) {
+    card.style.opacity = '1';
+    alert('Network error.');
+  }
 }
 
 async function openPanel(id) {
@@ -2310,7 +2382,48 @@ document.addEventListener('keydown', e => { if (e.key === 'Escape') closePanel()
 loadAll();
 // Open ideas view if URL hash says so
 if (location.hash === '#ideas') setView('ideas');
+
+// ── Pipeline Status modal ─────────────────────────────────────────────────
+const STATUS_COLOR = {
+  pending:'yellow', picked_up:'yellow', idea:'yellow', filtered:'yellow',
+  implementing:'yellow', awaiting_research:'yellow',
+  implemented:'yellow', quick_testing:'yellow', quick_tested:'yellow',
+  backtesting:'yellow', validating:'yellow', awaiting_review:'yellow',
+  done:'green', live:'green',
+  failed:'red',
+};
+async function showPipelineStatus() {
+  const overlay = document.getElementById('psOverlay');
+  const body    = document.getElementById('psBody');
+  overlay.classList.add('open');
+  body.innerHTML = '<div style="color:#94a3b8;text-align:center;padding:20px">Loading…</div>';
+  try {
+    const d = await fetch('/api/pipeline-status').then(r => r.json());
+    const sections = [['Ideas queue', d.ideas || {}], ['Strategies', d.strategies || {}]];
+    body.innerHTML = sections.map(([title, counts]) => {
+      const rows = Object.entries(counts).sort((a,b) => b[1]-a[1]);
+      if (!rows.length) return \`<div class="ps-section"><h4>\${title}</h4><div style="color:#64748b;font-size:.85rem">empty</div></div>\`;
+      return \`<div class="ps-section"><h4>\${title}</h4>\${rows.map(([st,n]) =>
+        \`<div class="ps-row"><span class="ps-label">\${st}</span><span class="ps-count \${STATUS_COLOR[st]||''}">\${n}</span></div>\`
+      ).join('')}</div>\`;
+    }).join('');
+  } catch(e) {
+    body.innerHTML = '<div style="color:#f87171">Failed to load</div>';
+  }
+}
+document.getElementById('psOverlay').addEventListener('click', e => {
+  if (e.target === e.currentTarget) e.currentTarget.classList.remove('open');
+});
 </script>
+
+<div class="ps-overlay" id="psOverlay">
+  <div class="ps-box">
+    <button class="ps-close" onclick="document.getElementById('psOverlay').classList.remove('open')">✕</button>
+    <h3>Pipeline Status</h3>
+    <div id="psBody"></div>
+  </div>
+</div>
+
 </body>
 </html>"""
 
@@ -3225,7 +3338,7 @@ class FromIndicatorRequest(BaseModel):
 
 
 @app.post("/api/strategy/from-indicator")
-def api_strategy_from_indicator(req: FromIndicatorRequest) -> JSONResponse:
+def api_strategy_from_indicator(req: FromIndicatorRequest, background_tasks: BackgroundTasks) -> JSONResponse:
     """
     Create a strategy idea pre-filled from an indicator library entry.
     Inserts a user_idea that the implementer will pick up and turn into
@@ -3269,10 +3382,28 @@ def api_strategy_from_indicator(req: FromIndicatorRequest) -> JSONResponse:
 
         idea_id = result.data[0]["id"] if result.data else None
         log.info("strategy_from_indicator_created spec_id=%s idea_id=%s", req.spec_id, idea_id)
+        background_tasks.add_task(_scheduled_queue_worker)
         return JSONResponse({"ok": True, "idea_id": idea_id, "indicator": display})
     except Exception as exc:
         log.error("api_strategy_from_indicator_error", error=str(exc), traceback=_traceback.format_exc())
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
+
+
+@app.get("/api/pipeline-status")
+def api_pipeline_status() -> JSONResponse:
+    """Return counts by status for strategies and user_ideas — quick health check."""
+    try:
+        sb = db.get_client()
+        ideas_raw = sb.table("user_ideas").select("status").execute().data or []
+        strat_raw = sb.table("strategies").select("status").execute().data or []
+
+        from collections import Counter
+        ideas_counts = dict(Counter(r["status"] for r in ideas_raw))
+        strat_counts = dict(Counter(r["status"] for r in strat_raw))
+
+        return JSONResponse({"ideas": ideas_counts, "strategies": strat_counts})
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=500)
 
 
 @app.get("/api/knowledge")
