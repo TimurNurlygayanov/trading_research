@@ -48,8 +48,8 @@ _TF_CONFIG = {
     "1d":  {"start": "2015-01-01", "bars_per_day": 1},
 }
 
-DEFAULT_SYMBOLS    = ["EURUSD"]
-DEFAULT_TIMEFRAMES = ["1h", "5m", "1m"]
+DEFAULT_SYMBOLS    = ["EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD", "NZDUSD"]
+DEFAULT_TIMEFRAMES = ["4h", "1h", "5m", "1m"]
 
 
 @app.function(

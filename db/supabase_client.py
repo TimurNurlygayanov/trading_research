@@ -270,7 +270,8 @@ def get_research_tasks(
     # not needed for list views. Use get_research_task() for full single-row data.
     q = sb.table("research_tasks").select(
         "id, title, type, status, question, result_summary, error_log, "
-        "key_findings, research_spec, retry_count, created_at, updated_at"
+        "key_findings, research_spec, retry_count, created_at, updated_at, "
+        "data_requirements, fanned_out, parent_task_id"
     )
     if status == "active":
         q = q.in_("status", ["pending", "running"])

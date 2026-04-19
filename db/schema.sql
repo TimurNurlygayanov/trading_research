@@ -145,9 +145,11 @@ ALTER TABLE strategies ADD COLUMN IF NOT EXISTS quick_test_drawdown            f
 ALTER TABLE strategies ADD COLUMN IF NOT EXISTS quick_test_trades              int;
 ALTER TABLE strategies ADD COLUMN IF NOT EXISTS quick_test_win_rate            float8;
 ALTER TABLE strategies ADD COLUMN IF NOT EXISTS quick_test_signals_per_year    float8;
--- Multi-timeframe quick test: best timeframe found and per-TF metrics dict
+-- Multi-symbol × multi-timeframe quick test: best combo + full results grid
 ALTER TABLE strategies ADD COLUMN IF NOT EXISTS best_timeframe                 text;
-ALTER TABLE strategies ADD COLUMN IF NOT EXISTS quick_test_all_timeframes      jsonb;
+ALTER TABLE strategies ADD COLUMN IF NOT EXISTS best_symbol                    text;
+ALTER TABLE strategies ADD COLUMN IF NOT EXISTS quick_test_all_timeframes      jsonb;  -- best symbol's per-TF dict
+ALTER TABLE strategies ADD COLUMN IF NOT EXISTS quick_test_all_symbols         jsonb;  -- {symbol: {tf: metrics}}
 -- Trade-level data from best-TF quick test (for strategy_analyzer)
 ALTER TABLE strategies ADD COLUMN IF NOT EXISTS quick_test_trade_records       jsonb;
 -- Analysis findings from strategy_analyzer (session, trade cap, LLM interpretation)
@@ -359,6 +361,10 @@ ALTER TABLE research_tasks ADD COLUMN IF NOT EXISTS generated_code  text;
 ALTER TABLE research_tasks ADD COLUMN IF NOT EXISTS key_findings    jsonb;
 ALTER TABLE research_tasks ADD COLUMN IF NOT EXISTS research_spec   jsonb;
 ALTER TABLE research_tasks ADD COLUMN IF NOT EXISTS retry_count     int  DEFAULT 0;
+-- Multi-symbol fan-out: fanned_out=true once symbol variants have been queued;
+-- parent_task_id links variant tasks back to the original.
+ALTER TABLE research_tasks ADD COLUMN IF NOT EXISTS fanned_out      boolean DEFAULT false;
+ALTER TABLE research_tasks ADD COLUMN IF NOT EXISTS parent_task_id  uuid REFERENCES research_tasks(id) ON DELETE SET NULL;
 
 CREATE INDEX IF NOT EXISTS idx_research_tasks_status     ON research_tasks(status);
 CREATE INDEX IF NOT EXISTS idx_research_tasks_type       ON research_tasks(type);

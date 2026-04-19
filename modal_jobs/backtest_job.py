@@ -72,9 +72,10 @@ def run_quick_backtest(strategy_id: str) -> dict:
     import pandas as pd
     from backtesting import Strategy
 
-    # Test all standard timeframes — ordered fastest→slowest so partial results
-    # are useful if the job times out near the end.
+    # Symbols and timeframes tested with default params — ordered so partial
+    # results are still useful if the job times out near the end.
     QUICK_TEST_TIMEFRAMES = ["4h", "1h", "15m", "5m", "1m"]
+    QUICK_TEST_SYMBOLS    = ["EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD", "NZDUSD"]
 
     try:
         from db import supabase_client as db
@@ -92,15 +93,11 @@ def run_quick_backtest(strategy_id: str) -> dict:
             raise ValueError("No backtest_code on strategy")
 
         indicators_meta = strategy.get("indicators") or {}
-        symbols = indicators_meta.get("symbols", ["EURUSD"])
-        if isinstance(symbols, str):
-            symbols = [symbols]
-        symbol = symbols[0] if symbols else "EURUSD"
 
         db.update_strategy(strategy_id, {"status": "quick_testing"})
         add_pipeline_note(strategy_id,
-            f"Quick test started — {symbol}, testing all timeframes: "
-            f"{QUICK_TEST_TIMEFRAMES}, default params, no optimization.")
+            f"Quick test started — {len(QUICK_TEST_SYMBOLS)} symbols × "
+            f"{len(QUICK_TEST_TIMEFRAMES)} timeframes, default params, no optimization.")
 
         # Leakage check (fast, before any data work)
         leakage_result = check_leakage(code)
@@ -120,7 +117,7 @@ def run_quick_backtest(strategy_id: str) -> dict:
             return {"passed": False, "reason": "leakage_check_failed",
                     "issues": leakage_result.issues}
 
-        # Execute the strategy class once (shared across all timeframe runs)
+        # Execute the strategy class once (shared across all runs)
         namespace: dict = {}
         exec(compile(code, "<strategy>", "exec"), namespace)
         strategy_classes = {
@@ -135,7 +132,7 @@ def run_quick_backtest(strategy_id: str) -> dict:
         else:
             strategy_class = next(iter(strategy_classes.values()))
 
-        # ── Run backtest on each timeframe ────────────────────────────────────
+        # ── Run backtest on every symbol × timeframe ──────────────────────────
         def _clean(v, ndigits=4):
             """Round float; replace NaN/inf with None so JSONB accepts it."""
             import math
@@ -147,78 +144,96 @@ def run_quick_backtest(strategy_id: str) -> dict:
             except (TypeError, ValueError):
                 return None
 
-        tf_results: dict = {}   # tf -> metrics dict
-        tf_dates:   dict = {}   # tf -> (start_str, end_str, n_bars)
-        cache_committed = False
+        # all_sym_results[sym][tf] = metrics dict
+        all_sym_results: dict = {}
+        # tf_dates[(sym, tf)] = (start_str, end_str, n_bars)
+        tf_dates: dict = {}
+        cache_needs_commit = False
 
-        for tf in QUICK_TEST_TIMEFRAMES:
-            try:
-                cache_file = f"{CACHE_DIR}/{symbol}_{tf}.parquet"
-                if os.path.exists(cache_file):
-                    df = pd.read_parquet(cache_file)
-                else:
-                    df = fetch_ohlcv(symbol, tf, start="2015-01-01", end="2026-12-31")
-                    os.makedirs(CACHE_DIR, exist_ok=True)
-                    df.to_parquet(cache_file)
-                    cache_committed = False  # will commit after all downloads
+        for sym in QUICK_TEST_SYMBOLS:
+            all_sym_results[sym] = {}
+            for tf in QUICK_TEST_TIMEFRAMES:
+                try:
+                    cache_file = f"{CACHE_DIR}/{sym}_{tf}.parquet"
+                    if os.path.exists(cache_file):
+                        df = pd.read_parquet(cache_file)
+                    else:
+                        df = fetch_ohlcv(sym, tf, start="2015-01-01", end="2026-12-31")
+                        os.makedirs(CACHE_DIR, exist_ok=True)
+                        df.to_parquet(cache_file)
+                        cache_needs_commit = True
 
-                train_df, _ = split_train_oos(df)
-                tf_dates[tf] = (
-                    train_df.index[0].strftime("%Y-%m-%d"),
-                    train_df.index[-1].strftime("%Y-%m-%d"),
-                    len(train_df),
-                )
-                result = run_backtest(strategy_class, train_df, params={},
-                                      enforce_gates=False)
+                    train_df, _ = split_train_oos(df)
+                    tf_dates[(sym, tf)] = (
+                        train_df.index[0].strftime("%Y-%m-%d"),
+                        train_df.index[-1].strftime("%Y-%m-%d"),
+                        len(train_df),
+                    )
+                    result = run_backtest(strategy_class, train_df, params={},
+                                          enforce_gates=False)
 
-                tf_results[tf] = {
-                    "sharpe":           _clean(result.sharpe),
-                    "equity_sharpe":    _clean(result.equity_sharpe),
-                    "trades":           result.total_trades,
-                    "win_rate":         _clean(result.win_rate),
-                    "drawdown":         _clean(result.max_drawdown),
-                    "profit_factor":    _clean(result.profit_factor, 3),
-                    "signals_per_year": _clean(result.signals_per_year, 1),
-                    "bars":             len(train_df),
-                }
-            except Exception as tf_err:
-                tf_results[tf] = {"error": str(tf_err)[:200], "sharpe": -999.0}
+                    all_sym_results[sym][tf] = {
+                        "sharpe":           _clean(result.sharpe),
+                        "equity_sharpe":    _clean(result.equity_sharpe),
+                        "trades":           result.total_trades,
+                        "win_rate":         _clean(result.win_rate),
+                        "drawdown":         _clean(result.max_drawdown),
+                        "profit_factor":    _clean(result.profit_factor, 3),
+                        "signals_per_year": _clean(result.signals_per_year, 1),
+                        "bars":             len(train_df),
+                    }
+                except Exception as tf_err:
+                    all_sym_results[sym][tf] = {"error": str(tf_err)[:200], "sharpe": -999.0}
 
-        if not cache_committed:
+        if cache_needs_commit:
             try:
                 ohlcv_cache.commit()
             except Exception:
                 pass
 
-        # ── Pick the best timeframe ───────────────────────────────────────────
-        # Require at least 10 trades to be considered valid; prefer by Sharpe.
-        valid = {tf: m for tf, m in tf_results.items()
-                 if "error" not in m and m.get("trades", 0) >= 10}
-        if valid:
-            best_tf = max(valid, key=lambda tf: valid[tf]["sharpe"])
+        # ── Pick the best (symbol, timeframe) by Sharpe ───────────────────────
+        # Require at least 10 trades to be valid.
+        valid_combos = {
+            (sym, tf): all_sym_results[sym][tf]
+            for sym in QUICK_TEST_SYMBOLS
+            for tf in QUICK_TEST_TIMEFRAMES
+            if "error" not in all_sym_results[sym][tf]
+            and all_sym_results[sym][tf].get("trades", 0) >= 10
+        }
+        if valid_combos:
+            best_sym, best_tf = max(valid_combos, key=lambda k: valid_combos[k]["sharpe"])
         else:
-            # No valid timeframe — pick whichever had the most trades (even if 0)
-            best_tf = max(
-                (tf for tf in tf_results if "error" not in tf_results[tf]),
-                key=lambda tf: tf_results[tf].get("trades", 0),
-                default=QUICK_TEST_TIMEFRAMES[1],  # fallback: 1h
-            )
+            ran_ok_combos = [
+                (sym, tf)
+                for sym in QUICK_TEST_SYMBOLS
+                for tf in QUICK_TEST_TIMEFRAMES
+                if "error" not in all_sym_results[sym][tf]
+            ]
+            if ran_ok_combos:
+                best_sym, best_tf = max(
+                    ran_ok_combos,
+                    key=lambda k: all_sym_results[k[0]][k[1]].get("trades", 0),
+                )
+            else:
+                best_sym, best_tf = QUICK_TEST_SYMBOLS[0], QUICK_TEST_TIMEFRAMES[1]
 
-        best = tf_results.get(best_tf, {})
+        best = all_sym_results[best_sym][best_tf]
+        # Keep quick_test_all_timeframes as the best symbol's per-TF results for
+        # backward compat with run_backtest_pipeline's viable_tfs logic.
+        tf_results = all_sym_results[best_sym]
 
-        # ── Hard fail: 0 trades on every timeframe ───────────────────────────
-        # This means the strategy code has a bug — session filter kills all signals,
-        # indicator init fails, or entry condition is never True on any bar.
-        # Proceeding to optimization is pointless; flag it now.
-        ran_ok = [m for m in tf_results.values() if "error" not in m]
+        # ── Hard fail: 0 trades on every symbol+timeframe combo ──────────────
+        ran_ok = [
+            all_sym_results[sym][tf]
+            for sym in QUICK_TEST_SYMBOLS
+            for tf in QUICK_TEST_TIMEFRAMES
+            if "error" not in all_sym_results[sym][tf]
+        ]
         total_trades_across_all = sum(m.get("trades", 0) for m in ran_ok)
         if ran_ok and total_trades_across_all == 0:
-            tf_summary = "\n".join(
-                f"  {tf:>4s}: {tf_results[tf].get('error', '0 trades')}"
-                for tf in QUICK_TEST_TIMEFRAMES
-            )
             reason = (
-                "Zero trades on ALL timeframes with default params. "
+                f"Zero trades on ALL {len(QUICK_TEST_SYMBOLS)} symbols × "
+                f"{len(QUICK_TEST_TIMEFRAMES)} timeframes with default params. "
                 "Likely causes: session filter (start_hour/end_hour) blocks all bars, "
                 "indicator returns NaN for the entire series, or entry condition is never True. "
                 "Fix the strategy code before re-submitting."
@@ -227,52 +242,69 @@ def run_quick_backtest(strategy_id: str) -> dict:
                 "status": "failed",
                 "modal_job_id": None,
                 "quick_test_all_timeframes": tf_results,
+                "quick_test_all_symbols": all_sym_results,
                 "error_log": reason,
                 "leakage_score": leakage_result.score,
                 "leakage_issues": leakage_result.issues,
             })
             add_pipeline_note(strategy_id,
-                f"Quick test FAILED — 0 trades on all timeframes.\n{tf_summary}\n\n{reason}")
+                f"Quick test FAILED — 0 trades on all symbols and timeframes.\n\n{reason}")
             return {"passed": False, "reason": "zero_trades_all_timeframes",
-                    "tf_results": tf_results}
+                    "all_sym_results": all_sym_results}
 
-        # Build a compact one-line summary per timeframe for the pipeline note
+        # Build summary: per-symbol best result + best-symbol TF breakdown
+        sym_summary_lines = []
+        for sym in QUICK_TEST_SYMBOLS:
+            sym_valid = {
+                tf: m for tf, m in all_sym_results[sym].items()
+                if "error" not in m and m.get("trades", 0) >= 10
+            }
+            if sym_valid:
+                sym_best_tf = max(sym_valid, key=lambda t: sym_valid[t]["sharpe"])
+                sm = sym_valid[sym_best_tf]
+                marker = " ◀ BEST" if sym == best_sym else ""
+                sym_summary_lines.append(
+                    f"  {sym}: best={sym_best_tf} Sharpe={sm['sharpe']:+.4f} "
+                    f"trades={sm['trades']}{marker}"
+                )
+            else:
+                sym_summary_lines.append(f"  {sym}: no valid TF (< 10 trades)")
+
         tf_lines = []
         for tf in QUICK_TEST_TIMEFRAMES:
             m = tf_results.get(tf, {})
             if "error" in m:
-                tf_lines.append(f"  {tf:>4s}: ERROR — {m['error'][:60]}")
+                tf_lines.append(f"    {tf:>4s}: ERROR — {m['error'][:60]}")
             else:
-                marker = " ◀ best" if tf == best_tf else ""
+                marker = " ◀" if tf == best_tf else ""
                 tf_lines.append(
-                    f"  {tf:>4s}: Sharpe={m['sharpe']:+.4f}  "
+                    f"    {tf:>4s}: Sharpe={m['sharpe']:+.4f}  "
                     f"trades={m['trades']}  win={m['win_rate']:.0%}  "
                     f"dd={m['drawdown']:.1%}{marker}"
                 )
 
-        # Date range info for the best timeframe
-        if best_tf in tf_dates:
-            t0, t1, n_bars = tf_dates[best_tf]
+        date_line = ""
+        if (best_sym, best_tf) in tf_dates:
+            t0, t1, n_bars = tf_dates[(best_sym, best_tf)]
             years = round((pd.Timestamp(t1) - pd.Timestamp(t0)).days / 365.25, 1)
-            date_line = f"\nTrain period: {t0} → {t1} ({years}y, {n_bars:,} bars on {best_tf})"
-        else:
-            date_line = ""
+            date_line = f"\nTrain period: {t0} → {t1} ({years}y, {n_bars:,} bars)"
 
         add_pipeline_note(strategy_id,
-            f"Multi-timeframe quick test complete — best: {best_tf} "
+            f"Multi-symbol quick test complete — best: {best_sym} {best_tf} "
             f"(Sharpe={best.get('sharpe', 0):+.4f}, "
             f"trades={best.get('trades', 0)}, "
             f"win={best.get('win_rate', 0):.0%}, "
             f"pf={best.get('profit_factor', 0):.3f}, "
             f"dd={best.get('drawdown', 0):.1%})\n"
-            + "\n".join(tf_lines)
+            + "Per-symbol summary:\n" + "\n".join(sym_summary_lines)
+            + f"\n{best_sym} TF breakdown:\n" + "\n".join(tf_lines)
             + date_line)
 
-        # Generate HTML report for best timeframe + capture trades for analyzer
+        # Generate HTML report for best (symbol, timeframe)
         html_report = None
         trades_for_db = None
         try:
-            cache_file = f"{CACHE_DIR}/{symbol}_{best_tf}.parquet"
+            cache_file = f"{CACHE_DIR}/{best_sym}_{best_tf}.parquet"
             best_df = pd.read_parquet(cache_file) if os.path.exists(cache_file) else None
             if best_df is not None:
                 train_df, _ = split_train_oos(best_df)
@@ -280,7 +312,6 @@ def run_quick_backtest(strategy_id: str) -> dict:
                                            enforce_gates=False, generate_html=True)
                 html_report = html_result.html_report
 
-                # Serialise essential trade columns for strategy_analyzer
                 if html_result.trades is not None and not html_result.trades.empty:
                     keep = [c for c in ["EntryTime", "ExitTime", "PnL", "ReturnPct", "Size"]
                             if c in html_result.trades.columns]
@@ -293,18 +324,19 @@ def run_quick_backtest(strategy_id: str) -> dict:
         except Exception:
             pass
 
-        # Save results — quick_test_* fields reflect the best timeframe
         db.update_strategy(strategy_id, {
             "status":                      "quick_tested",
             "modal_job_id":                None,
             "best_timeframe":              best_tf,
-            "quick_test_all_timeframes":   tf_results,
-            "quick_test_trade_records":    trades_for_db,   # JSONB trade list for strategy_analyzer
-            "analysis_done":               False,            # reset flag for analyzer
+            "best_symbol":                 best_sym,
+            "quick_test_all_timeframes":   tf_results,        # best symbol's per-TF dict
+            "quick_test_all_symbols":      all_sym_results,   # full symbol × TF grid
+            "quick_test_trade_records":    trades_for_db,
+            "analysis_done":               False,
             "quick_test_sharpe":           best.get("sharpe"),
             "quick_test_calmar":           None,
             "quick_test_drawdown":         best.get("drawdown"),
-            "quick_test_trades":           best.get("trades"),   # int count
+            "quick_test_trades":           best.get("trades"),
             "quick_test_win_rate":         best.get("win_rate"),
             "quick_test_signals_per_year": best.get("signals_per_year"),
             "leakage_score":               leakage_result.score,
@@ -314,12 +346,13 @@ def run_quick_backtest(strategy_id: str) -> dict:
         })
 
         return {
-            "passed":        True,
-            "strategy_id":   strategy_id,
-            "best_timeframe": best_tf,
-            "best_sharpe":   best.get("sharpe"),
-            "best_trades":   best.get("trades"),
-            "all_timeframes": tf_results,
+            "passed":           True,
+            "strategy_id":      strategy_id,
+            "best_symbol":      best_sym,
+            "best_timeframe":   best_tf,
+            "best_sharpe":      best.get("sharpe"),
+            "best_trades":      best.get("trades"),
+            "all_sym_results":  all_sym_results,
         }
 
     except Exception as e:
@@ -386,10 +419,12 @@ def run_backtest_pipeline(strategy_id: str) -> dict:
         # hyperparams at this stage stores param_space from implementer
         param_space = param_space_raw if isinstance(param_space_raw, dict) else json.loads(param_space_raw)
 
+        # Use best_symbol from multi-symbol quick test; fall back to implementer hint
+        best_symbol_from_qt = strategy.get("best_symbol")
         symbols = strategy.get("indicators", {}).get("symbols", ["EURUSD"])
         if isinstance(symbols, str):
             symbols = [symbols]
-        symbol = symbols[0] if symbols else "EURUSD"
+        symbol = best_symbol_from_qt or (symbols[0] if symbols else "EURUSD")
 
         # Use the best timeframe discovered by the multi-TF quick test.
         # Falls back to the implementer's suggestion, then 1h.

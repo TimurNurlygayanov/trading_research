@@ -256,6 +256,76 @@ def _auto_generate_research_tasks() -> int:
 
 _MAX_CONCURRENT_RESEARCH = 1  # one at a time — 8k output tokens/min is too tight for two
 
+# Symbols to fan research tasks out to (in addition to the original symbol).
+# Must match the QUICK_TEST_SYMBOLS list in backtest_job.py.
+_FAN_OUT_SYMBOLS = ["EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD", "NZDUSD"]
+_FAN_OUT_BATCH = 6  # max new tasks created per queue-worker cycle
+
+
+def _fan_out_research_to_symbols() -> int:
+    """
+    For every done research task that (a) has data_requirements.symbol set and
+    (b) hasn't been fanned out yet, create a pending variant for each of the
+    other major FX pairs.  This lets us check whether a market-structure finding
+    holds on GBPUSD, USDJPY, etc., not just EURUSD.
+
+    Returns the number of new tasks created this cycle.
+    """
+    done_tasks = db.get_research_tasks(status="done", limit=50)
+    created = 0
+
+    for task in done_tasks:
+        if task.get("fanned_out") or task.get("parent_task_id"):
+            # Already fanned out, or is itself a variant — skip
+            continue
+        if created >= _FAN_OUT_BATCH:
+            break
+
+        data_req = task.get("data_requirements") or {}
+        base_sym = data_req.get("symbol")
+        tf = data_req.get("timeframe")
+        if not base_sym or not tf:
+            # No specific symbol/timeframe — nothing to replicate
+            db.update_research_task(task["id"], {"fanned_out": True})
+            continue
+
+        for sym in _FAN_OUT_SYMBOLS:
+            if sym == base_sym:
+                continue
+            if created >= _FAN_OUT_BATCH:
+                break
+
+            new_title = (
+                task["title"].replace(base_sym, sym)
+                if base_sym in task["title"]
+                else f"{task['title']} — {sym}"
+            )
+            new_question = (
+                task["question"].replace(base_sym, sym)
+                if base_sym in task["question"]
+                else task["question"]
+            )
+            new_data_req = {**data_req, "symbol": sym}
+
+            row = db.insert_research_task({
+                "type":             task.get("type", "market_analysis"),
+                "title":            new_title,
+                "question":         new_question,
+                "data_requirements": new_data_req,
+                "parent_task_id":   task["id"],
+                "status":           "pending",
+            })
+            if row:
+                created += 1
+                log.info("research_fan_out_created parent=%s sym=%s title=%r",
+                         task["id"], sym, new_title)
+
+        db.update_research_task(task["id"], {"fanned_out": True})
+
+    if created:
+        log.info("research_fan_out_total created=%s", created)
+    return created
+
 
 def _dispatch_pending_research_tasks() -> int:
     """Find research tasks in 'pending' and dispatch them to Modal.
@@ -1155,6 +1225,7 @@ def process_queue() -> None:
     research_unblocked    = _process_awaiting_research_strategies()
     research_recovered    = _recover_stuck_research_tasks()
     research_retried      = _retry_failed_research_tasks()
+    research_fanned_out   = _fan_out_research_to_symbols()
     research_generated    = _auto_generate_research_tasks()
     research_dispatched   = _dispatch_pending_research_tasks()
     # 'implemented' → quick backtest; 'validating' → validator
@@ -1175,6 +1246,7 @@ def process_queue() -> None:
         research_unblocked=research_unblocked,
         research_recovered=research_recovered,
         research_retried=research_retried,
+        research_fanned_out=research_fanned_out,
         research_generated=research_generated,
         research_dispatched=research_dispatched,
         modal_dispatched=modal_dispatched,
