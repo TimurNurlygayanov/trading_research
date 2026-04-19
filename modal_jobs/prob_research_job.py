@@ -104,7 +104,7 @@ def run_prob_research(
                             row["timeframe"]      = tf
                             row["condition_desc"] = spec.description
                             row["category"]       = spec.category
-                            row["params"]         = {}
+                            row["params"]         = spec.params
                             db.upsert_prob_result(row)
                             total_results += 1
                     except Exception as exc:

@@ -429,9 +429,12 @@ CREATE TABLE IF NOT EXISTS prob_research_results (
   p_value          float8,
   sharpe           float8,
   is_significant   boolean      DEFAULT false,
+  params           jsonb        DEFAULT '{}',   -- condition hyper-params (period, threshold, etc.)
   last_updated     timestamptz  NOT NULL DEFAULT now(),
   UNIQUE (condition_id, symbol, timeframe, forward_bars)
 );
+
+ALTER TABLE prob_research_results ADD COLUMN IF NOT EXISTS params jsonb DEFAULT '{}';
 
 CREATE INDEX IF NOT EXISTS idx_prob_results_symbol    ON prob_research_results(symbol, timeframe);
 CREATE INDEX IF NOT EXISTS idx_prob_results_category  ON prob_research_results(category);

@@ -17,6 +17,7 @@ class ConditionSpec:
     description: str
     category: str  # candle | ema | session | volatility | momentum
     forward_bars: list[int] = field(default_factory=lambda: [1, 4, 12, 24])
+    params: dict = field(default_factory=dict)  # condition hyper-params for reference
 
 
 # ── Technical helpers ────────────────────────────────────────────────────────
