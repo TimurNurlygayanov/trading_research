@@ -58,7 +58,7 @@ def run_implementer(
 
     db.update_strategy(strategy_id, {"status": "implementing"})
 
-    knowledge = db.get_knowledge_summary(limit=20)
+    knowledge = db.get_knowledge_summary(limit=50)
     knowledge_text = _format_knowledge(knowledge)
 
     library = db.get_indicator_library(limit=50)

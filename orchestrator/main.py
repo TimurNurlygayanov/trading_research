@@ -1019,6 +1019,7 @@ _DASHBOARD_HTML = r"""<!DOCTYPE html>
   <a href="/ideas">Ideas</a>
   <a href="/research">Research</a>
   <a href="/data">Data</a>
+  <a href="/probabilities">Probabilities</a>
 
   <div class="nav-right">
     <div class="budget-pill">Today: <span id="spend">…</span> / <span id="limit">$8.00</span></div>
@@ -2386,6 +2387,7 @@ _IDEAS_HTML = """<!DOCTYPE html>
   <a href="/ideas" class="active">Ideas</a>
   <a href="/research">Research</a>
   <a href="/data">Data</a>
+  <a href="/probabilities">Probabilities</a>
 </nav>
 <div class="page">
   <h1>Submit an Idea</h1>
@@ -2632,6 +2634,7 @@ _RESEARCH_HTML = r"""<!DOCTYPE html>
   <a href="/ideas">Ideas</a>
   <a href="/research" class="active">Research</a>
   <a href="/data">Data</a>
+  <a href="/probabilities">Probabilities</a>
   <div class="nav-right">
     <button class="btn-secondary" id="memo-btn" onclick="refreshMemo(this)" style="margin-right:8px">
       ↻ Refresh memo
@@ -3424,6 +3427,7 @@ _DATA_HTML = r"""<!DOCTYPE html>
   <a href="/ideas">Ideas</a>
   <a href="/research">Research</a>
   <a href="/data" class="active">Data</a>
+  <a href="/probabilities">Probabilities</a>
 
   <div class="nav-right">
     <button class="btn-primary" id="preload-btn" onclick="preloadAll()">
@@ -3445,23 +3449,35 @@ _DATA_HTML = r"""<!DOCTYPE html>
 </div>
 
 <script>
-// Datasets to show (always rendered as cards, even if not yet cached)
-const DATASETS = [
-  {symbol: 'EURUSD', timeframe: '1h',  label: '1 Hour',   color: '#6366f1'},
-  {symbol: 'EURUSD', timeframe: '5m',  label: '5 Min',    color: '#22d3ee'},
-  {symbol: 'EURUSD', timeframe: '1m',  label: '1 Min',    color: '#a78bfa'},
-];
+const SYMBOL_COLORS = {
+  'EURUSD':'#6366f1','GBPUSD':'#22d3ee','USDJPY':'#f59e0b',
+  'AUDUSD':'#4ade80','USDCAD':'#f87171','NZDUSD':'#a78bfa',
+  'BTCUSD':'#fb923c','ETHUSD':'#34d399',
+};
+const TF_LABELS = {'1m':'1 Min','5m':'5 Min','15m':'15 Min','1h':'1 Hour','4h':'4 Hour','1d':'1 Day','1w':'1 Week'};
 
 let cacheMap = {};   // key → metadata row from Supabase
+let datasets  = [];  // built dynamically from API response
 
 async function loadCache() {
   try {
     const r = await fetch('/api/data/cache');
     const d = await r.json();
     cacheMap = {};
+    datasets = [];
     for (const ds of (d.datasets || [])) {
-      cacheMap[ds.symbol + '_' + ds.timeframe] = ds;
+      const key = ds.symbol + '_' + ds.timeframe;
+      cacheMap[key] = ds;
+      datasets.push({
+        symbol:    ds.symbol,
+        timeframe: ds.timeframe,
+        label:     TF_LABELS[ds.timeframe] || ds.timeframe,
+        color:     SYMBOL_COLORS[ds.symbol] || '#6366f1',
+      });
     }
+    // Sort by symbol then timeframe order
+    const TF_ORDER = {'1d':0,'4h':1,'1h':2,'15m':3,'5m':4,'1m':5};
+    datasets.sort((a,b) => a.symbol.localeCompare(b.symbol) || (TF_ORDER[a.timeframe]??9) - (TF_ORDER[b.timeframe]??9));
     renderGrid();
   } catch(e) {
     document.getElementById('grid-wrap').innerHTML =
@@ -3471,9 +3487,12 @@ async function loadCache() {
 
 function renderGrid() {
   const wrap = document.getElementById('grid-wrap');
-  wrap.innerHTML = `<div class="grid">${DATASETS.map(ds => renderCard(ds)).join('')}</div>`;
-  // Load charts asynchronously
-  DATASETS.forEach(ds => {
+  if (!datasets.length) {
+    wrap.innerHTML = '<div class="loading">No cached datasets yet. Use "Preload all" to download data.</div>';
+    return;
+  }
+  wrap.innerHTML = `<div class="grid">${datasets.map(ds => renderCard(ds)).join('')}</div>`;
+  datasets.forEach(ds => {
     const key = ds.symbol + '_' + ds.timeframe;
     if (cacheMap[key]) loadChart(ds.symbol, ds.timeframe, ds.color);
   });
@@ -3706,6 +3725,420 @@ loadCache();
 @app.get("/data", response_class=HTMLResponse)
 def data_page() -> HTMLResponse:
     return HTMLResponse(_DATA_HTML)
+
+
+# ---------------------------------------------------------------------------
+# Probabilities dashboard
+# ---------------------------------------------------------------------------
+
+_PROB_HTML = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Market Probabilities — Trading Research</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+         background: #0a0d14; color: #e2e8f0; min-height: 100vh; }
+  .nav { display: flex; align-items: center; gap: 0; background: #111827;
+         border-bottom: 1px solid #1f2937; padding: 0 24px; }
+  .nav-logo { font-weight: 700; font-size: 0.95rem; color: #f8fafc;
+              padding: 14px 0; margin-right: 32px; letter-spacing: -.01em; }
+  .nav a { display: block; padding: 14px 16px; font-size: 0.85rem; color: #94a3b8;
+           text-decoration: none; border-bottom: 2px solid transparent; transition: color .15s; }
+  .nav a:hover, .nav a.active { color: #f1f5f9; border-bottom-color: #6366f1; }
+  .nav-right { margin-left: auto; display: flex; align-items: center; gap: 12px; }
+  .page { max-width: 1400px; margin: 0 auto; padding: 28px 24px; }
+  h1 { font-size: 1.4rem; font-weight: 700; color: #f8fafc; margin-bottom: 6px; }
+  .subtitle { font-size: 0.85rem; color: #64748b; margin-bottom: 24px; }
+
+  /* filter bar */
+  .filters { display: flex; flex-wrap: wrap; gap: 10px; align-items: flex-end;
+             background: #111827; border: 1px solid #1f2937; border-radius: 12px;
+             padding: 16px 20px; margin-bottom: 20px; }
+  .filter-group { display: flex; flex-direction: column; gap: 4px; }
+  .filter-group label { font-size: 0.72rem; font-weight: 600; text-transform: uppercase;
+                        letter-spacing: .06em; color: #64748b; }
+  select, input[type=range] { background: #1e2533; border: 1px solid #374151;
+    border-radius: 8px; color: #e2e8f0; font-size: 0.82rem; padding: 6px 10px; cursor: pointer; }
+  select:focus { outline: none; border-color: #6366f1; }
+  .run-btn { background: #6366f1; border: none; border-radius: 8px; color: #fff;
+             font-size: 0.85rem; font-weight: 600; padding: 8px 20px; cursor: pointer; transition: background .15s; }
+  .run-btn:hover { background: #4f46e5; }
+  .run-btn:disabled { background: #374151; color: #64748b; cursor: not-allowed; }
+  .p-slider-val { font-size: 0.78rem; color: #94a3b8; min-width: 32px; }
+
+  /* summary cards */
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+           gap: 12px; margin-bottom: 24px; }
+  .card { background: #111827; border: 1px solid #1f2937; border-radius: 12px;
+          padding: 16px 18px; }
+  .card-label { font-size: 0.72rem; font-weight: 600; text-transform: uppercase;
+                letter-spacing: .07em; color: #64748b; margin-bottom: 6px; }
+  .card-value { font-size: 1.6rem; font-weight: 700; color: #f8fafc; line-height: 1; }
+  .card-value.green { color: #4ade80; }
+  .card-value.red   { color: #f87171; }
+  .card-value.blue  { color: #60a5fa; }
+
+  /* results table */
+  .table-wrap { background: #111827; border: 1px solid #1f2937; border-radius: 12px;
+                overflow: auto; }
+  table { width: 100%; border-collapse: collapse; font-size: 0.82rem; }
+  th { background: #0f1624; padding: 10px 12px; text-align: left; font-size: 0.72rem;
+       font-weight: 600; text-transform: uppercase; letter-spacing: .06em; color: #64748b;
+       border-bottom: 1px solid #1f2937; cursor: pointer; user-select: none; white-space: nowrap; }
+  th:hover { color: #94a3b8; }
+  th .sort-arrow { margin-left: 4px; opacity: 0.4; }
+  th.sorted .sort-arrow { opacity: 1; color: #6366f1; }
+  td { padding: 9px 12px; border-bottom: 1px solid #0f1624; vertical-align: middle; }
+  tr:last-child td { border-bottom: none; }
+  tr:hover td { background: #141c2e; }
+
+  /* hit-rate cell color coding */
+  .hit-bull-strong { background: rgba(74,222,128,.18); color: #4ade80; font-weight: 700; }
+  .hit-bull-weak   { background: rgba(74,222,128,.07); color: #86efac; }
+  .hit-bear-strong { background: rgba(248,113,113,.18); color: #f87171; font-weight: 700; }
+  .hit-bear-weak   { background: rgba(248,113,113,.07); color: #fca5a5; }
+  .hit-neutral     { color: #94a3b8; }
+
+  .cat-badge { display: inline-block; padding: 2px 8px; border-radius: 99px;
+               font-size: 0.7rem; font-weight: 600; }
+  .cat-candle     { background: #1a2e1a; color: #86efac; }
+  .cat-ema        { background: #1e1b4b; color: #818cf8; }
+  .cat-session    { background: #1a2530; color: #60a5fa; }
+  .cat-volatility { background: #2a1f00; color: #fcd34d; }
+  .cat-momentum   { background: #2a1020; color: #f9a8d4; }
+
+  .sig-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+             margin-right: 4px; }
+  .sig-yes { background: #4ade80; }
+  .sig-no  { background: #374151; }
+
+  .empty { text-align: center; padding: 60px 20px; color: #475569; }
+  .status-bar { font-size: 0.78rem; color: #64748b; margin-top: 12px; }
+  .loading { opacity: 0.5; pointer-events: none; }
+</style>
+</head>
+<body>
+<nav class="nav">
+  <div class="nav-logo">Trading Research</div>
+  <a href="/dashboard">Dashboard</a>
+  <a href="/ideas">Ideas</a>
+  <a href="/research">Research</a>
+  <a href="/data">Data</a>
+  <a href="/probabilities" class="active">Probabilities</a>
+  <div class="nav-right">
+    <button class="refresh-btn" onclick="loadResults()">↻ Refresh</button>
+  </div>
+</nav>
+<div class="page">
+  <h1>Market Condition Probabilities</h1>
+  <p class="subtitle">
+    Statistical forward-return analysis for 42 market conditions across 6 pairs × 3 timeframes.
+    Shows whether a condition tilts the probability of the next N bars being bullish or bearish.
+  </p>
+
+  <div class="filters">
+    <div class="filter-group">
+      <label>Symbol</label>
+      <select id="fSymbol" onchange="loadResults()">
+        <option value="">All</option>
+        <option value="EURUSD">EURUSD</option>
+        <option value="GBPUSD">GBPUSD</option>
+        <option value="USDJPY">USDJPY</option>
+        <option value="AUDUSD">AUDUSD</option>
+        <option value="USDCAD">USDCAD</option>
+        <option value="NZDUSD">NZDUSD</option>
+      </select>
+    </div>
+    <div class="filter-group">
+      <label>Timeframe</label>
+      <select id="fTf" onchange="loadResults()">
+        <option value="">All</option>
+        <option value="1d">1D</option>
+        <option value="4h">4H</option>
+        <option value="1h">1H</option>
+      </select>
+    </div>
+    <div class="filter-group">
+      <label>Category</label>
+      <select id="fCat" onchange="loadResults()">
+        <option value="">All</option>
+        <option value="candle">Candle</option>
+        <option value="ema">EMA / Levels</option>
+        <option value="session">Session / Time</option>
+        <option value="volatility">Volatility</option>
+        <option value="momentum">Momentum</option>
+      </select>
+    </div>
+    <div class="filter-group">
+      <label>Forward bars</label>
+      <select id="fFwd" onchange="loadResults()">
+        <option value="">All</option>
+        <option value="1">1 bar</option>
+        <option value="4">4 bars</option>
+        <option value="12">12 bars</option>
+        <option value="24">24 bars</option>
+      </select>
+    </div>
+    <div class="filter-group">
+      <label>Direction</label>
+      <select id="fDir" onchange="loadResults()">
+        <option value="">Both</option>
+        <option value="bull">Bullish edge (hit > 50%)</option>
+        <option value="bear">Bearish edge (hit < 50%)</option>
+      </select>
+    </div>
+    <div class="filter-group">
+      <label>Significant only</label>
+      <select id="fSig" onchange="loadResults()">
+        <option value="">All</option>
+        <option value="1">p &lt; 0.05 only</option>
+        <option value="0.1">p &lt; 0.10 only</option>
+      </select>
+    </div>
+    <div style="margin-left:auto; display:flex; align-items:flex-end; gap:10px;">
+      <button class="run-btn" id="runBtn" onclick="runAnalysis()">▶ Run Analysis</button>
+    </div>
+  </div>
+
+  <div class="cards">
+    <div class="card">
+      <div class="card-label">Total results</div>
+      <div class="card-value blue" id="cTotal">—</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Significant (p&lt;0.05)</div>
+      <div class="card-value green" id="cSig">—</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Bullish edges</div>
+      <div class="card-value green" id="cBull">—</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Bearish edges</div>
+      <div class="card-value red" id="cBear">—</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Last run</div>
+      <div class="card-value" id="cLast" style="font-size:0.9rem">—</div>
+    </div>
+  </div>
+
+  <div class="table-wrap">
+    <table id="tbl">
+      <thead>
+        <tr>
+          <th onclick="sortBy('condition_desc')">Condition <span class="sort-arrow">↕</span></th>
+          <th onclick="sortBy('category')">Category <span class="sort-arrow">↕</span></th>
+          <th onclick="sortBy('symbol')">Symbol <span class="sort-arrow">↕</span></th>
+          <th onclick="sortBy('timeframe')">TF <span class="sort-arrow">↕</span></th>
+          <th onclick="sortBy('forward_bars')">Fwd <span class="sort-arrow">↕</span></th>
+          <th onclick="sortBy('n_samples')">Samples <span class="sort-arrow">↕</span></th>
+          <th onclick="sortBy('hit_rate')">Hit Rate <span class="sort-arrow">↕</span></th>
+          <th onclick="sortBy('mean_return')">Avg Return <span class="sort-arrow">↕</span></th>
+          <th onclick="sortBy('t_stat')">T-stat <span class="sort-arrow">↕</span></th>
+          <th onclick="sortBy('p_value')">P-value <span class="sort-arrow">↕</span></th>
+          <th onclick="sortBy('sharpe')">Sharpe <span class="sort-arrow">↕</span></th>
+          <th onclick="sortBy('is_significant')">Sig? <span class="sort-arrow">↕</span></th>
+        </tr>
+      </thead>
+      <tbody id="tbody">
+        <tr><td colspan="12" class="empty">Loading…</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="status-bar" id="statusBar"></div>
+</div>
+
+<script>
+let allRows = [];
+let sortCol = 'p_value';
+let sortAsc = true;
+
+async function loadResults() {
+  const sym  = document.getElementById('fSymbol').value;
+  const tf   = document.getElementById('fTf').value;
+  const cat  = document.getElementById('fCat').value;
+  const fwd  = document.getElementById('fFwd').value;
+  const dir  = document.getElementById('fDir').value;
+  const sig  = document.getElementById('fSig').value;
+
+  const params = new URLSearchParams();
+  if (sym) params.set('symbol', sym);
+  if (tf)  params.set('timeframe', tf);
+  if (cat) params.set('category', cat);
+  if (fwd) params.set('forward_bars', fwd);
+  if (dir) params.set('direction', dir);
+  if (sig) params.set('max_p_value', sig);
+
+  const tbody = document.getElementById('tbody');
+  tbody.innerHTML = '<tr><td colspan="12" class="empty">Loading…</td></tr>';
+
+  try {
+    const r = await fetch('/api/probabilities/results?' + params);
+    const d = await r.json();
+    allRows = d.results || [];
+    updateCards(d.meta || {}, allRows);
+    renderTable();
+    document.getElementById('statusBar').textContent =
+      `Showing ${allRows.length} rows`;
+  } catch(e) {
+    tbody.innerHTML = '<tr><td colspan="12" class="empty">Error loading results</td></tr>';
+  }
+}
+
+function updateCards(meta, rows) {
+  document.getElementById('cTotal').textContent = (meta.total || 0).toLocaleString();
+  const sig   = rows.filter(r => r.is_significant).length;
+  const bull  = rows.filter(r => r.is_significant && r.hit_rate > 0.5).length;
+  const bear  = rows.filter(r => r.is_significant && r.hit_rate < 0.5).length;
+  document.getElementById('cSig').textContent  = sig;
+  document.getElementById('cBull').textContent = bull;
+  document.getElementById('cBear').textContent = bear;
+  if (meta.last_updated) {
+    const d = new Date(meta.last_updated);
+    document.getElementById('cLast').textContent = d.toLocaleDateString() + ' ' + d.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'});
+  }
+}
+
+function sortBy(col) {
+  if (sortCol === col) { sortAsc = !sortAsc; }
+  else { sortCol = col; sortAsc = col === 'p_value'; }
+  renderTable();
+  // update header highlight
+  document.querySelectorAll('th').forEach(th => th.classList.remove('sorted'));
+  const ths = document.querySelectorAll('th');
+  ths.forEach(th => { if (th.getAttribute('onclick') === `sortBy('${col}')`) th.classList.add('sorted'); });
+}
+
+function renderTable() {
+  const fDir = document.getElementById('fDir').value;
+  let rows = [...allRows];
+  if (fDir === 'bull') rows = rows.filter(r => r.hit_rate > 0.5);
+  if (fDir === 'bear') rows = rows.filter(r => r.hit_rate < 0.5);
+
+  rows.sort((a, b) => {
+    const va = a[sortCol]; const vb = b[sortCol];
+    if (va == null && vb == null) return 0;
+    if (va == null) return 1;
+    if (vb == null) return -1;
+    return sortAsc ? (va > vb ? 1 : -1) : (va < vb ? 1 : -1);
+  });
+
+  const tbody = document.getElementById('tbody');
+  if (!rows.length) {
+    tbody.innerHTML = '<tr><td colspan="12" class="empty">No results — run the analysis first or adjust filters.</td></tr>';
+    return;
+  }
+  tbody.innerHTML = rows.map(r => {
+    const hr = r.hit_rate != null ? r.hit_rate : 0.5;
+    let hrClass = 'hit-neutral';
+    if (r.is_significant) {
+      if (hr >= 0.55) hrClass = 'hit-bull-strong';
+      else if (hr > 0.51) hrClass = 'hit-bull-weak';
+      else if (hr <= 0.45) hrClass = 'hit-bear-strong';
+      else if (hr < 0.49) hrClass = 'hit-bear-weak';
+    } else {
+      if (hr > 0.52) hrClass = 'hit-bull-weak';
+      else if (hr < 0.48) hrClass = 'hit-bear-weak';
+    }
+    const sigDot = r.is_significant
+      ? '<span class="sig-dot sig-yes"></span>Yes'
+      : '<span class="sig-dot sig-no"></span>No';
+    const pFmt = r.p_value != null ? r.p_value.toFixed(4) : '—';
+    const tFmt = r.t_stat  != null ? r.t_stat.toFixed(3)  : '—';
+    const mFmt = r.mean_return != null ? (r.mean_return * 100).toFixed(4) + '%' : '—';
+    const sFmt = r.sharpe  != null ? r.sharpe.toFixed(3)  : '—';
+    const hrFmt = r.hit_rate != null ? (r.hit_rate * 100).toFixed(1) + '%' : '—';
+    return `<tr>
+      <td style="max-width:260px;white-space:normal">${r.condition_desc || r.condition_id}</td>
+      <td><span class="cat-badge cat-${r.category}">${r.category}</span></td>
+      <td>${r.symbol}</td>
+      <td>${r.timeframe}</td>
+      <td>${r.forward_bars}b</td>
+      <td>${(r.n_samples||0).toLocaleString()}</td>
+      <td class="${hrClass}">${hrFmt}</td>
+      <td>${mFmt}</td>
+      <td>${tFmt}</td>
+      <td>${pFmt}</td>
+      <td>${sFmt}</td>
+      <td>${sigDot}</td>
+    </tr>`;
+  }).join('');
+}
+
+async function runAnalysis() {
+  const btn = document.getElementById('runBtn');
+  btn.disabled = true;
+  btn.textContent = '⏳ Running…';
+  try {
+    const r = await fetch('/api/probabilities/run', { method: 'POST' });
+    const d = await r.json();
+    if (d.ok) {
+      btn.textContent = '✓ Started';
+      setTimeout(() => { btn.disabled = false; btn.textContent = '▶ Run Analysis'; }, 5000);
+    } else {
+      btn.textContent = '✗ Error';
+      setTimeout(() => { btn.disabled = false; btn.textContent = '▶ Run Analysis'; }, 3000);
+    }
+  } catch(e) {
+    btn.textContent = '✗ Error';
+    setTimeout(() => { btn.disabled = false; btn.textContent = '▶ Run Analysis'; }, 3000);
+  }
+}
+
+loadResults();
+</script>
+</body>
+</html>"""
+
+
+@app.get("/probabilities", response_class=HTMLResponse)
+def probabilities_page() -> HTMLResponse:
+    return HTMLResponse(_PROB_HTML)
+
+
+@app.get("/api/probabilities/results")
+def api_prob_results(
+    symbol: str | None = Query(default=None),
+    timeframe: str | None = Query(default=None),
+    category: str | None = Query(default=None),
+    forward_bars: int | None = Query(default=None),
+    direction: str | None = Query(default=None),  # "bull" | "bear" | None
+    max_p_value: float = Query(default=1.0),
+) -> JSONResponse:
+    try:
+        sig_only = max_p_value < 1.0
+        results = db.get_prob_results(
+            symbol=symbol, timeframe=timeframe, category=category,
+            forward_bars=forward_bars, max_p_value=max_p_value,
+            significant_only=sig_only, limit=1000,
+        )
+        if direction == "bull":
+            results = [r for r in results if (r.get("hit_rate") or 0.5) > 0.5]
+        elif direction == "bear":
+            results = [r for r in results if (r.get("hit_rate") or 0.5) < 0.5]
+        meta = db.get_prob_research_meta()
+        return JSONResponse({"results": results, "meta": meta})
+    except Exception as exc:
+        log.error("api_prob_results_error", error=str(exc), traceback=_traceback.format_exc())
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+@app.post("/api/probabilities/run")
+def api_prob_run() -> JSONResponse:
+    """Trigger the probability research Modal job asynchronously."""
+    try:
+        import modal as _modal
+        fn = _modal.Function.from_name("trading-research-prob", "run_prob_research")
+        fn.spawn()
+        log.info("prob_research_job_spawned")
+        return JSONResponse({"ok": True, "message": "Probability research job started"})
+    except Exception as exc:
+        log.error("api_prob_run_error", error=str(exc), traceback=_traceback.format_exc())
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
 
 
 # ---------------------------------------------------------------------------

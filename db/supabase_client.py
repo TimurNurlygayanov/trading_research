@@ -400,6 +400,26 @@ def get_indicator_library(category: str | None = None, limit: int = 200) -> list
     return result.data or []
 
 
+def get_indicator_library_for_strategy_gen(min_sharpe: float = 0.6, limit: int = 10) -> list[dict]:
+    """Return good indicator library entries that haven't been converted to strategies yet."""
+    sb = get_client()
+    result = (
+        sb.table("indicator_library")
+        .select("id, spec_id, name, display_name, category, description, best_params, best_sharpe")
+        .eq("strategy_generated", False)
+        .gte("best_sharpe", min_sharpe)
+        .order("best_sharpe", desc=True, nullsfirst=False)
+        .limit(limit)
+        .execute()
+    )
+    return result.data or []
+
+
+def mark_indicator_strategy_generated(spec_id: str) -> None:
+    sb = get_client()
+    sb.table("indicator_library").update({"strategy_generated": True}).eq("spec_id", spec_id).execute()
+
+
 def get_indicator_code(spec_id: str) -> str | None:
     sb = get_client()
     result = sb.table("indicator_library").select("code").eq("spec_id", spec_id).execute()
@@ -420,3 +440,52 @@ def set_config(key: str, value: str) -> None:
         {"key": key, "value": value, "updated_at": datetime.utcnow().isoformat()},
         on_conflict="key",
     ).execute()
+
+
+# ── prob_research_results ─────────────────────────────────────────────────────
+
+def upsert_prob_result(data: dict) -> None:
+    """Insert or update a prob_research_results row keyed by (condition_id, symbol, timeframe, forward_bars)."""
+    sb = get_client()
+    sb.table("prob_research_results").upsert(data, on_conflict="condition_id,symbol,timeframe,forward_bars").execute()
+
+
+def get_prob_results(
+    symbol: str | None = None,
+    timeframe: str | None = None,
+    category: str | None = None,
+    forward_bars: int | None = None,
+    min_samples: int = 30,
+    max_p_value: float = 1.0,
+    significant_only: bool = False,
+    limit: int = 500,
+) -> list[dict]:
+    sb = get_client()
+    q = sb.table("prob_research_results").select("*")
+    if symbol:
+        q = q.eq("symbol", symbol)
+    if timeframe:
+        q = q.eq("timeframe", timeframe)
+    if category:
+        q = q.eq("category", category)
+    if forward_bars is not None:
+        q = q.eq("forward_bars", forward_bars)
+    if min_samples > 0:
+        q = q.gte("n_samples", min_samples)
+    if max_p_value < 1.0:
+        q = q.lte("p_value", max_p_value)
+    if significant_only:
+        q = q.eq("is_significant", True)
+    result = q.order("p_value", desc=False).limit(limit).execute()
+    return result.data or []
+
+
+def get_prob_research_meta() -> dict:
+    """Return last_updated timestamp and total result count."""
+    sb = get_client()
+    result = sb.table("prob_research_results").select(
+        "last_updated", count="exact"
+    ).order("last_updated", desc=True).limit(1).execute()
+    count = result.count or 0
+    last_updated = result.data[0]["last_updated"] if result.data else None
+    return {"total": count, "last_updated": last_updated}

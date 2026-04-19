@@ -53,7 +53,7 @@ CACHE_DIR = "/ohlcv_cache"
     image=image,
     cpu=4,
     memory=8192,
-    timeout=600,  # 10 minutes
+    timeout=1800,  # 30 minutes
     secrets=[modal.Secret.from_name("trading-research-secrets")],
     volumes={CACHE_DIR: ohlcv_cache},
 )

@@ -96,7 +96,7 @@ def _dispatch_validator_job(strategy_id: str) -> None:
 
 
 _RESEARCH_MAX_RETRIES = 3
-_RESEARCH_STUCK_TIMEOUT_MINUTES = 13  # Modal timeout is 10 min; 13 min means it's definitely dead
+_RESEARCH_STUCK_TIMEOUT_MINUTES = 35  # Modal timeout is 30 min; 35 min means it's definitely dead
 
 # Strategy job timeouts — Modal kills containers silently, leaving stale status + modal_job_id.
 # Set slightly above the Modal function timeout so we don't reset jobs that are still running.
@@ -207,6 +207,63 @@ def _retry_failed_research_tasks() -> int:
         reset += 1
         log.info("research_task_reset_for_retry task_id=%s retry=%s", task["id"], retries + 1)
     return reset
+
+
+def _auto_generate_strategies_from_research() -> int:
+    """
+    Convert high-quality indicator_library entries into strategy ideas.
+
+    When indicator research shows a Sharpe > 0.6 finding, this function creates
+    a user_idea so the full implementer → quick_test → backtest pipeline runs
+    on it automatically.  At most 2 ideas per cycle to avoid flooding the queue.
+    Only runs when fewer than 5 strategies are actively being implemented.
+    """
+    # Don't flood the pipeline
+    implementing = (
+        len(db.get_strategies_by_status("implementing", limit=10)) +
+        len(db.get_strategies_by_status("implemented",  limit=10))
+    )
+    if implementing >= 5:
+        return 0
+
+    indicators = db.get_indicator_library_for_strategy_gen(min_sharpe=0.6, limit=5)
+    created = 0
+    for ind in indicators[:2]:
+        display = ind.get("display_name") or ind.get("name", "Unknown indicator")
+        category = ind.get("category", "")
+        desc_text = ind.get("description") or ""
+        best_sharpe = ind.get("best_sharpe") or 0
+        best_params = ind.get("best_params") or {}
+
+        params_str = (
+            ", ".join(f"{k}={v}" for k, v in best_params.items())
+            if best_params else "default params"
+        )
+
+        idea_description = (
+            f"Implement a trading strategy based on the {display} indicator "
+            f"({category} category). "
+            f"Research shows this indicator achieves Sharpe ≈ {best_sharpe:.2f} "
+            f"with best params: {params_str}. "
+            f"{desc_text} "
+            f"Use the indicator as the primary entry/exit signal. "
+            f"Test on EURUSD, GBPUSD, and USDJPY across 1h and 4h timeframes."
+        )
+
+        sb = db.get_client()
+        sb.table("user_ideas").insert({
+            "description": idea_description,
+            "status":      "pending",
+            "priority":    2,
+            "source":      "auto_research",
+        }).execute()
+
+        db.mark_indicator_strategy_generated(ind["spec_id"])
+        created += 1
+        log.info("auto_strategy_from_research spec_id=%s sharpe=%.3f",
+                 ind["spec_id"], best_sharpe)
+
+    return created
 
 
 def _auto_generate_research_tasks() -> int:
@@ -794,9 +851,19 @@ def _process_quick_tested_strategies() -> int:
                          sharpe=sharpe, trades=trades)
                 acted += 1
             else:
-                log.info("campaign_variation_ready", strategy_id=strategy_id,
+                # Good campaign variation — move to awaiting_review so it can be
+                # approved for full backtesting, same as standalone strategies.
+                db.update_strategy(strategy_id, {"status": "awaiting_review"})
+                add_pipeline_note(
+                    strategy_id,
+                    f"Campaign variation passed quick test "
+                    f"(Sharpe={sharpe:.4f}, trades={trades}). "
+                    "Waiting for review — approve to start full optimization."
+                )
+                log.info("campaign_variation_awaiting_review", strategy_id=strategy_id,
                          sharpe=sharpe, trades=trades)
-            continue  # campaign review panel handles approval
+                acted += 1
+            continue
 
         # ── Standalone strategies: individual review ─────────────────────────
         try:
@@ -1227,6 +1294,7 @@ def process_queue() -> None:
     research_retried      = _retry_failed_research_tasks()
     research_fanned_out   = _fan_out_research_to_symbols()
     research_generated    = _auto_generate_research_tasks()
+    strategies_from_research = _auto_generate_strategies_from_research()
     research_dispatched   = _dispatch_pending_research_tasks()
     # 'implemented' → quick backtest; 'validating' → validator
     modal_dispatched      = _process_implemented_strategies()
@@ -1248,6 +1316,7 @@ def process_queue() -> None:
         research_retried=research_retried,
         research_fanned_out=research_fanned_out,
         research_generated=research_generated,
+        strategies_from_research=strategies_from_research,
         research_dispatched=research_dispatched,
         modal_dispatched=modal_dispatched,
         full_backtest_queued=full_backtest_queued,

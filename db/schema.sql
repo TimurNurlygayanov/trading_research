@@ -308,7 +308,7 @@ BEGIN
     SELECT policyname, tablename FROM pg_policies
     WHERE tablename IN (
       'strategies', 'user_ideas', 'generated_ideas', 'knowledge_base', 'spend_log',
-      'research_tasks'
+      'research_tasks', 'indicator_library', 'system_config', 'prob_research_results'
     )
   LOOP
     EXECUTE format('DROP POLICY IF EXISTS %I ON %I', pol.policyname, pol.tablename);
@@ -403,8 +403,41 @@ CREATE TABLE IF NOT EXISTS indicator_library (
 CREATE INDEX IF NOT EXISTS idx_indicator_library_category ON indicator_library(category);
 CREATE INDEX IF NOT EXISTS idx_indicator_library_name     ON indicator_library(name);
 
+ALTER TABLE indicator_library ADD COLUMN IF NOT EXISTS strategy_generated boolean DEFAULT false;
+
 ALTER TABLE indicator_library ENABLE ROW LEVEL SECURITY;
 CREATE POLICY allow_all ON indicator_library FOR ALL USING (true) WITH CHECK (true);
+
+-- =============================================================================
+-- Table: prob_research_results  (statistical probability research)
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS prob_research_results (
+  id               uuid         PRIMARY KEY DEFAULT gen_random_uuid(),
+  condition_id     text         NOT NULL,
+  condition_desc   text         NOT NULL,
+  category         text         NOT NULL,
+  symbol           text         NOT NULL,
+  timeframe        text         NOT NULL,
+  forward_bars     int          NOT NULL,
+  n_samples        int,
+  hit_rate         float8,
+  mean_return      float8,
+  std_return       float8,
+  median_return    float8,
+  t_stat           float8,
+  p_value          float8,
+  sharpe           float8,
+  is_significant   boolean      DEFAULT false,
+  last_updated     timestamptz  NOT NULL DEFAULT now(),
+  UNIQUE (condition_id, symbol, timeframe, forward_bars)
+);
+
+CREATE INDEX IF NOT EXISTS idx_prob_results_symbol    ON prob_research_results(symbol, timeframe);
+CREATE INDEX IF NOT EXISTS idx_prob_results_category  ON prob_research_results(category);
+CREATE INDEX IF NOT EXISTS idx_prob_results_sig       ON prob_research_results(is_significant, p_value);
+
+ALTER TABLE prob_research_results ENABLE ROW LEVEL SECURITY;
+CREATE POLICY allow_all ON prob_research_results FOR ALL USING (true) WITH CHECK (true);
 
 -- =============================================================================
 -- Table: system_config  (single-row key/value store for persistent system state)

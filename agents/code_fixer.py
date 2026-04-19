@@ -82,6 +82,9 @@ _CODE_BUG_PATTERNS = [
     r"zero trades on all timeframes",
     r"0 trades on all timeframes",
     r"zero signals",
+    r"Zero trades on ALL",           # new multi-symbol quick test message
+    r"Too few trades: 0 ",           # engine quality gate when total_trades == 0
+    r"zero_trades_all_timeframes",   # return reason key
 ]
 
 
