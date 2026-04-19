@@ -252,6 +252,7 @@ def _auto_generate_strategies_from_research() -> int:
 
         sb = db.get_client()
         sb.table("user_ideas").insert({
+            "title":       f"Auto: {display} strategy",
             "description": idea_description,
             "status":      "pending",
             "priority":    2,

@@ -219,10 +219,10 @@ def run_variation_planner(
             raw1 = raw1.strip().rstrip("```").strip()
 
         decomposed = json.loads(raw1)
-        log.info("variation_planner_decompose_done", strategy_id=strategy_id,
-                 hypothesis=decomposed.get("core_hypothesis", "?")[:80])
+        log.info("variation_planner_decompose_done strategy_id=%s hypothesis=%s",
+                 strategy_id, decomposed.get("core_hypothesis", "?")[:80])
     except Exception as exc:
-        log.warning("variation_planner_decompose_failed", error=str(exc))
+        log.warning("variation_planner_decompose_failed error=%s", exc)
         # Fall back to raw description if decomposition fails
         decomposed = {"core_hypothesis": description, "edge_summary": ""}
 
@@ -277,8 +277,8 @@ def run_variation_planner(
         # Trim to requested count in case LLM produced extras
         variations = variations[:n_extra]
 
-        log.info("variation_planner_done", strategy_id=strategy_id,
-                 n_generated=len(variations))
+        log.info("variation_planner_done strategy_id=%s n_generated=%d",
+                 strategy_id, len(variations))
 
         add_pipeline_note(
             strategy_id,
@@ -292,7 +292,7 @@ def run_variation_planner(
         return variations
 
     except Exception as exc:
-        log.error("variation_planner_error", strategy_id=strategy_id, error=str(exc))
+        log.error("variation_planner_error strategy_id=%s error=%s", strategy_id, exc)
         add_pipeline_note(strategy_id,
             f"Variation planner failed ({exc}). Proceeding with single implementation.")
         return []

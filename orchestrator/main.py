@@ -1412,7 +1412,7 @@ function renderIdeas(ideas) {
           <div class="idea-pills">${pills}</div>
         </div>
         <button class="idea-delete-btn" title="Delete idea and all its strategies"
-          onclick="event.stopPropagation(); deleteIdea(${JSON.stringify(idea.idea_id)}, ${idx})">✕</button>
+          onclick="event.stopPropagation(); deleteIdea('${idea.idea_id}', ${idx})">✕</button>
       </div>
       <div class="idea-strategies">${rows}</div>
     </div>`;
