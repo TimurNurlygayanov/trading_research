@@ -201,6 +201,7 @@ ALTER TABLE user_ideas ADD COLUMN IF NOT EXISTS notes       text;
 ALTER TABLE user_ideas ADD COLUMN IF NOT EXISTS priority    int DEFAULT 5;
 ALTER TABLE user_ideas ADD COLUMN IF NOT EXISTS updated_at  timestamptz DEFAULT now();
 ALTER TABLE user_ideas ADD COLUMN IF NOT EXISTS strategy_id uuid REFERENCES strategies(id) ON DELETE SET NULL;
+ALTER TABLE user_ideas ADD COLUMN IF NOT EXISTS source      text DEFAULT 'user';  -- 'user' | 'indicator_library' | 'seed_agent'
 
 CREATE INDEX IF NOT EXISTS idx_user_ideas_status      ON user_ideas(status);
 CREATE INDEX IF NOT EXISTS idx_user_ideas_priority    ON user_ideas(priority, created_at);

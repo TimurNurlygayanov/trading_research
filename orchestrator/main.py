@@ -3260,6 +3260,7 @@ def api_strategy_from_indicator(req: FromIndicatorRequest) -> JSONResponse:
 
         sb = db.get_client()
         result = sb.table("user_ideas").insert({
+            "title":       f"Strategy from {display}",
             "description": description,
             "status":      "pending",
             "priority":    1,
