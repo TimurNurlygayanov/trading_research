@@ -3092,7 +3092,7 @@ async function loadLibrary() {
   ${e.description ? `<div class="lib-desc">${esc(e.description.slice(0,200))}</div>` : ''}
   ${params ? `<div class="lib-params">${esc(params)}</div>` : ''}
   <div style="margin-top:10px">
-    <button class="create-strat-btn" onclick="createStrategyFromIndicator(${JSON.stringify(e.spec_id)}, ${JSON.stringify(e.display_name)}, this)">
+    <button class="create-strat-btn" data-spec-id="${esc(e.spec_id)}" data-display-name="${esc(e.display_name)}" onclick="createStrategyFromIndicator(this.dataset.specId, this.dataset.displayName, this)">
       ＋ Create Strategy
     </button>
   </div>
@@ -3991,6 +3991,7 @@ _PROB_HTML = r"""<!DOCTYPE html>
       </select>
     </div>
     <div style="margin-left:auto; display:flex; align-items:flex-end; gap:10px;">
+      <button class="run-btn" onclick="loadResults()" style="background:#1e3a5f;border-color:#3b82f6">↻ Refresh</button>
       <button class="run-btn" id="runBtn" onclick="runAnalysis()">▶ Run Analysis</button>
     </div>
   </div>
@@ -4161,23 +4162,40 @@ function renderTable() {
   }).join('');
 }
 
+let _pollTimer = null;
 async function runAnalysis() {
   const btn = document.getElementById('runBtn');
   btn.disabled = true;
-  btn.textContent = '⏳ Running…';
+  btn.textContent = '⏳ Spawning…';
   try {
     const r = await fetch('/api/probabilities/run', { method: 'POST' });
     const d = await r.json();
     if (d.ok) {
-      btn.textContent = '✓ Started';
-      setTimeout(() => { btn.disabled = false; btn.textContent = '▶ Run Analysis'; }, 5000);
+      btn.textContent = '⏳ Running (10–30 min)…';
+      // Poll every 60s; stop after 20 attempts (~20 min) or when results appear
+      let attempts = 0;
+      const prevTotal = parseInt(document.getElementById('cTotal').textContent) || 0;
+      if (_pollTimer) clearInterval(_pollTimer);
+      _pollTimer = setInterval(async () => {
+        attempts++;
+        await loadResults();
+        const newTotal = parseInt(document.getElementById('cTotal').textContent) || 0;
+        if (newTotal > prevTotal || attempts >= 20) {
+          clearInterval(_pollTimer); _pollTimer = null;
+          btn.disabled = false;
+          btn.textContent = newTotal > prevTotal ? '✓ Done — results loaded' : '▶ Run Analysis';
+          if (newTotal > prevTotal) setTimeout(() => { btn.textContent = '▶ Run Analysis'; }, 5000);
+        }
+      }, 60000);
     } else {
-      btn.textContent = '✗ Error';
-      setTimeout(() => { btn.disabled = false; btn.textContent = '▶ Run Analysis'; }, 3000);
+      btn.textContent = '✗ ' + (d.error || 'Error — see console');
+      console.error('prob run error:', d.error);
+      setTimeout(() => { btn.disabled = false; btn.textContent = '▶ Run Analysis'; }, 8000);
     }
   } catch(e) {
-    btn.textContent = '✗ Error';
-    setTimeout(() => { btn.disabled = false; btn.textContent = '▶ Run Analysis'; }, 3000);
+    btn.textContent = '✗ Network error';
+    console.error('prob run fetch error:', e);
+    setTimeout(() => { btn.disabled = false; btn.textContent = '▶ Run Analysis'; }, 5000);
   }
 }
 
