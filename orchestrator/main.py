@@ -2616,6 +2616,11 @@ _RESEARCH_HTML = r"""<!DOCTYPE html>
   .lib-sharpe { font-size: 0.72rem; font-weight: 600; font-family: "SF Mono",monospace; }
   .lib-sharpe.pos { color: #4ade80; }
   .lib-sharpe.neu { color: #64748b; }
+  .create-strat-btn { background: #1e1b4b; border: 1px solid #4f46e5; border-radius: 8px;
+    color: #818cf8; font-size: 0.78rem; font-weight: 600; padding: 6px 14px;
+    cursor: pointer; width: 100%; transition: background .15s; }
+  .create-strat-btn:hover:not(:disabled) { background: #312e81; color: #c7d2fe; }
+  .create-strat-btn:disabled { opacity: 0.6; cursor: not-allowed; }
 
   .empty   { text-align: center; padding: 60px 0; color: #475569; font-size: 0.9rem; }
   .loading { text-align: center; padding: 40px 0; color: #475569; }
@@ -3085,10 +3090,41 @@ async function loadLibrary() {
   </div>
   ${e.description ? `<div class="lib-desc">${esc(e.description.slice(0,200))}</div>` : ''}
   ${params ? `<div class="lib-params">${esc(params)}</div>` : ''}
+  <div style="margin-top:10px">
+    <button class="create-strat-btn" onclick="createStrategyFromIndicator(${JSON.stringify(e.spec_id)}, ${JSON.stringify(e.display_name)}, this)">
+      ＋ Create Strategy
+    </button>
+  </div>
 </div>`;
     }).join('');
   } catch(e) {
     document.getElementById('lib-grid').innerHTML = '<div class="empty">Failed to load library.</div>';
+  }
+}
+
+async function createStrategyFromIndicator(specId, displayName, btn) {
+  btn.disabled = true;
+  btn.textContent = '⏳ Creating…';
+  try {
+    const r = await fetch('/api/strategy/from-indicator', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({spec_id: specId}),
+    });
+    const d = await r.json();
+    if (d.ok) {
+      btn.textContent = '✓ Queued';
+      btn.style.background = '#14532d';
+      showToast(`Strategy from "${displayName}" queued — check Dashboard.`);
+    } else {
+      btn.disabled = false;
+      btn.textContent = '＋ Create Strategy';
+      showToast(d.error || 'Failed to create strategy', true);
+    }
+  } catch(e) {
+    btn.disabled = false;
+    btn.textContent = '＋ Create Strategy';
+    showToast('Network error', true);
   }
 }
 
@@ -3180,6 +3216,61 @@ def api_get_indicator_library(
     except Exception as exc:
         log.error("api_indicator_library_error", error=str(exc), traceback=_traceback.format_exc())
         return JSONResponse({"entries": [], "error": str(exc)}, status_code=500)
+
+
+class FromIndicatorRequest(BaseModel):
+    spec_id: str
+    custom_note: str = ""
+
+
+@app.post("/api/strategy/from-indicator")
+def api_strategy_from_indicator(req: FromIndicatorRequest) -> JSONResponse:
+    """
+    Create a strategy idea pre-filled from an indicator library entry.
+    Inserts a user_idea that the implementer will pick up and turn into
+    backtest code using the indicator's best params as a starting point.
+    """
+    try:
+        entries = db.get_indicator_library(limit=500)
+        entry = next((e for e in entries if e["spec_id"] == req.spec_id), None)
+        if not entry:
+            return JSONResponse({"ok": False, "error": f"Indicator '{req.spec_id}' not found"}, status_code=404)
+
+        display  = entry.get("display_name") or entry.get("name", req.spec_id)
+        category = entry.get("category", "")
+        desc     = entry.get("description") or ""
+        sharpe   = entry.get("best_sharpe")
+        params   = entry.get("best_params") or {}
+
+        params_str = (
+            ", ".join(f"{k}={v}" for k, v in params.items()) if params else "default params"
+        )
+        sharpe_str = f"Sharpe ≈ {sharpe:.2f}" if sharpe else "unknown Sharpe"
+
+        description = (
+            f"Create a trading strategy using the {display} indicator ({category}). "
+            f"Research found this indicator achieves {sharpe_str} with best params: {params_str}. "
+            f"{desc} "
+            f"Use the indicator as the primary signal for entries and exits. "
+            f"Test on EURUSD, GBPUSD, and USDJPY on both 1h and 4h timeframes."
+        )
+        if req.custom_note:
+            description += f" Additional notes: {req.custom_note}"
+
+        sb = db.get_client()
+        result = sb.table("user_ideas").insert({
+            "description": description,
+            "status":      "pending",
+            "priority":    1,
+            "source":      "indicator_library",
+        }).execute()
+
+        idea_id = result.data[0]["id"] if result.data else None
+        log.info("strategy_from_indicator_created spec_id=%s idea_id=%s", req.spec_id, idea_id)
+        return JSONResponse({"ok": True, "idea_id": idea_id, "indicator": display})
+    except Exception as exc:
+        log.error("api_strategy_from_indicator_error", error=str(exc), traceback=_traceback.format_exc())
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
 
 
 @app.get("/api/knowledge")
