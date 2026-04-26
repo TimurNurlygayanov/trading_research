@@ -168,6 +168,29 @@ def api_research_recover() -> JSONResponse:
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
 
 
+@app.get("/api/system/workers-status")
+def api_workers_status() -> JSONResponse:
+    """Return whether scheduled workers are currently paused."""
+    try:
+        paused = db.get_config("workers_paused") == "true"
+        return JSONResponse({"paused": paused})
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+@app.post("/api/system/toggle-workers")
+def api_toggle_workers() -> JSONResponse:
+    """Toggle the workers_paused flag in system_config."""
+    try:
+        paused = db.get_config("workers_paused") == "true"
+        new_state = not paused
+        db.set_config("workers_paused", "true" if new_state else "false")
+        log.info("workers_toggled", paused=new_state)
+        return JSONResponse({"paused": new_state})
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
 @app.get("/api/stats")
 def api_stats() -> JSONResponse:
     """Summary numbers for the dashboard header cards."""
@@ -880,6 +903,10 @@ _DASHBOARD_HTML = r"""<!DOCTYPE html>
   .refresh-btn { background: #1e2533; border: 1px solid #374151; border-radius: 8px;
                  color: #94a3b8; font-size: 0.8rem; padding: 6px 12px; cursor: pointer; }
   .refresh-btn:hover { color: #f1f5f9; }
+  .workers-btn { background: #1e2533; border: 1px solid #374151; border-radius: 8px;
+                 font-size: 0.8rem; padding: 6px 12px; cursor: pointer; transition: color .15s, border-color .15s; }
+  .workers-btn.on  { color: #4ade80; border-color: #166534; }
+  .workers-btn.off { color: #fbbf24; border-color: #854d0e; }
   /* Pipeline status modal */
   .ps-overlay { display:none; position:fixed; inset:0; background:rgba(0,0,0,.6); z-index:1000; align-items:center; justify-content:center; }
   .ps-overlay.open { display:flex; }
@@ -1072,8 +1099,10 @@ _DASHBOARD_HTML = r"""<!DOCTYPE html>
   <a href="/data">Data</a>
   <a href="/probabilities">Probabilities</a>
 
+  <a href="/practice">Practice</a>
   <div class="nav-right">
     <div class="budget-pill">Today: <span id="spend">…</span> / <span id="limit">$8.00</span></div>
+    <button class="workers-btn" id="workers-btn" onclick="toggleWorkers()">Workers: …</button>
     <button class="refresh-btn" onclick="showPipelineStatus()">Pipeline</button>
     <button class="refresh-btn" onclick="loadAll()">↻ Refresh</button>
   </div>
@@ -2380,8 +2409,27 @@ async function saveAndRetry(id) {
 document.addEventListener('keydown', e => { if (e.key === 'Escape') closePanel(); });
 
 loadAll();
+loadWorkersStatus();
 // Open ideas view if URL hash says so
 if (location.hash === '#ideas') setView('ideas');
+
+async function loadWorkersStatus() {
+  try {
+    const d = await fetch('/api/system/workers-status').then(r => r.json());
+    const btn = document.getElementById('workers-btn');
+    if (d.paused) {
+      btn.textContent = '⏸ Workers: PAUSED';
+      btn.className = 'workers-btn off';
+    } else {
+      btn.textContent = '▶ Workers: ON';
+      btn.className = 'workers-btn on';
+    }
+  } catch(e) { /* ignore */ }
+}
+async function toggleWorkers() {
+  await fetch('/api/system/toggle-workers', {method: 'POST'});
+  loadWorkersStatus();
+}
 
 // ── Pipeline Status modal ─────────────────────────────────────────────────
 const STATUS_COLOR = {
@@ -2502,6 +2550,7 @@ _IDEAS_HTML = """<!DOCTYPE html>
   <a href="/research">Research</a>
   <a href="/data">Data</a>
   <a href="/probabilities">Probabilities</a>
+  <a href="/practice">Practice</a>
 </nav>
 <div class="page">
   <h1>Submit an Idea</h1>
@@ -2754,6 +2803,7 @@ _RESEARCH_HTML = r"""<!DOCTYPE html>
   <a href="/research" class="active">Research</a>
   <a href="/data">Data</a>
   <a href="/probabilities">Probabilities</a>
+  <a href="/practice">Practice</a>
   <div class="nav-right">
     <button class="btn-secondary" id="memo-btn" onclick="refreshMemo(this)" style="margin-right:8px">
       ↻ Refresh memo
@@ -3547,6 +3597,605 @@ def api_knowledge_to_strategy(entry_id: str) -> JSONResponse:
 
 
 # ---------------------------------------------------------------------------
+# Practice trading page — HTML
+# ---------------------------------------------------------------------------
+
+_PRACTICE_HTML = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Practice Trading — Trading Research</title>
+<script src="https://cdn.jsdelivr.net/npm/lightweight-charts@4/dist/lightweight-charts.standalone.production.js"></script>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+         background: #0a0d14; color: #e2e8f0;
+         height: 100vh; display: flex; flex-direction: column; overflow: hidden; }
+
+  .nav { display: flex; align-items: center; gap: 0; background: #111827;
+         border-bottom: 1px solid #1f2937; padding: 0 24px; flex-shrink: 0; }
+  .nav-logo { font-weight: 700; font-size: 0.95rem; color: #f8fafc;
+              padding: 14px 0; margin-right: 32px; letter-spacing: -.01em; }
+  .nav a { display: block; padding: 14px 16px; font-size: 0.85rem; color: #94a3b8;
+           text-decoration: none; border-bottom: 2px solid transparent; transition: color .15s; }
+  .nav a:hover, .nav a.active { color: #f1f5f9; border-bottom-color: #6366f1; }
+  .nav-right { margin-left: auto; }
+
+  .ctrl-bar { display: flex; align-items: center; gap: 8px; padding: 7px 14px;
+              background: #0f1421; border-bottom: 1px solid #1f2937; flex-shrink: 0; flex-wrap: wrap; }
+  select { background: #1e2533; border: 1px solid #374151; border-radius: 6px;
+           color: #e2e8f0; font-size: 0.82rem; padding: 5px 8px; }
+  .btn { border: none; border-radius: 7px; font-size: 0.82rem; font-weight: 600;
+         padding: 6px 13px; cursor: pointer; transition: filter .15s; white-space: nowrap; }
+  .btn:hover:not(:disabled) { filter: brightness(1.2); }
+  .btn:disabled { opacity: .4; cursor: default; }
+  .btn-indigo { background: #4f46e5; color: #fff; }
+  .btn-green  { background: #16a34a; color: #fff; }
+  .btn-red    { background: #dc2626; color: #fff; }
+  .btn-amber  { background: #d97706; color: #fff; }
+  .btn-gray   { background: #374151; color: #e2e8f0; }
+  .btn-active { background: #4f46e5 !important; color: #fff !important; }
+  .vsep { width: 1px; height: 20px; background: #374151; flex-shrink: 0; }
+  .status { font-size: 0.78rem; color: #64748b; }
+
+  .main { display: flex; flex: 1; min-height: 0; }
+  #chart-wrap { flex: 1; min-width: 0; position: relative; }
+  #chart { width: 100%; height: 100%; }
+  #chart-wrap.draw-cursor #chart { cursor: crosshair; }
+
+  .panel { width: 210px; flex-shrink: 0; background: #0f1421;
+           border-left: 1px solid #1f2937; display: flex; flex-direction: column; overflow: hidden; }
+  .ps { padding: 10px 13px; border-bottom: 1px solid #1f2937; }
+  .lbl { font-size: 0.65rem; text-transform: uppercase; letter-spacing: .07em; color: #475569; margin-bottom: 5px; }
+  .price-big { font-size: 1.35rem; font-weight: 700; font-family: "SF Mono", monospace; color: #f8fafc; }
+  .pos-badge { display: inline-block; border-radius: 5px; padding: 2px 9px;
+               font-size: 0.75rem; font-weight: 700; letter-spacing: .04em; }
+  .pos-long  { background: #14532d; color: #4ade80; }
+  .pos-short { background: #7f1d1d; color: #f87171; }
+  .pos-flat  { background: #1e2533; color: #64748b; }
+  .prow { display: flex; justify-content: space-between; align-items: center;
+          font-size: 0.78rem; margin-top: 4px; color: #64748b; }
+  .pval { font-weight: 600; font-family: monospace; color: #e2e8f0; }
+  .pval.pos { color: #4ade80; }
+  .pval.neg { color: #f87171; }
+
+  .tbtns { display: grid; grid-template-columns: 1fr 1fr; gap: 5px; }
+  .tbtns .btn { padding: 7px 4px; font-size: 0.78rem; }
+  .btn-full { grid-column: 1 / -1; }
+
+  .sg { display: grid; grid-template-columns: 1fr 1fr; gap: 5px 8px; }
+  .sg-full { grid-column: 1/-1; }
+  .sn { font-size: 0.88rem; font-weight: 700; font-family: monospace; color: #e2e8f0; }
+
+  .tlog { flex: 1; overflow-y: auto; padding: 6px 13px; }
+  .tlog .lbl { position: sticky; top: 0; background: #0f1421; padding: 4px 0; }
+  .trow { font-size: 0.7rem; font-family: monospace; padding: 3px 0;
+          border-bottom: 1px solid #1a2030; display: flex; justify-content: space-between; gap: 4px; }
+  .trow .sd { font-weight: 700; }
+  .sd.L { color: #4ade80; }
+  .sd.S { color: #f87171; }
+
+  .toolbar { display: flex; align-items: center; gap: 7px; padding: 5px 13px;
+             background: #0f1421; border-top: 1px solid #1f2937; flex-shrink: 0; flex-wrap: wrap; }
+  .tb-lbl { font-size: 0.7rem; color: #475569; }
+  .ema-chip { display: flex; align-items: center; gap: 3px; background: #1e2533;
+              border: 1px solid #374151; border-radius: 99px; padding: 2px 8px 2px 9px; font-size: 0.73rem; }
+  .ema-dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; }
+  .ema-x { background: none; border: none; color: #64748b; cursor: pointer; font-size: 0.85rem;
+            padding: 0 0 0 3px; line-height: 1; }
+  .ema-x:hover { color: #f87171; }
+  input.ema-in { width: 50px; background: #1e2533; border: 1px solid #374151; border-radius: 6px;
+                 color: #e2e8f0; font-size: 0.8rem; padding: 4px 7px; }
+</style>
+</head>
+<body>
+<nav class="nav">
+  <div class="nav-logo">Trading Research</div>
+  <a href="/dashboard">Dashboard</a>
+  <a href="/ideas">Ideas</a>
+  <a href="/research">Research</a>
+  <a href="/data">Data</a>
+  <a href="/probabilities">Probabilities</a>
+  <a href="/practice" class="active">Practice</a>
+  <div class="nav-right"></div>
+</nav>
+
+<div class="ctrl-bar">
+  <select id="sym-sel"></select>
+  <select id="tf-sel">
+    <option value="1h">1H</option>
+    <option value="5m">5M</option>
+    <option value="15m">15M</option>
+    <option value="4h">4H</option>
+  </select>
+  <button class="btn btn-indigo" id="start-btn" onclick="startSession()">▶ Start Session</button>
+  <div class="vsep"></div>
+  <button class="btn btn-amber" id="play-btn" onclick="togglePlay()" disabled title="Space">⏸ Pause</button>
+  <button class="btn btn-gray" id="nc-btn" onclick="nextCandle()" disabled title="Next candle">▶|</button>
+  <button class="btn btn-gray" id="nd-btn" onclick="nextDay()" disabled title="Skip to next day">▶▶|</button>
+  <div class="vsep"></div>
+  <span class="status">Speed:</span>
+  <select id="spd-sel" onchange="onSpeedChange()">
+    <option value="5000">Slow</option>
+    <option value="2500" selected>Normal (30s/bar)</option>
+    <option value="500">Fast</option>
+    <option value="80">Turbo</option>
+  </select>
+  <div class="vsep"></div>
+  <span class="status" id="stat-txt">Select a symbol and click Start Session.</span>
+</div>
+
+<div class="main">
+  <div id="chart-wrap"><div id="chart"></div></div>
+
+  <div class="panel">
+    <div class="ps">
+      <div class="lbl">Price</div>
+      <div class="price-big" id="cur-price">—</div>
+    </div>
+    <div class="ps">
+      <div class="lbl">Position</div>
+      <span class="pos-badge pos-flat" id="pos-badge">FLAT</span>
+      <div class="prow"><span>Entry</span><span class="pval" id="p-entry">—</span></div>
+      <div class="prow"><span>Unrealized</span><span class="pval" id="p-unreal">—</span></div>
+    </div>
+    <div class="ps">
+      <div class="tbtns">
+        <button class="btn btn-green"  id="buy-btn"  onclick="openLong()"  disabled>▲ Long</button>
+        <button class="btn btn-red"    id="sell-btn" onclick="openShort()" disabled>▼ Short</button>
+        <button class="btn btn-amber btn-full" id="close-btn" onclick="closePos()" disabled>✕ Close</button>
+      </div>
+    </div>
+    <div class="ps">
+      <div class="lbl">Session</div>
+      <div class="sg">
+        <div><div class="lbl" style="margin:0">Trades</div><div class="sn" id="s-n">0</div></div>
+        <div><div class="lbl" style="margin:0">Win %</div><div class="sn" id="s-wr">—</div></div>
+        <div class="sg-full"><div class="lbl" style="margin:0">Total P&L</div>
+          <div class="sn pval" id="s-pnl">—</div></div>
+      </div>
+    </div>
+    <div class="tlog">
+      <div class="lbl">Trades</div>
+      <div id="tlog-body"></div>
+    </div>
+  </div>
+</div>
+
+<div class="toolbar">
+  <span class="tb-lbl">EMA:</span>
+  <input type="number" class="ema-in" id="ema-in" value="20" min="2" max="500"
+         onkeydown="if(event.key==='Enter')addEma()">
+  <button class="btn btn-gray" onclick="addEma()" style="padding:5px 9px">+ Add</button>
+  <div id="ema-chips"></div>
+  <div class="vsep"></div>
+  <button class="btn btn-gray" id="draw-btn" onclick="toggleDraw()" title="Click chart to place horizontal lines">📐 Draw</button>
+  <button class="btn btn-gray" onclick="autoLevels()" title="Detect & draw S/R from swing highs/lows">📊 Auto S/R</button>
+  <button class="btn btn-gray" onclick="clearLines()">✕ Lines</button>
+</div>
+
+<script>
+// ── State ──────────────────────────────────────────────────────────────────
+const S = {
+  dispBars: [], subBars: [], sessIdx: 0,
+  subMap: {},     // {dispIdx: [subBar,...]}
+  di: 0,          // current display bar index
+  si: 0,          // current sub-bar index within di
+  timer: null, playing: false,
+  speedMs: 2500,
+  lines: [],
+  autoLines: [],
+  drawMode: false,
+  emas: {},       // {period: {series, color, ema}}
+  emaColors: ['#818cf8','#f59e0b','#34d399','#f87171','#38bdf8','#fb923c','#a78bfa'],
+  pos: null,      // {side:'long'|'short', entry:number}
+  trades: [],
+  price: null,
+  loaded: false,
+};
+
+// ── Chart ───────────────────────────────────────────────────────────────────
+let chart, cs;  // chart, candleSeries
+
+function initChart() {
+  const wrap = document.getElementById('chart-wrap');
+  chart = LightweightCharts.createChart(document.getElementById('chart'), {
+    width: wrap.clientWidth, height: wrap.clientHeight,
+    layout: { background: {color:'#0a0d14'}, textColor:'#64748b' },
+    grid:   { vertLines:{color:'#141a25'}, horzLines:{color:'#141a25'} },
+    crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
+    timeScale: { borderColor:'#1f2937', timeVisible:true, secondsVisible:false },
+    rightPriceScale: { borderColor:'#1f2937' },
+  });
+  cs = chart.addCandlestickSeries({
+    upColor:'#22c55e', downColor:'#ef4444',
+    borderUpColor:'#22c55e', borderDownColor:'#ef4444',
+    wickUpColor:'#22c55e', wickDownColor:'#ef4444',
+  });
+  chart.subscribeClick(param => {
+    if (!S.drawMode || !param.point) return;
+    const p = cs.coordinateToPrice(param.point.y);
+    if (p != null) addLine(p);
+  });
+  new ResizeObserver(() =>
+    chart.applyOptions({width: wrap.clientWidth, height: wrap.clientHeight})
+  ).observe(wrap);
+}
+
+// ── Symbol list ─────────────────────────────────────────────────────────────
+async function loadSymbols() {
+  try {
+    const d = await fetch('/api/practice/symbols').then(r => r.json());
+    const sel = document.getElementById('sym-sel');
+    sel.innerHTML = (d.symbols || []).map(s =>
+      `<option value="${s.symbol}">${s.symbol}</option>`).join('');
+    if (!d.symbols?.length) sel.innerHTML = '<option>— no data cached —</option>';
+  } catch { document.getElementById('sym-sel').innerHTML = '<option>Error</option>'; }
+}
+
+// ── Session ─────────────────────────────────────────────────────────────────
+async function startSession() {
+  const sym = document.getElementById('sym-sel').value;
+  const tf  = document.getElementById('tf-sel').value;
+  if (!sym) return;
+  setCtrl(false);
+  setStat('Fetching market data… (5–15s depending on timeframe)');
+  try {
+    const resp = await fetch('/api/practice/session', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({symbol:sym, timeframe:tf}),
+    });
+    const data = await resp.json();
+    if (!resp.ok) { setStat('Error: ' + (data.error||'unknown')); return; }
+    initSession(data);
+  } catch(e) { setStat('Network error: ' + e.message); }
+  finally { setCtrl(true); }
+}
+
+function initSession(data) {
+  S.dispBars = data.display_bars;
+  S.subBars  = data.sub_bars;
+  S.sessIdx  = data.session_start_idx;
+  S.di       = data.session_start_idx;
+  S.si       = 0;
+  S.pos      = null;
+  S.trades   = [];
+  S.price    = null;
+
+  // Group sub-bars by display bar index
+  const tfSec = tfSecs(data.timeframe);
+  S.subMap = {};
+  for (let i = S.sessIdx; i < S.dispBars.length; i++) {
+    const t0 = S.dispBars[i].time, t1 = t0 + tfSec;
+    S.subMap[i] = S.subBars.filter(b => b.time >= t0 && b.time < t1);
+  }
+
+  // Show history bars
+  cs.setData(S.dispBars.slice(0, S.sessIdx));
+
+  // Init EMAs from history
+  for (const p of Object.keys(S.emas)) initEmaHist(+p);
+
+  S.loaded = true;
+  setStat(`${data.session_date}  ·  ${data.symbol} ${data.timeframe.toUpperCase()}  ·  sub-TF: ${data.sub_tf}`);
+  ['nc-btn','nd-btn','play-btn','buy-btn','sell-btn'].forEach(id =>
+    document.getElementById(id).disabled = false);
+  updatePanel();
+  startPlay();
+}
+
+function tfSecs(tf) {
+  return {1:60,5:300,15:900,30:1800,60:3600,240:14400,1440:86400}[
+    tf === '1d' ? 1440 : tf === '4h' ? 240 : tf === '1h' ? 60 :
+    tf === '15m' ? 15 : tf === '5m' ? 5 : 1] ||
+  {'1m':60,'5m':300,'15m':900,'30m':1800,'1h':3600,'4h':14400,'1d':86400}[tf] || 3600;
+}
+
+// ── Playback ─────────────────────────────────────────────────────────────────
+function startPlay() {
+  if (S.timer) clearInterval(S.timer);
+  S.playing = true;
+  S.timer = setInterval(tick, S.speedMs);
+  const b = document.getElementById('play-btn');
+  b.textContent = '⏸ Pause'; b.className = 'btn btn-amber';
+}
+function stopPlay() {
+  if (S.timer) { clearInterval(S.timer); S.timer = null; }
+  S.playing = false;
+  const b = document.getElementById('play-btn');
+  b.textContent = '▶ Play'; b.className = 'btn btn-green';
+}
+function togglePlay() { if (!S.loaded) return; S.playing ? stopPlay() : startPlay(); }
+function onSpeedChange() {
+  S.speedMs = +document.getElementById('spd-sel').value;
+  if (S.playing) { stopPlay(); startPlay(); }
+}
+
+function tick() {
+  if (S.di >= S.dispBars.length) {
+    stopPlay();
+    setStat('Session complete. Start a new session to continue.');
+    return;
+  }
+  const subs = S.subMap[S.di] || [];
+  if (subs.length > 0 && S.si < subs.length) {
+    const base = S.dispBars[S.di];
+    const seen = subs.slice(0, S.si + 1);
+    cs.update({
+      time: base.time,
+      open: seen[0].open,
+      high: Math.max(...seen.map(b => b.high)),
+      low:  Math.min(...seen.map(b => b.low)),
+      close: seen[seen.length-1].close,
+    });
+    setPrice(seen[seen.length-1].close);
+    S.si++;
+    if (S.si >= subs.length) finalizeBar();
+  } else {
+    finalizeBar();
+  }
+}
+
+function finalizeBar() {
+  const bar = S.dispBars[S.di];
+  cs.update(bar);
+  setPrice(bar.close);
+  tickEmas(S.di);
+  S.di++;
+  S.si = 0;
+  updatePanel();
+}
+
+// ── Jump controls ────────────────────────────────────────────────────────────
+function nextCandle() {
+  if (!S.loaded || S.di >= S.dispBars.length) return;
+  finalizeBar();
+}
+
+function nextDay() {
+  if (!S.loaded || S.di >= S.dispBars.length) return;
+  const startDay = Math.floor(S.dispBars[S.di].time / 86400);
+  while (S.di < S.dispBars.length && Math.floor(S.dispBars[S.di].time / 86400) === startDay)
+    finalizeBar();
+}
+
+// ── EMA ──────────────────────────────────────────────────────────────────────
+function addEma() {
+  const period = +document.getElementById('ema-in').value;
+  if (!period || period < 2 || S.emas[period]) return;
+  const color = S.emaColors[Object.keys(S.emas).length % S.emaColors.length];
+  const series = chart.addLineSeries({
+    color, lineWidth:1, priceLineVisible:false, lastValueVisible:false, crosshairMarkerVisible:false
+  });
+  S.emas[period] = {series, color, ema: null};
+  if (S.loaded) initEmaHist(period);
+  renderEmaChips();
+}
+
+function removeEma(p) {
+  if (!S.emas[p]) return;
+  chart.removeSeries(S.emas[p].series);
+  delete S.emas[p];
+  renderEmaChips();
+}
+
+function initEmaHist(period) {
+  if (!S.dispBars.length) return;
+  const k = 2 / (period + 1);
+  const hist = S.dispBars.slice(0, S.sessIdx);
+  if (!hist.length) return;
+  let ema = hist[0].close;
+  const data = hist.map(bar => { ema = bar.close*k + ema*(1-k); return {time:bar.time,value:ema}; });
+  S.emas[period].ema = ema;
+  S.emas[period].series.setData(data);
+}
+
+function tickEmas(idx) {
+  const bar = S.dispBars[idx];
+  for (const [p, obj] of Object.entries(S.emas)) {
+    const k = 2 / (+p + 1);
+    const prev = obj.ema ?? bar.close;
+    const ema = bar.close * k + prev * (1-k);
+    obj.ema = ema;
+    obj.series.update({time: bar.time, value: ema});
+  }
+}
+
+function renderEmaChips() {
+  document.getElementById('ema-chips').innerHTML =
+    Object.entries(S.emas).map(([p, o]) =>
+      `<span class="ema-chip">
+         <span class="ema-dot" style="background:${o.color}"></span>
+         EMA ${p}
+         <button class="ema-x" onclick="removeEma(${p})">×</button>
+       </span>`
+    ).join('');
+}
+
+// ── Lines ────────────────────────────────────────────────────────────────────
+function toggleDraw() {
+  S.drawMode = !S.drawMode;
+  document.getElementById('draw-btn').classList.toggle('btn-active', S.drawMode);
+  document.getElementById('chart-wrap').classList.toggle('draw-cursor', S.drawMode);
+}
+function addLine(price) {
+  S.lines.push(cs.createPriceLine({
+    price, color:'#fbbf24', lineWidth:1,
+    lineStyle: LightweightCharts.LineStyle.Dashed,
+    axisLabelVisible:true, title:'',
+  }));
+}
+function clearLines() {
+  S.lines.forEach(l => cs.removePriceLine(l));
+  S.autoLines.forEach(l => cs.removePriceLine(l));
+  S.lines = [];
+  S.autoLines = [];
+}
+
+// ── Auto-detect support / resistance ─────────────────────────────────────────
+function detectLevels() {
+  const bars = S.dispBars.slice(0, Math.max(S.di, S.sessIdx));
+  if (bars.length < 30) return [];
+
+  // Adaptive lookback: ~2-3% of bars, between 3 and 10
+  const lookback = Math.max(3, Math.min(10, Math.floor(bars.length / 40)));
+  const swings = [];
+  for (let i = lookback; i < bars.length - lookback; i++) {
+    let isHi = true, isLo = true;
+    for (let j = i - lookback; j <= i + lookback; j++) {
+      if (j === i) continue;
+      if (bars[j].high >= bars[i].high) isHi = false;
+      if (bars[j].low  <= bars[i].low)  isLo = false;
+    }
+    if (isHi) swings.push(bars[i].high);
+    if (isLo) swings.push(bars[i].low);
+  }
+  if (!swings.length) return [];
+
+  // Cluster swings within 0.3% of price
+  const ref = bars[bars.length - 1].close;
+  const tol = ref * 0.003;
+  swings.sort((a, b) => a - b);
+  const clusters = [];
+  for (const p of swings) {
+    const last = clusters[clusters.length - 1];
+    if (last && Math.abs(p - last.price) <= tol) {
+      last.price = (last.price * last.touches + p) / (last.touches + 1);
+      last.touches++;
+    } else {
+      clusters.push({price: p, touches: 1});
+    }
+  }
+  // Keep clusters with ≥2 touches; sort by touches desc; cap at 8
+  return clusters.filter(c => c.touches >= 2)
+                 .sort((a, b) => b.touches - a.touches)
+                 .slice(0, 8);
+}
+
+function autoLevels() {
+  if (!S.loaded) { setStat('Start a session first.'); return; }
+  S.autoLines.forEach(l => cs.removePriceLine(l));
+  S.autoLines = [];
+  const levels = detectLevels();
+  if (!levels.length) { setStat('Not enough data for S/R detection.'); return; }
+  const cur = S.price ?? S.dispBars[S.di - 1]?.close ?? S.dispBars[S.sessIdx - 1]?.close;
+  for (const lvl of levels) {
+    const isResist = lvl.price > cur;
+    S.autoLines.push(cs.createPriceLine({
+      price: lvl.price,
+      color: isResist ? '#ef4444' : '#22c55e',
+      lineWidth: 1,
+      lineStyle: LightweightCharts.LineStyle.Dotted,
+      axisLabelVisible: true,
+      title: (isResist ? 'R' : 'S') + ' ×' + lvl.touches,
+    }));
+  }
+  setStat(`Drew ${levels.length} S/R levels (red=resistance, green=support).`);
+}
+
+// ── Trading ───────────────────────────────────────────────────────────────────
+function openLong() {
+  if (!S.price || !S.loaded) return;
+  if (S.pos?.side === 'short') recordClose();
+  if (!S.pos) { S.pos = {side:'long', entry:S.price}; updatePanel(); }
+}
+function openShort() {
+  if (!S.price || !S.loaded) return;
+  if (S.pos?.side === 'long') recordClose();
+  if (!S.pos) { S.pos = {side:'short', entry:S.price}; updatePanel(); }
+}
+function closePos() {
+  if (!S.pos || !S.price) return;
+  recordClose();
+  updatePanel();
+}
+function recordClose() {
+  const pnl = S.pos.side==='long' ? S.price-S.pos.entry : S.pos.entry-S.price;
+  S.trades.push({side:S.pos.side, entry:S.pos.entry, exit:S.price, pnl});
+  S.pos = null;
+}
+
+function setPrice(price) {
+  S.price = price;
+  document.getElementById('cur-price').textContent = fmt(price);
+  if (S.pos) {
+    const pnl = S.pos.side==='long' ? price-S.pos.entry : S.pos.entry-price;
+    const el = document.getElementById('p-unreal');
+    el.textContent = (pnl>=0?'+':'') + fmtPnl(pnl);
+    el.className = 'pval ' + (pnl>=0?'pos':'neg');
+  }
+}
+
+function updatePanel() {
+  const pos = S.pos;
+  const badge = document.getElementById('pos-badge');
+  if (pos) {
+    badge.textContent = pos.side === 'long' ? 'LONG' : 'SHORT';
+    badge.className = 'pos-badge ' + (pos.side==='long'?'pos-long':'pos-short');
+    document.getElementById('p-entry').textContent = fmt(pos.entry);
+    document.getElementById('close-btn').disabled = false;
+  } else {
+    badge.textContent = 'FLAT'; badge.className = 'pos-badge pos-flat';
+    document.getElementById('p-entry').textContent = '—';
+    document.getElementById('p-unreal').textContent = '—';
+    document.getElementById('p-unreal').className = 'pval';
+    document.getElementById('close-btn').disabled = true;
+  }
+  const tot = S.trades.reduce((s,t)=>s+t.pnl, 0);
+  const wins = S.trades.filter(t=>t.pnl>0).length;
+  document.getElementById('s-n').textContent = S.trades.length;
+  document.getElementById('s-wr').textContent =
+    S.trades.length ? Math.round(wins/S.trades.length*100)+'%' : '—';
+  const pnlEl = document.getElementById('s-pnl');
+  pnlEl.textContent = S.trades.length ? (tot>=0?'+':'')+fmtPnl(tot) : '—';
+  pnlEl.className = 'sn pval ' + (tot>0?'pos':tot<0?'neg':'');
+  document.getElementById('tlog-body').innerHTML =
+    [...S.trades].reverse().map(t =>
+      `<div class="trow">
+        <span class="sd ${t.side==='long'?'L':'S'}">${t.side==='long'?'L':'S'}</span>
+        <span>${fmt(t.entry)}→${fmt(t.exit)}</span>
+        <span class="pval ${t.pnl>=0?'pos':'neg'}">${t.pnl>=0?'+':''}${fmtPnl(t.pnl)}</span>
+      </div>`
+    ).join('');
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+function fmt(p) {
+  if (p == null) return '—';
+  return p < 10 ? p.toFixed(5) : p < 500 ? p.toFixed(3) : p.toFixed(2);
+}
+function fmtPnl(p) {
+  const a = Math.abs(p);
+  return (a < 10 ? p.toFixed(5) : a < 500 ? p.toFixed(3) : p.toFixed(2));
+}
+function setStat(t) { document.getElementById('stat-txt').textContent = t; }
+function setCtrl(on) { document.getElementById('start-btn').disabled = !on; }
+
+// ── Keyboard shortcuts ────────────────────────────────────────────────────────
+document.addEventListener('keydown', e => {
+  if (['INPUT','SELECT','TEXTAREA'].includes(e.target.tagName)) return;
+  if (e.key === ' ')      { e.preventDefault(); togglePlay(); }
+  else if (e.key === 'b' || e.key === 'B') openLong();
+  else if (e.key === 's' || e.key === 'S') openShort();
+  else if (e.key === 'c' || e.key === 'C') closePos();
+  else if (e.key === 'ArrowRight') nextCandle();
+});
+
+// ── Init ──────────────────────────────────────────────────────────────────────
+initChart();
+loadSymbols();
+</script>
+</body>
+</html>"""
+
+
+@app.get("/practice", response_class=HTMLResponse)
+def practice() -> HTMLResponse:
+    return HTMLResponse(_PRACTICE_HTML)
+
+
+# ---------------------------------------------------------------------------
 # Data cache page
 # ---------------------------------------------------------------------------
 
@@ -3652,6 +4301,7 @@ _DATA_HTML = r"""<!DOCTYPE html>
   <a href="/research">Research</a>
   <a href="/data" class="active">Data</a>
   <a href="/probabilities">Probabilities</a>
+  <a href="/practice">Practice</a>
 
   <div class="nav-right">
     <button class="btn-primary" id="preload-btn" onclick="preloadAll()">
@@ -4052,6 +4702,7 @@ _PROB_HTML = r"""<!DOCTYPE html>
   <a href="/research">Research</a>
   <a href="/data">Data</a>
   <a href="/probabilities" class="active">Probabilities</a>
+  <a href="/practice">Practice</a>
   <div class="nav-right">
     <button class="refresh-btn" onclick="loadResults()">↻ Refresh</button>
   </div>
@@ -4539,11 +5190,151 @@ def api_strategy_from_prob_result(row: _ProbResultRow, background_tasks: Backgro
 
 
 # ---------------------------------------------------------------------------
+# Practice trading page — API
+# ---------------------------------------------------------------------------
+
+@app.get("/api/practice/symbols")
+def api_practice_symbols() -> JSONResponse:
+    """Return symbols available in data_cache for the practice page symbol picker."""
+    try:
+        datasets = db.get_data_cache()
+        by_symbol: dict[str, list[str]] = {}
+        for ds in datasets:
+            by_symbol.setdefault(ds["symbol"], []).append(ds["timeframe"])
+        result = [{"symbol": s, "timeframes": sorted(tfs)} for s, tfs in sorted(by_symbol.items())]
+        return JSONResponse({"symbols": result})
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+@app.post("/api/practice/session")
+async def api_practice_session(request: Request) -> JSONResponse:
+    """
+    Create a new practice session. Picks a random trading-day start at 7 AM,
+    fetches ~60 days of display-TF history plus sub-TF data for the 5-day active window.
+    All bars are returned so the frontend manages replay state locally.
+    """
+    import random
+    from datetime import datetime, timedelta
+
+    try:
+        import pandas as pd
+        from backtest.data_fetcher import fetch_ohlcv
+    except ImportError as exc:
+        return JSONResponse({"error": f"data_fetcher unavailable: {exc}"}, status_code=500)
+
+    try:
+        body = await request.json()
+        symbol     = body.get("symbol", "EURUSD").upper()
+        display_tf = body.get("timeframe", "1h").lower()
+
+        sub_tf_map = {"1m": "1m", "5m": "1m", "15m": "1m", "1h": "5m", "4h": "15m", "1d": "1h"}
+        sub_tf = sub_tf_map.get(display_tf, "5m")
+
+        # ── date range from data_cache metadata ─────────────────────────────
+        sb = db.get_client()
+        row = sb.table("data_cache").select("first_date,last_date") \
+                .eq("symbol", symbol).eq("timeframe", display_tf).execute()
+        if not row.data:
+            return JSONResponse(
+                {"error": f"No cached metadata for {symbol} {display_tf}. "
+                          "Go to the Data page and preload this dataset first."},
+                status_code=400)
+
+        info       = row.data[0]
+        first_date = datetime.fromisoformat(info["first_date"].replace("Z", "").split("+")[0])
+        last_date  = datetime.fromisoformat(info["last_date"].replace("Z", "").split("+")[0])
+
+        history_days = 60
+        session_days = 5
+        earliest_start = first_date + timedelta(days=history_days)
+        latest_start   = last_date  - timedelta(days=session_days + 2)
+
+        if earliest_start >= latest_start:
+            return JSONResponse({"error": "Not enough data (need 65+ days)"}, status_code=400)
+
+        # ── pick a random weekday ─────────────────────────────────────────
+        total_range = max(1, (latest_start - earliest_start).days)
+        candidate = earliest_start
+        for _ in range(30):
+            candidate = earliest_start + timedelta(days=random.randint(0, total_range))
+            if candidate.weekday() < 5:
+                break
+            candidate += timedelta(days=(7 - candidate.weekday()) % 7)
+            if candidate <= latest_start:
+                break
+
+        session_start = candidate.replace(hour=7, minute=0, second=0, microsecond=0)
+        fetch_start   = (session_start - timedelta(days=history_days + 5)).strftime("%Y-%m-%d")
+        fetch_end     = (session_start + timedelta(days=session_days + 3)).strftime("%Y-%m-%d")
+
+        # ── fetch display-TF bars ─────────────────────────────────────────
+        display_df = fetch_ohlcv(symbol, display_tf, fetch_start, fetch_end)
+        if display_df.empty:
+            return JSONResponse({"error": "API returned no bars for this period"}, status_code=500)
+
+        if display_df.index.tz is None:
+            display_df.index = display_df.index.tz_localize("UTC")
+
+        session_ts   = pd.Timestamp(session_start).tz_localize("UTC")
+        mask         = display_df.index >= session_ts
+        if not mask.any():
+            return JSONResponse({"error": "No bars found at or after session start"}, status_code=500)
+        session_start_idx = int(mask.argmax())
+
+        def df_to_bars(df: "pd.DataFrame") -> list[dict]:
+            return [
+                {"time":  int(ts.timestamp()),
+                 "open":  round(float(row["Open"]),  6),
+                 "high":  round(float(row["High"]),  6),
+                 "low":   round(float(row["Low"]),   6),
+                 "close": round(float(row["Close"]), 6)}
+                for ts, row in df.iterrows()
+            ]
+
+        display_bars = df_to_bars(display_df)
+
+        # ── fetch sub-TF bars (session window only) ───────────────────────
+        sub_start = session_start.strftime("%Y-%m-%d")
+        sub_end   = (session_start + timedelta(days=session_days + 3)).strftime("%Y-%m-%d")
+        try:
+            sub_df   = fetch_ohlcv(symbol, sub_tf, sub_start, sub_end)
+            sub_bars = df_to_bars(sub_df) if not sub_df.empty else []
+        except Exception:
+            sub_bars = []   # graceful: play without intra-bar animation
+
+        return JSONResponse({
+            "symbol":            symbol,
+            "timeframe":         display_tf,
+            "sub_tf":            sub_tf,
+            "session_date":      session_start.strftime("%Y-%m-%d"),
+            "display_bars":      display_bars,
+            "sub_bars":          sub_bars,
+            "session_start_idx": session_start_idx,
+        })
+
+    except Exception as exc:
+        log.error("practice_session_error", error=str(exc), traceback=_traceback.format_exc())
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+# ---------------------------------------------------------------------------
 # Scheduled jobs
 # ---------------------------------------------------------------------------
 
+def _is_workers_paused() -> bool:
+    """Return True if workers are paused via system_config. Fails safe (returns False)."""
+    try:
+        return db.get_config("workers_paused") == "true"
+    except Exception:
+        return False
+
+
 def _scheduled_queue_worker() -> None:
     """Wrapper so APScheduler exceptions are logged rather than silently swallowed."""
+    if _is_workers_paused():
+        log.info("queue_worker_skipped", reason="workers_paused")
+        return
     try:
         process_queue()
     except Exception:
@@ -4558,6 +5349,8 @@ def _scheduled_research_watchdog() -> None:
     Intentionally separate from the full queue cycle so research isn't blocked
     by slow strategy-processing steps.
     """
+    if _is_workers_paused():
+        return
     try:
         from orchestrator.queue_worker import (
             _recover_stuck_research_tasks,
@@ -4576,6 +5369,8 @@ def _scheduled_research_watchdog() -> None:
 
 def _scheduled_research_cycle() -> None:
     """Fetch new papers from arXiv / Semantic Scholar and extract strategy ideas."""
+    if _is_workers_paused():
+        return
     try:
         from agents.idea_generator import run_idea_generator
         inserted = run_idea_generator()
