@@ -3644,6 +3644,17 @@ _PRACTICE_HTML = r"""<!DOCTYPE html>
   #chart { width: 100%; height: 100%; }
   #chart-wrap.draw-cursor #chart { cursor: crosshair; }
 
+  /* Floating P&L tag near current price */
+  .pnl-tag { position: absolute; right: 68px; padding: 3px 9px;
+             border-radius: 5px; font-family: "SF Mono", monospace;
+             font-size: 0.85rem; font-weight: 700;
+             pointer-events: none; z-index: 5;
+             transform: translateY(-50%); white-space: nowrap;
+             box-shadow: 0 2px 6px rgba(0,0,0,.4); display: none; }
+  .pnl-tag.pos { background: #14532d; color: #4ade80; border: 1px solid #16a34a; }
+  .pnl-tag.neg { background: #7f1d1d; color: #fca5a5; border: 1px solid #dc2626; }
+  .pnl-tag .side { font-size: 0.7rem; opacity: .85; margin-right: 4px; }
+
   .panel { width: 210px; flex-shrink: 0; background: #0f1421;
            border-left: 1px solid #1f2937; display: flex; flex-direction: column; overflow: hidden; }
   .ps { padding: 10px 13px; border-bottom: 1px solid #1f2937; }
@@ -3727,7 +3738,10 @@ _PRACTICE_HTML = r"""<!DOCTYPE html>
 </div>
 
 <div class="main">
-  <div id="chart-wrap"><div id="chart"></div></div>
+  <div id="chart-wrap">
+    <div id="chart"></div>
+    <div class="pnl-tag" id="pnl-tag"></div>
+  </div>
 
   <div class="panel">
     <div class="ps">
@@ -3788,12 +3802,21 @@ const S = {
   autoLines: [],
   drawMode: false,
   emas: {},       // {period: {series, color, ema}}
-  emaColors: ['#818cf8','#f59e0b','#34d399','#f87171','#38bdf8','#fb923c','#a78bfa'],
+  emaColors: ['#3b82f6','#60a5fa','#1d4ed8','#06b6d4','#0ea5e9','#93c5fd','#2563eb'],
   pos: null,      // {side:'long'|'short', entry:number}
   trades: [],
   price: null,
   loaded: false,
+  contractSize: 1,    // received from backend per session
+  lots: 5,            // fixed: every position is 5 lots
+  entryLine: null,    // PriceLine for the open position's entry
 };
+
+// $ P&L: lots × contractSize × price_diff (signed by side)
+function dollarPnl(side, entry, exit) {
+  const diff = side === 'long' ? exit - entry : entry - exit;
+  return diff * S.lots * S.contractSize;
+}
 
 // ── Chart ───────────────────────────────────────────────────────────────────
 let chart, cs;  // chart, candleSeries
@@ -3818,9 +3841,10 @@ function initChart() {
     const p = cs.coordinateToPrice(param.point.y);
     if (p != null) addLine(p);
   });
-  new ResizeObserver(() =>
-    chart.applyOptions({width: wrap.clientWidth, height: wrap.clientHeight})
-  ).observe(wrap);
+  new ResizeObserver(() => {
+    chart.applyOptions({width: wrap.clientWidth, height: wrap.clientHeight});
+    updatePnlTag();
+  }).observe(wrap);
 }
 
 // ── Symbol list ─────────────────────────────────────────────────────────────
@@ -3862,6 +3886,8 @@ function initSession(data) {
   S.pos      = null;
   S.trades   = [];
   S.price    = null;
+  S.contractSize = data.contract_size || 1;
+  S.lots         = data.lots_per_trade || 5;
 
   // Group sub-bars by display bar index
   const tfSec = tfSecs(data.timeframe);
@@ -3966,7 +3992,7 @@ function addEma() {
   if (!period || period < 2 || S.emas[period]) return;
   const color = S.emaColors[Object.keys(S.emas).length % S.emaColors.length];
   const series = chart.addLineSeries({
-    color, lineWidth:1, priceLineVisible:false, lastValueVisible:false, crosshairMarkerVisible:false
+    color, lineWidth:3, priceLineVisible:false, lastValueVisible:false, crosshairMarkerVisible:false
   });
   S.emas[period] = {series, color, ema: null};
   if (S.loaded) initEmaHist(period);
@@ -4111,7 +4137,7 @@ function closePos() {
   updatePanel();
 }
 function recordClose() {
-  const pnl = S.pos.side==='long' ? S.price-S.pos.entry : S.pos.entry-S.price;
+  const pnl = dollarPnl(S.pos.side, S.pos.entry, S.price);
   S.trades.push({side:S.pos.side, entry:S.pos.entry, exit:S.price, pnl});
   S.pos = null;
 }
@@ -4120,18 +4146,46 @@ function setPrice(price) {
   S.price = price;
   document.getElementById('cur-price').textContent = fmt(price);
   if (S.pos) {
-    const pnl = S.pos.side==='long' ? price-S.pos.entry : S.pos.entry-price;
+    const pnl = dollarPnl(S.pos.side, S.pos.entry, price);
     const el = document.getElementById('p-unreal');
-    el.textContent = (pnl>=0?'+':'') + fmtPnl(pnl);
+    el.textContent = fmtUsd(pnl);
     el.className = 'pval ' + (pnl>=0?'pos':'neg');
   }
+  updatePnlTag();
+}
+
+function syncEntryLine() {
+  if (S.entryLine) { cs.removePriceLine(S.entryLine); S.entryLine = null; }
+  if (!S.pos) return;
+  S.entryLine = cs.createPriceLine({
+    price: S.pos.entry,
+    color: S.pos.side === 'long' ? '#4ade80' : '#f87171',
+    lineWidth: 2,
+    lineStyle: LightweightCharts.LineStyle.Solid,
+    axisLabelVisible: true,
+    title: (S.pos.side === 'long' ? '▲ LONG' : '▼ SHORT') + ` ${S.lots}× @ ${fmt(S.pos.entry)}`,
+  });
+}
+
+function updatePnlTag() {
+  const tag = document.getElementById('pnl-tag');
+  if (!S.pos || S.price == null) { tag.style.display = 'none'; return; }
+  const y = cs.priceToCoordinate(S.price);
+  if (y == null) { tag.style.display = 'none'; return; }
+  const pnl  = dollarPnl(S.pos.side, S.pos.entry, S.price);
+  const side = S.pos.side === 'long' ? 'L' : 'S';
+  tag.style.top = y + 'px';
+  tag.style.display = 'block';
+  tag.className = 'pnl-tag ' + (pnl >= 0 ? 'pos' : 'neg');
+  tag.innerHTML = `<span class="side">${side} @ ${fmt(S.pos.entry)}</span>${fmtUsd(pnl)}`;
 }
 
 function updatePanel() {
+  syncEntryLine();
   const pos = S.pos;
   const badge = document.getElementById('pos-badge');
   if (pos) {
-    badge.textContent = pos.side === 'long' ? 'LONG' : 'SHORT';
+    badge.textContent = (pos.side === 'long' ? 'LONG' : 'SHORT') + ` · ${S.lots} lots`;
     badge.className = 'pos-badge ' + (pos.side==='long'?'pos-long':'pos-short');
     document.getElementById('p-entry').textContent = fmt(pos.entry);
     document.getElementById('close-btn').disabled = false;
@@ -4141,21 +4195,22 @@ function updatePanel() {
     document.getElementById('p-unreal').textContent = '—';
     document.getElementById('p-unreal').className = 'pval';
     document.getElementById('close-btn').disabled = true;
+    document.getElementById('pnl-tag').style.display = 'none';
   }
-  const tot = S.trades.reduce((s,t)=>s+t.pnl, 0);
+  const tot  = S.trades.reduce((s,t)=>s+t.pnl, 0);
   const wins = S.trades.filter(t=>t.pnl>0).length;
   document.getElementById('s-n').textContent = S.trades.length;
   document.getElementById('s-wr').textContent =
     S.trades.length ? Math.round(wins/S.trades.length*100)+'%' : '—';
   const pnlEl = document.getElementById('s-pnl');
-  pnlEl.textContent = S.trades.length ? (tot>=0?'+':'')+fmtPnl(tot) : '—';
+  pnlEl.textContent = S.trades.length ? fmtUsd(tot) : '—';
   pnlEl.className = 'sn pval ' + (tot>0?'pos':tot<0?'neg':'');
   document.getElementById('tlog-body').innerHTML =
     [...S.trades].reverse().map(t =>
       `<div class="trow">
         <span class="sd ${t.side==='long'?'L':'S'}">${t.side==='long'?'L':'S'}</span>
         <span>${fmt(t.entry)}→${fmt(t.exit)}</span>
-        <span class="pval ${t.pnl>=0?'pos':'neg'}">${t.pnl>=0?'+':''}${fmtPnl(t.pnl)}</span>
+        <span class="pval ${t.pnl>=0?'pos':'neg'}">${fmtUsd(t.pnl)}</span>
       </div>`
     ).join('');
 }
@@ -4168,6 +4223,12 @@ function fmt(p) {
 function fmtPnl(p) {
   const a = Math.abs(p);
   return (a < 10 ? p.toFixed(5) : a < 500 ? p.toFixed(3) : p.toFixed(2));
+}
+function fmtUsd(p) {
+  if (p == null || isNaN(p)) return '—';
+  const sign = p >= 0 ? '+' : '−';
+  const a = Math.abs(p);
+  return `${sign}$${a.toFixed(2)}`;
 }
 function setStat(t) { document.getElementById('stat-txt').textContent = t; }
 function setCtrl(on) { document.getElementById('start-btn').disabled = !on; }
@@ -5219,7 +5280,7 @@ async def api_practice_session(request: Request) -> JSONResponse:
 
     try:
         import pandas as pd
-        from backtest.data_fetcher import fetch_ohlcv
+        from backtest.data_fetcher import fetch_ohlcv, _FX_PAIRS, _CRYPTO
     except ImportError as exc:
         return JSONResponse({"error": f"data_fetcher unavailable: {exc}"}, status_code=500)
 
@@ -5227,6 +5288,15 @@ async def api_practice_session(request: Request) -> JSONResponse:
         body = await request.json()
         symbol     = body.get("symbol", "EURUSD").upper()
         display_tf = body.get("timeframe", "1h").lower()
+
+        # Contract size for $ P&L: position $ = lots × contract_size × price_diff
+        sym_clean = symbol.replace("/", "").replace("-", "")
+        if sym_clean in _FX_PAIRS:
+            contract_size = 10000     # FX mini lot (10k units → $1/pip per lot)
+        elif sym_clean in _CRYPTO:
+            contract_size = 0.1       # crypto: small fractional units
+        else:
+            contract_size = 100       # stock round lot (100 shares)
 
         sub_tf_map = {"1m": "1m", "5m": "1m", "15m": "1m", "1h": "5m", "4h": "15m", "1d": "1h"}
         sub_tf = sub_tf_map.get(display_tf, "5m")
@@ -5311,6 +5381,8 @@ async def api_practice_session(request: Request) -> JSONResponse:
             "display_bars":      display_bars,
             "sub_bars":          sub_bars,
             "session_start_idx": session_start_idx,
+            "contract_size":     contract_size,
+            "lots_per_trade":    5,
         })
 
     except Exception as exc:
