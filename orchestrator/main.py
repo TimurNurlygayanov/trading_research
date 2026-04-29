@@ -3787,6 +3787,9 @@ _PRACTICE_HTML = r"""<!DOCTYPE html>
   <button class="btn btn-gray" id="draw-btn" onclick="toggleDraw()" title="Click chart to place horizontal lines">📐 Draw</button>
   <button class="btn btn-gray" onclick="autoLevels()" title="Detect & draw S/R from swing highs/lows">📊 Auto S/R</button>
   <button class="btn btn-gray" onclick="clearLines()">✕ Lines</button>
+  <div class="vsep"></div>
+  <button class="btn btn-gray" id="hl2-btn" onclick="toggleHlHalf()" title="Toggle HL/2 midpoint line (hides candles)">HL/2</button>
+  <button class="btn btn-gray" id="arima-btn" onclick="toggleArima()" title="Show AR(2) forecast for next 5 HL/2 bars">ARIMA ±5</button>
 </div>
 
 <script>
@@ -3810,6 +3813,10 @@ const S = {
   contractSize: 1,    // received from backend per session
   lots: 5,            // fixed: every position is 5 lots
   entryLine: null,    // PriceLine for the open position's entry
+  hlHalfSeries: null,
+  hlHalfVisible: false,
+  arimaSeries: null,
+  arimaVisible: false,
 };
 
 // $ P&L: lots × contractSize × price_diff (signed by side)
@@ -3899,6 +3906,9 @@ function initSession(data) {
 
   // Show history bars
   cs.setData(S.dispBars.slice(0, S.sessIdx));
+  if (S.hlHalfVisible && S.hlHalfSeries)
+    S.hlHalfSeries.setData(S.dispBars.slice(0, S.sessIdx).map(b => ({time: b.time, value: (b.high + b.low) / 2})));
+  if (S.arimaSeries) S.arimaSeries.setData([]);
 
   // Init EMAs from history
   for (const p of Object.keys(S.emas)) initEmaHist(+p);
@@ -3948,14 +3958,18 @@ function tick() {
   if (subs.length > 0 && S.si < subs.length) {
     const base = S.dispBars[S.di];
     const seen = subs.slice(0, S.si + 1);
+    const synthHigh = Math.max(...seen.map(b => b.high));
+    const synthLow  = Math.min(...seen.map(b => b.low));
     cs.update({
       time: base.time,
       open: seen[0].open,
-      high: Math.max(...seen.map(b => b.high)),
-      low:  Math.min(...seen.map(b => b.low)),
+      high: synthHigh,
+      low:  synthLow,
       close: seen[seen.length-1].close,
     });
     setPrice(seen[seen.length-1].close);
+    if (S.hlHalfVisible && S.hlHalfSeries)
+      S.hlHalfSeries.update({time: base.time, value: (synthHigh + synthLow) / 2});
     S.si++;
     if (S.si >= subs.length) finalizeBar();
   } else {
@@ -3968,7 +3982,10 @@ function finalizeBar() {
   cs.update(bar);
   setPrice(bar.close);
   tickEmas(S.di);
+  if (S.hlHalfVisible && S.hlHalfSeries)
+    S.hlHalfSeries.update({time: bar.time, value: (bar.high + bar.low) / 2});
   S.di++;
+  if (S.arimaVisible) updateArimaForecast();
   S.si = 0;
   updatePanel();
 }
@@ -4009,7 +4026,7 @@ function removeEma(p) {
 function initEmaHist(period) {
   if (!S.dispBars.length) return;
   const k = 2 / (period + 1);
-  const hist = S.dispBars.slice(0, S.sessIdx);
+  const hist = S.dispBars.slice(0, S.di);
   if (!hist.length) return;
   let ema = hist[0].close;
   const data = hist.map(bar => { ema = bar.close*k + ema*(1-k); return {time:bar.time,value:ema}; });
@@ -4213,6 +4230,108 @@ function updatePanel() {
         <span class="pval ${t.pnl>=0?'pos':'neg'}">${fmtUsd(t.pnl)}</span>
       </div>`
     ).join('');
+}
+
+// ── HL/2 line ─────────────────────────────────────────────────────────────────
+function toggleHlHalf() {
+  S.hlHalfVisible = !S.hlHalfVisible;
+  document.getElementById('hl2-btn').classList.toggle('btn-active', S.hlHalfVisible);
+  if (S.hlHalfVisible) {
+    if (!S.hlHalfSeries) {
+      S.hlHalfSeries = chart.addLineSeries({
+        color: '#a78bfa', lineWidth: 2,
+        priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false,
+      });
+    }
+    if (S.loaded)
+      S.hlHalfSeries.setData(S.dispBars.slice(0, S.di).map(b => ({time: b.time, value: (b.high + b.low) / 2})));
+    cs.applyOptions({visible: false});
+  } else {
+    if (S.hlHalfSeries) { chart.removeSeries(S.hlHalfSeries); S.hlHalfSeries = null; }
+    cs.applyOptions({visible: true});
+  }
+}
+
+// ── ARIMA forecast ────────────────────────────────────────────────────────────
+function toggleArima() {
+  S.arimaVisible = !S.arimaVisible;
+  document.getElementById('arima-btn').classList.toggle('btn-active', S.arimaVisible);
+  if (S.arimaVisible) {
+    if (!S.arimaSeries) {
+      S.arimaSeries = chart.addLineSeries({
+        color: '#fb923c', lineWidth: 2,
+        lineStyle: LightweightCharts.LineStyle.Dashed,
+        priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false,
+      });
+    }
+    if (S.loaded) updateArimaForecast();
+  } else {
+    if (S.arimaSeries) S.arimaSeries.setData([]);
+  }
+}
+
+function updateArimaForecast() {
+  if (!S.arimaVisible || !S.arimaSeries || !S.loaded || S.di < 2) return;
+  const forecasts = computeAR2Forecast(S.dispBars, S.di, 5);
+  if (!forecasts) { S.arimaSeries.setData([]); return; }
+  const lastBar = S.dispBars[S.di - 1];
+  const tfSec = S.di >= 2 ? (S.dispBars[S.di - 1].time - S.dispBars[S.di - 2].time) : 3600;
+  const pts = [{time: lastBar.time, value: (lastBar.high + lastBar.low) / 2}];
+  for (let i = 0; i < 5; i++) {
+    const futBar = S.dispBars[S.di + i];
+    pts.push({time: futBar ? futBar.time : lastBar.time + (i + 1) * tfSec, value: forecasts[i]});
+  }
+  S.arimaSeries.setData(pts);
+}
+
+function computeAR2Forecast(dispBars, currentIdx, steps) {
+  const N = Math.min(currentIdx, 50);
+  if (N < 6) return null;
+  const hl2 = dispBars.slice(currentIdx - N, currentIdx).map(b => (b.high + b.low) / 2);
+  const diffs = hl2.slice(1).map((v, i) => v - hl2[i]);
+  if (diffs.length < 5) return null;
+  // AR(2) on first differences: d[t] = c + φ1*d[t-1] + φ2*d[t-2]
+  const X = [], y = [];
+  for (let i = 2; i < diffs.length; i++) {
+    X.push([1, diffs[i-1], diffs[i-2]]);
+    y.push(diffs[i]);
+  }
+  const coeffs = olsSolve3(X, y);
+  if (!coeffs) return null;
+  const [c, phi1, phi2] = coeffs;
+  const hist = [diffs[diffs.length - 2], diffs[diffs.length - 1]];
+  const fd = [];
+  for (let h = 0; h < steps; h++) {
+    const d1 = h === 0 ? hist[1] : fd[h - 1];
+    const d2 = h === 0 ? hist[0] : (h === 1 ? hist[1] : fd[h - 2]);
+    fd.push(c + phi1 * d1 + phi2 * d2);
+  }
+  let prev = hl2[hl2.length - 1];
+  return fd.map(d => { prev += d; return prev; });
+}
+
+function olsSolve3(X, y) {
+  const p = 3;
+  const XtX = [[0,0,0],[0,0,0],[0,0,0]], Xty = [0,0,0];
+  for (let i = 0; i < X.length; i++)
+    for (let j = 0; j < p; j++) {
+      Xty[j] += X[i][j] * y[i];
+      for (let k = 0; k < p; k++) XtX[j][k] += X[i][j] * X[i][k];
+    }
+  const aug = XtX.map((row, i) => [...row, Xty[i]]);
+  for (let col = 0; col < p; col++) {
+    let maxRow = col;
+    for (let r = col + 1; r < p; r++)
+      if (Math.abs(aug[r][col]) > Math.abs(aug[maxRow][col])) maxRow = r;
+    [aug[col], aug[maxRow]] = [aug[maxRow], aug[col]];
+    if (Math.abs(aug[col][col]) < 1e-12) return null;
+    for (let r = 0; r < p; r++) {
+      if (r === col) continue;
+      const f = aug[r][col] / aug[col][col];
+      for (let k = col; k <= p; k++) aug[r][k] -= f * aug[col][k];
+    }
+  }
+  return [aug[0][p] / aug[0][0], aug[1][p] / aug[1][1], aug[2][p] / aug[2][2]];
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

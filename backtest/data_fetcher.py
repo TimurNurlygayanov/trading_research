@@ -20,11 +20,42 @@ from __future__ import annotations
 
 import os
 from datetime import date, timedelta
+from pathlib import Path
 
 import pandas as pd
 from dotenv import load_dotenv
 
 load_dotenv()
+
+# Disk cache: data/cache/<symbol>_<tf>_<start>_<end>.parquet
+_CACHE_DIR = Path(__file__).resolve().parents[1] / "data" / "cache"
+
+
+def _cache_path(symbol: str, timeframe: str, start: str, end: str) -> Path:
+    safe = f"{symbol}_{timeframe}_{start}_{end}".replace(":", "_")
+    return _CACHE_DIR / f"{safe}.parquet"
+
+
+def _load_cache(symbol: str, timeframe: str, start: str, end: str) -> pd.DataFrame | None:
+    # 1. Full-history file downloaded from Modal Volume (no date suffix)
+    modal_path = _CACHE_DIR / f"{symbol}_{timeframe}.parquet"
+    if modal_path.exists():
+        df = pd.read_parquet(modal_path)
+        # Slice to requested date range
+        s = pd.Timestamp(start, tz="UTC")
+        e = pd.Timestamp(end,   tz="UTC") + pd.Timedelta(days=1)
+        return df[(df.index >= s) & (df.index < e)]
+    # 2. Date-range-specific cache written by this fetcher
+    p = _cache_path(symbol, timeframe, start, end)
+    if p.exists():
+        return pd.read_parquet(p)
+    return None
+
+
+def _save_cache(df: pd.DataFrame, symbol: str, timeframe: str,
+                start: str, end: str) -> None:
+    _CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    df.to_parquet(_cache_path(symbol, timeframe, start, end))
 
 # ── Ticker prefix mapping ────────────────────────────────────────────────────
 # FX pairs: prefix C:
@@ -93,6 +124,10 @@ def fetch_ohlcv(
     -------
     DataFrame columns [Open, High, Low, Close, Volume], DatetimeIndex UTC, sorted asc.
     """
+    cached = _load_cache(symbol, timeframe, start, end)
+    if cached is not None:
+        return cached
+
     api_key = os.environ.get("MARKET_DATA_API_KEY", "")
     if not api_key:
         raise EnvironmentError(
@@ -186,6 +221,7 @@ def fetch_ohlcv(
     if (df["Close"] <= 0).any():
         raise ValueError(f"Data integrity error: non-positive Close prices for {ticker}")
 
+    _save_cache(df, symbol, timeframe, start, end)
     return df
 
 
