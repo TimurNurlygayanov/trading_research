@@ -34,6 +34,7 @@ modal
 
 # Storage
 boto3
+pyarrow
 
 # Stats
 scipy

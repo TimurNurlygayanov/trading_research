@@ -36,6 +36,7 @@ image = (
         "scipy==1.14.1",
         "anthropic>=0.25.0",
         "structlog>=24.0.0",
+        "pyarrow",
     )
     .add_local_dir(_os.path.join(_ROOT, "db"),       remote_path="/root/db")
     .add_local_dir(_os.path.join(_ROOT, "agents"),   remote_path="/root/agents")
