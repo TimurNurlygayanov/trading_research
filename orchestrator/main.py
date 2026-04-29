@@ -3790,6 +3790,7 @@ _PRACTICE_HTML = r"""<!DOCTYPE html>
   <div class="vsep"></div>
   <button class="btn btn-gray" id="hl2-btn" onclick="toggleHlHalf()" title="Toggle HL/2 midpoint line (hides candles)">HL/2</button>
   <button class="btn btn-gray" id="arima-btn" onclick="toggleArima()" title="Show AR(2) forecast for next 20 HL/2 bars">ARIMA ±20</button>
+  <button class="btn btn-gray" id="holt-btn" onclick="toggleHolt()" title="Holt double-exponential-smoothing forecast for next 20 HL/2 bars (auto-tunes α/β)">Holt ×20</button>
 </div>
 
 <script>
@@ -3817,6 +3818,8 @@ const S = {
   hlHalfVisible: false,
   arimaSeries: null,
   arimaVisible: false,
+  holtSeries: null,
+  holtVisible: false,
 };
 
 // $ P&L: lots × contractSize × price_diff (signed by side)
@@ -3909,6 +3912,7 @@ function initSession(data) {
   if (S.hlHalfVisible && S.hlHalfSeries)
     S.hlHalfSeries.setData(S.dispBars.slice(0, S.sessIdx).map(b => ({time: b.time, value: (b.high + b.low) / 2})));
   if (S.arimaSeries) S.arimaSeries.setData([]);
+  if (S.holtSeries)  S.holtSeries.setData([]);
 
   // Init EMAs from history
   for (const p of Object.keys(S.emas)) initEmaHist(+p);
@@ -3986,6 +3990,7 @@ function finalizeBar() {
     S.hlHalfSeries.update({time: bar.time, value: (bar.high + bar.low) / 2});
   S.di++;
   if (S.arimaVisible) updateArimaForecast();
+  if (S.holtVisible)  updateHoltForecast();
   S.si = 0;
   updatePanel();
 }
@@ -4332,6 +4337,80 @@ function olsSolve3(X, y) {
     }
   }
   return [aug[0][p] / aug[0][0], aug[1][p] / aug[1][1], aug[2][p] / aug[2][2]];
+}
+
+// ── Holt DES forecast ─────────────────────────────────────────────────────────
+function toggleHolt() {
+  S.holtVisible = !S.holtVisible;
+  document.getElementById('holt-btn').classList.toggle('btn-active', S.holtVisible);
+  if (S.holtVisible) {
+    if (!S.holtSeries) {
+      S.holtSeries = chart.addLineSeries({
+        color: '#22d3ee', lineWidth: 2,
+        lineStyle: LightweightCharts.LineStyle.Dashed,
+        priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false,
+      });
+    }
+    if (S.loaded) updateHoltForecast();
+  } else {
+    if (S.holtSeries) S.holtSeries.setData([]);
+  }
+}
+
+function updateHoltForecast() {
+  if (!S.holtVisible || !S.holtSeries || !S.loaded || S.di < 2) return;
+  const forecasts = computeHoltForecast(S.dispBars, S.di, 20);
+  if (!forecasts) { S.holtSeries.setData([]); return; }
+  const lastBar = S.dispBars[S.di - 1];
+  const tfSec = S.di >= 2 ? (S.dispBars[S.di - 1].time - S.dispBars[S.di - 2].time) : 3600;
+  const pts = [{time: lastBar.time, value: (lastBar.high + lastBar.low) / 2}];
+  for (let i = 0; i < 20; i++) {
+    const futBar = S.dispBars[S.di + i];
+    pts.push({time: futBar ? futBar.time : lastBar.time + (i + 1) * tfSec, value: forecasts[i]});
+  }
+  S.holtSeries.setData(pts);
+}
+
+// Holt double exponential smoothing with holdout-optimised α and β.
+// Uses only dispBars[currentIdx-N .. currentIdx-1] — no future data.
+function computeHoltForecast(dispBars, currentIdx, steps) {
+  const N = Math.min(currentIdx, 60);
+  if (N < 8) return null;
+  const hl2 = dispBars.slice(currentIdx - N, currentIdx).map(b => (b.high + b.low) / 2);
+
+  // Hold out the last third (max 10 bars) to pick α/β
+  const holdout  = Math.min(10, Math.floor(N / 3));
+  const trainEnd = N - holdout;
+
+  let bestAlpha = 0.3, bestBeta = 0.1, bestMSE = Infinity;
+  for (let ai = 1; ai <= 9; ai++) {
+    const alpha = ai / 10;
+    for (let bi = 1; bi <= 5; bi++) {
+      const beta = bi / 10;
+      let L = hl2[0], B = hl2[1] - hl2[0];
+      for (let i = 1; i < trainEnd; i++) {
+        const Lp = L, Bp = B;
+        L = alpha * hl2[i] + (1 - alpha) * (Lp + Bp);
+        B = beta  * (L - Lp) + (1 - beta) * Bp;
+      }
+      let mse = 0;
+      for (let i = 0; i < holdout; i++) {
+        const err = (L + (i + 1) * B) - hl2[trainEnd + i];
+        mse += err * err;
+      }
+      if (mse < bestMSE) { bestMSE = mse; bestAlpha = alpha; bestBeta = beta; }
+    }
+  }
+
+  // Refit on all N bars with best params
+  let L = hl2[0], B = hl2[1] - hl2[0];
+  for (let i = 1; i < N; i++) {
+    const Lp = L, Bp = B;
+    L = bestAlpha * hl2[i] + (1 - bestAlpha) * (Lp + Bp);
+    B = bestBeta  * (L - Lp) + (1 - bestBeta) * Bp;
+  }
+
+  return Array.from({length: steps}, (_, h) => L + (h + 1) * B);
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -5435,7 +5514,7 @@ async def api_practice_session(request: Request) -> JSONResponse:
         last_date  = datetime.fromisoformat(info["last_date"].replace("Z", "").split("+")[0])
 
         history_days = 60
-        session_days = 5
+        session_days = 20
         earliest_start = first_date + timedelta(days=history_days)
         latest_start   = last_date  - timedelta(days=session_days + 2)
 
