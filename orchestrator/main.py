@@ -3789,7 +3789,7 @@ _PRACTICE_HTML = r"""<!DOCTYPE html>
   <button class="btn btn-gray" onclick="clearLines()">✕ Lines</button>
   <div class="vsep"></div>
   <button class="btn btn-gray" id="hl2-btn" onclick="toggleHlHalf()" title="Toggle HL/2 midpoint line (hides candles)">HL/2</button>
-  <button class="btn btn-gray" id="arima-btn" onclick="toggleArima()" title="Show AR(2) forecast for next 5 HL/2 bars">ARIMA ±5</button>
+  <button class="btn btn-gray" id="arima-btn" onclick="toggleArima()" title="Show AR(2) forecast for next 20 HL/2 bars">ARIMA ±20</button>
 </div>
 
 <script>
@@ -4272,12 +4272,12 @@ function toggleArima() {
 
 function updateArimaForecast() {
   if (!S.arimaVisible || !S.arimaSeries || !S.loaded || S.di < 2) return;
-  const forecasts = computeAR2Forecast(S.dispBars, S.di, 5);
+  const forecasts = computeAR2Forecast(S.dispBars, S.di, 20);
   if (!forecasts) { S.arimaSeries.setData([]); return; }
   const lastBar = S.dispBars[S.di - 1];
   const tfSec = S.di >= 2 ? (S.dispBars[S.di - 1].time - S.dispBars[S.di - 2].time) : 3600;
   const pts = [{time: lastBar.time, value: (lastBar.high + lastBar.low) / 2}];
-  for (let i = 0; i < 5; i++) {
+  for (let i = 0; i < 20; i++) {
     const futBar = S.dispBars[S.di + i];
     pts.push({time: futBar ? futBar.time : lastBar.time + (i + 1) * tfSec, value: forecasts[i]});
   }
