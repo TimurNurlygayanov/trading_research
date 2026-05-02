@@ -17,11 +17,26 @@ load_dotenv()
 _client: Client | None = None
 
 
+class DBNotConfigured(RuntimeError):
+    """Raised when Supabase env vars are missing. Catch in callers that want
+    to degrade gracefully (e.g. dashboard endpoints that can run without DB)."""
+
+
+def is_configured() -> bool:
+    """Return True if both SUPABASE_URL and SUPABASE_ANON_KEY are set."""
+    return bool(os.environ.get("SUPABASE_URL")) and \
+           bool(os.environ.get("SUPABASE_ANON_KEY"))
+
+
 def get_client() -> Client:
     global _client
     if _client is None:
-        url = os.environ["SUPABASE_URL"]
-        key = os.environ["SUPABASE_ANON_KEY"]
+        url = os.environ.get("SUPABASE_URL")
+        key = os.environ.get("SUPABASE_ANON_KEY")
+        if not url or not key:
+            raise DBNotConfigured(
+                "Supabase env vars not set (SUPABASE_URL / SUPABASE_ANON_KEY). "
+                "Running without DB — set them in .env to enable.")
         _client = create_client(url, key)
     return _client
 

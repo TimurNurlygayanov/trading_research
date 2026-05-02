@@ -56,6 +56,19 @@ async def lifespan(app: FastAPI):
     # ── startup ──────────────────────────────────────────────────────────────
     log.info("orchestrator_starting", python_version=sys.version,
              port=os.environ.get("PORT", 8000))
+
+    # Offline mode: dashboard pages that don't need DB still serve (e.g. /practice).
+    # DB-dependent endpoints raise DBNotConfigured, which their try/except returns
+    # as a 500/503 to the user.
+    if not db.is_configured():
+        log.warning("offline_mode",
+                    reason="SUPABASE_URL/ANON_KEY not set",
+                    note="Dashboard runs without DB. /practice page works from "
+                         "data/cache/. Pipeline workers and Modal jobs disabled.")
+        yield
+        log.info("orchestrator_stopped")
+        return
+
     try:
         db.get_daily_spend()
         log.info("db_connection_ok")
@@ -5454,16 +5467,27 @@ def api_strategy_from_prob_result(row: _ProbResultRow, background_tasks: Backgro
 
 @app.get("/api/practice/symbols")
 def api_practice_symbols() -> JSONResponse:
-    """Return symbols available in data_cache for the practice page symbol picker."""
+    """Return symbols available in data_cache for the practice page symbol picker.
+    Falls back to filesystem scan when Supabase is unavailable."""
+    from db import local_cache
     try:
-        datasets = db.get_data_cache()
-        by_symbol: dict[str, list[str]] = {}
-        for ds in datasets:
-            by_symbol.setdefault(ds["symbol"], []).append(ds["timeframe"])
-        result = [{"symbol": s, "timeframes": sorted(tfs)} for s, tfs in sorted(by_symbol.items())]
-        return JSONResponse({"symbols": result})
+        if db.is_configured():
+            datasets = db.get_data_cache()
+        else:
+            datasets = local_cache.list_cached_datasets()
     except Exception as exc:
-        return JSONResponse({"error": str(exc)}, status_code=500)
+        log.warning("practice_symbols_db_fallback", error=str(exc))
+        try:
+            datasets = local_cache.list_cached_datasets()
+        except Exception as exc2:
+            return JSONResponse({"error": str(exc2)}, status_code=500)
+
+    by_symbol: dict[str, list[str]] = {}
+    for ds in datasets:
+        by_symbol.setdefault(ds["symbol"], []).append(ds["timeframe"])
+    result = [{"symbol": s, "timeframes": sorted(tfs)}
+              for s, tfs in sorted(by_symbol.items())]
+    return JSONResponse({"symbols": result})
 
 
 @app.post("/api/practice/session")
@@ -5499,17 +5523,28 @@ async def api_practice_session(request: Request) -> JSONResponse:
         sub_tf_map = {"1m": "1m", "5m": "1m", "15m": "1m", "1h": "5m", "4h": "15m", "1d": "1h"}
         sub_tf = sub_tf_map.get(display_tf, "5m")
 
-        # ── date range from data_cache metadata ─────────────────────────────
-        sb = db.get_client()
-        row = sb.table("data_cache").select("first_date,last_date") \
-                .eq("symbol", symbol).eq("timeframe", display_tf).execute()
-        if not row.data:
-            return JSONResponse(
-                {"error": f"No cached metadata for {symbol} {display_tf}. "
-                          "Go to the Data page and preload this dataset first."},
-                status_code=400)
+        # ── date range from cache metadata ──────────────────────────────────
+        # Prefer Supabase data_cache; fall back to filesystem when DB missing.
+        from db import local_cache
+        info: dict | None = None
+        if db.is_configured():
+            try:
+                sb = db.get_client()
+                row = sb.table("data_cache").select("first_date,last_date") \
+                        .eq("symbol", symbol).eq("timeframe", display_tf).execute()
+                if row.data:
+                    info = row.data[0]
+            except Exception as exc:
+                log.warning("practice_session_db_fallback", error=str(exc))
 
-        info       = row.data[0]
+        if info is None:
+            info = local_cache.get_dataset_range(symbol, display_tf)
+            if info is None:
+                return JSONResponse(
+                    {"error": f"No cached data for {symbol} {display_tf}. "
+                              "Run scripts/cache_fx_data.py to preload."},
+                    status_code=400)
+
         first_date = datetime.fromisoformat(info["first_date"].replace("Z", "").split("+")[0])
         last_date  = datetime.fromisoformat(info["last_date"].replace("Z", "").split("+")[0])
 

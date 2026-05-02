@@ -1,43 +1,104 @@
 # Range Fade Strategy
 
-Mean-reversion strategy on 1m forex bars. When price breaks out of a tight rolling range, fade the breakout (short above range high, long below range low). Time-of-day and day-of-week filters remove low-quality sessions.
+Mean-reversion on 1m FX bars. When price breaks out of a tight rolling range, fade the breakout: short above range high, long below range low. Take-profit and stop-loss are ATR-multiples set at entry. One open trade per pair at a time.
+
+This document reflects the **current validated configuration** based on gap-aware backtesting on 2024–2026 data. The original `scripts/strategy1.py` + `scripts/strategy1_portfolio.py` represent the legacy 2022–2024 setup and are kept for reference; new work should go through `strategy1_backtest_curves.py` and `strategy1_live_ib.py`.
 
 ---
 
 ## Logic
 
-1. **Range**: rolling `max(high)` and `min(low)` over the last 20 bars (excludes current bar — no lookahead).
-2. **Tightness filter**: skip entry if `(range_high − range_low) ≥ 1.5 × ATR(14)`. Only trade when the market has been consolidating tightly.
-3. **Entry**: at the close of the breakout bar, take the opposite direction.
-   - Close > range_high → **short**
-   - Close < range_low  → **long**
-4. **Exit**: ATR-based TP and SL, set at entry.
-   - TP = entry ± 1.0 × ATR (in trade direction)
-   - SL = entry ∓ 2.0 × ATR
-5. **Size**: 1 lot (100,000 units). P&L in USD.
-   - XXX/USD pairs: 1 pip = $10 directly.
-   - USD/YYY pairs: raw P&L divided by entry price.
-6. **Commission**: $7 round-trip (≈ 0.7 pip).
-7. **One trade at a time per pair**. New signals while in a trade are ignored.
+1. **Range**: rolling `max(high)` and `min(low)` over the previous **10 bars** (excludes the current bar — verified no look-ahead).
+2. **Entry**: at the close of the breakout bar, take the opposite direction.
+   - Close > range_high → **short** (fade)
+   - Close < range_low  → **long** (fade)
+3. **Exit**: ATR-based bracket set at entry.
+   - TP = entry ± 1.0 × ATR(14)
+   - SL = entry ∓ 2.0 × ATR(14)
+4. **Tightness filter** (legacy): `(range_high − range_low) ≥ 1.5 × ATR` blocks entry. **Disabled in the validated config** — it interacts poorly with shorter lookbacks. Keep `--no-tight` on for reproducibility.
+5. **Hour/day filters** (legacy): per-pair UTC-hour and day-of-week allow-lists. **Disabled in the validated config** — they overfit to the tuning window and degrade out-of-sample. Keep `--no-filters` on.
+6. **Pairs**: 5 USD-major pairs — **EURUSD, AUDUSD, NZDUSD, USDCHF, USDCAD**. GBPUSD is excluded (consistently loses or borderline). USDJPY is excluded (inconsistent on 1m).
 
 ---
 
-## Time Filters
+## Why the legacy filters are gone
 
-Derived from per-hour / per-DOW analysis on 2022–2024 data (stored in `scripts/strategy1_config.json`). Filters remove sessions with consistently negative PnL.
+The original config (`strategy1_config.json`) included per-pair hour/day filters tuned on 2024-2025 and a tightness gate. Walk-forward on 2026 showed:
 
-| Pair   | Excluded UTC hours | Excluded days |
-|--------|--------------------|---------------|
-| EURUSD | 1, 7, 8, 9, 11, 12, 14, 15, 18 | — |
-| GBPUSD | 0, 1, 2, 6, 8, 9, 11, 12, 13, 20 | Wed (2), Thu (3) |
-| AUDUSD | 0, 1 | — |
-| NZDUSD | 14, 16 | — |
-| USDCHF | 14 | — |
-| USDCAD | 13, 14, 16 | — |
+- Filtered run: 2024-2025 in-sample +$1,021K, 2026 OOS +$185K
+- Unfiltered run: 2024-2025 in-sample +$975K, 2026 OOS **+$198K**
 
-**Universal best hours** (positive for all 6 pairs): 3–5 UTC (Asian pre-market) and 19, 21–23 UTC (NY evening).  
-**GBPUSD** is the most session-sensitive pair — avoid Wed/Thu entirely.  
-Note: USDJPY is excluded from the portfolio (inconsistent results).
+The filters traded a small in-sample gain ($46K) for a real OOS hit (-$14K). The strategy edge is structurally distributed across most hours and weekdays. Filtering picks up noise, not signal.
+
+The same is true for the tightness filter at lookback=10 — a 10-bar range is naturally tight, so the `< 1.5 × ATR` gate rarely passes and rejects most setups.
+
+---
+
+## Cost model (IB-realistic)
+
+- **Entry** (market order): crosses ~half the bid-ask spread.
+- **TP exit** (limit): fills at the limit price exactly. No favorable-gap bonus assumed (deep retail FX liquidity makes that rare).
+- **SL exit** (stop → market on trigger): crosses ~half the spread. **If the bar gapped through the stop at the open, real fill is the open price** (the dominant gap risk in retail FX — weekend opens, news minutes).
+- **Commission** (IB Pro tier-1): `max($2, 0.20 bp × notional)` per side. The $2 minimum dominates for trades smaller than ~$100K notional.
+- **Per-pair half-spreads** baked in (pips):
+
+  | Pair | Half-spread |
+  |------|-------------|
+  | EURUSD | 0.15 |
+  | GBPUSD | 0.30 |
+  | AUDUSD | 0.25 |
+  | NZDUSD | 0.75 |
+  | USDCHF | 0.50 |
+  | USDCAD | 0.50 |
+
+Tune via `--spread-mult` (e.g. 1.5 for stress, 0.5 for tight regime). Use `--no-costs` to compare against frictionless.
+
+---
+
+## Risk management (live + backtest)
+
+These rules apply to both the backtest (`strategy1_backtest_curves.py`) and the live bot (`strategy1_live_ib.py`) and are wired with the same semantics.
+
+### Position sizing
+
+Pass exactly one of:
+- `--lot N` — fixed lot size (default 0.5)
+- `--risk-usd N` — risk-based: position chosen so SL distance × units = $N
+
+`--max-lot N` caps the position regardless of sizing mode. Recommended with `--risk-usd` to bound size when ATR is tight.
+
+### Per-pair daily-DD circuit breaker
+
+`--daily-dd-limit-pair 150` — once today's realised PnL on a given pair drops to -$150, block new entries on that pair until 00:00 UTC. A TP win that recovers the day reopens trading. Resets at midnight UTC.
+
+This caps the worst-case daily loss across the portfolio at `5 × $150 = $750` regardless of trade volume.
+
+### Overnight / weekend rules
+
+`--no-overnight` enables intraday-only defaults:
+- `close-by-hour=21` — force-close any open positions when bar UTC hour ≥ 21
+- `no-entry-after-hour=20` — block new entries after 20:00 UTC
+- `no-friday-after-hour=17` — Friday-only stricter cutoff
+
+Override individually with `--close-by-hour H`, `--no-entry-after-hour H`, `--no-friday-after-hour H`.
+
+Trade-off: blocks ~12% of trade count and ~22% of P&L on the backtest, but eliminates ~50% of weekend gap exposure. Worth it when running the live bot unattended.
+
+### Live-bot-only: spread guard
+
+`--spread-guard` queries IB's bid/ask before submitting and skips trades where current spread exceeds a per-pair limit. Default per-pair caps:
+
+| Pair | Max spread (pips) |
+|------|-------------------|
+| EURUSD | 0.6 |
+| GBPUSD | 1.0 |
+| AUDUSD | 1.0 |
+| NZDUSD | 2.5 |
+| USDCHF | 1.5 |
+| USDCAD | 1.5 |
+| USDJPY | 0.8 |
+
+These are roughly 2× normal spreads — wide enough that liquid hours pass through, narrow enough that news spikes get filtered out. Override with `--max-spread-pips EURUSD=0.5 NZDUSD=2.0` or globally `--max-spread-pips 1.5`.
 
 ---
 
@@ -45,114 +106,193 @@ Note: USDJPY is excluded from the portfolio (inconsistent results).
 
 | File | Purpose |
 |------|---------|
-| `scripts/strategy1.py` | Core backtest — single pair, sweep, multi-year, `--time-analysis` |
-| `scripts/strategy1_config.json` | Per-pair params + hour/day filters |
-| `scripts/strategy1_portfolio.py` | Portfolio backtest — all 6 pairs with config filters |
+| `scripts/strategy1.py` | Original single-pair backtest (legacy) |
+| `scripts/strategy1_config.json` | Pair list + legacy filters |
+| `scripts/strategy1_portfolio.py` | Original portfolio backtest (legacy) |
+| **`scripts/strategy1_backtest_curves.py`** | **Current backtest — gap-aware, multi-scenario, equity curves, account sizing** |
+| **`scripts/strategy1_live_ib.py`** | **Live IB trading bot (matches the backtest semantics 1:1)** |
+| `scripts/strategy1_lookback_sweep.py` | Lookback sensitivity study tool |
+| `scripts/strategy1_session_optimizer.py` | Per-pair hour/day filter tuner with train/test split |
+| `scripts/strategy1_propfirm_sizing.py` | Prop-firm sizing & challenge-completion estimator |
+| `scripts/cache_fx_data.py` | Bulk-fetch FX OHLCV into the local parquet cache |
 
 ---
 
-## How to Run
+## How to run
 
-### Single pair
+### Backtest with the validated config
+
 ```bash
-# Default: EURUSD, 2024, 1m
-python -m scripts.strategy1
+# 5 pairs, 1m, lookback=10, gap-aware, IB-realistic costs, fixed 0.5 lot
+python -m scripts.strategy1_backtest_curves \
+    --start 2024-01-01 --end 2026-05-02 \
+    --tf 1m --lookback 10 \
+    --no-tight --no-filters \
+    --exclude GBPUSD \
+    --lots 0.5
 
-# Custom pair and date range
-python -m scripts.strategy1 --symbol NZDUSD --start 2023-01-01 --end 2025-01-01 \
-    --fade --tight-atr 1.5 --tp-atr 1 --sl-atr 2
+# With full risk management
+python -m scripts.strategy1_backtest_curves \
+    --start 2024-01-01 --end 2026-05-02 \
+    --tf 1m --lookback 10 \
+    --no-tight --no-filters \
+    --exclude GBPUSD \
+    --risk-usd 50 --max-lot 0.5 \
+    --daily-dd-limit-pair 150 \
+    --no-overnight
 
-# With hour/day filters
-python -m scripts.strategy1 --symbol NZDUSD --start 2024-01-01 --end 2025-01-01 \
-    --fade --tight-atr 1.5 --tp-atr 1 --sl-atr 2 \
-    --hours 3 4 5 19 21 22 23 --days 0 1 2 3 4
-
-# TP/SL grid sweep
-python -m scripts.strategy1 --symbol NZDUSD --start 2024-01-01 --end 2025-01-01 \
-    --fade --tight-atr 1.5 --sweep
+# Stress test (2× normal spreads)
+python -m scripts.strategy1_backtest_curves \
+    --start 2024-01-01 --end 2026-05-02 \
+    --tf 1m --lookback 10 --no-tight --no-filters --exclude GBPUSD \
+    --lots 0.5 --spread-mult 2.0
 ```
 
-### Time-of-day analysis (per-pair)
+Outputs go to `data/backtest_curves/<timestamp>/`:
+- per-pair equity-curve PNGs
+- portfolio aggregate curve
+- `metrics_<scenario>.csv`
+- `trades.csv`
+- `summary.json`
+
+### Lookback sweep
+
 ```bash
-python -m scripts.strategy1 --symbol NZDUSD --start 2022-01-01 --end 2025-01-01 \
-    --fade --tight-atr 1.5 --tp-atr 1 --sl-atr 2 --time-analysis
+python -m scripts.strategy1_lookback_sweep \
+    --start 2024-01-01 --end 2026-05-02 \
+    --lookbacks 10 20 30 40 50 \
+    --tfs 1m 5m
 ```
-Prints a table of net PnL / win rate / trades for each UTC hour (0–23) and each day of week.
 
-### Portfolio (all 6 pairs with config filters)
+### Prop-firm challenge sizing
+
 ```bash
-# Default: 2022, 2023, 2024
-python -m scripts.strategy1_portfolio
+# Pass a trades.csv (default: latest backtest run)
+python -m scripts.strategy1_propfirm_sizing \
+    --account 100000 --target 15000 \
+    --max-daily-loss 5000 --max-drawdown 10000
+```
 
-# Specific years
-python -m scripts.strategy1_portfolio --years 2022 2023 2024 2025
+Reports:
+- per-lot-factor max daily loss, MaxDD, recommended sizing
+- average / median / pessimistic time to hit the target
 
-# Specific date range
-python -m scripts.strategy1_portfolio --start 2025-01-01 --end 2025-06-01
+### Live IB bot — recommended config
 
-# Compare without time filters
-python -m scripts.strategy1_portfolio --years 2022 2023 2024 --no-filters
+```bash
+# Paper-trade dry-run first (logs signals, no orders)
+python -m scripts.strategy1_live_ib \
+    --port 7497 --dry-run \
+    --pairs EURUSD AUDUSD NZDUSD USDCHF USDCAD \
+    --no-filters --no-overnight --spread-guard \
+    --risk-usd 50 --max-lot 0.5 --daily-dd-limit-pair 150
+
+# Real paper account, real orders
+python -m scripts.strategy1_live_ib \
+    --port 7497 \
+    --pairs EURUSD AUDUSD NZDUSD USDCHF USDCAD \
+    --no-filters --no-overnight --spread-guard \
+    --risk-usd 50 --max-lot 0.5 --daily-dd-limit-pair 150
+
+# Live account (port 7496) — only after paper validation
+python -m scripts.strategy1_live_ib \
+    --port 7496 \
+    --pairs EURUSD AUDUSD NZDUSD USDCHF USDCAD \
+    --no-filters --no-overnight --spread-guard \
+    --risk-usd 50 --max-lot 0.5 --daily-dd-limit-pair 150
+
+# Offline replay (no IB connection) — sanity-check signal logic
+python -m scripts.strategy1_live_ib --simulate --sim-hours 48 \
+    --pairs EURUSD AUDUSD NZDUSD USDCHF USDCAD --no-filters
 ```
 
 ---
 
-## Backtest Results
+## Backtest results (validated config, 2024-01-01 → 2026-05-02)
 
-### Portfolio (6 pairs, 1m, TP 1×ATR, SL 2×ATR, tight 1.5×ATR, with filters)
+5 pairs ex-GBPUSD, 1m, lookback=10, no tightness, no hour/day filters, IB-realistic costs, gap-aware SL fills.
 
-| Year | EURUSD | GBPUSD | AUDUSD | NZDUSD | USDCHF | USDCAD | **Total** | Win rate |
-|------|--------|--------|--------|--------|--------|--------|-----------|----------|
-| 2022 | +$1,882 | +$4,401 | +$6,130 | +$11,358 | +$5,150 | +$71 | **+$28,992** | 83.9% |
-| 2023 | +$2,827 | +$609 | +$15,426 | +$25,761 | +$13,478 | +$2,712 | **+$60,813** | 87.5% |
-| 2024 | +$2,678 | +$1,534 | +$25,421 | +$42,895 | +$17,542 | +$10,557 | **+$100,627** | 89.9% |
-| 2025* | +$86 | +$655 | +$3,435 | +$16,364 | +$10,786 | +$1,703 | **+$33,030** | 88.7% |
+### Fixed 1 lot per pair
 
-*2025 is Jan–Apr only (partial year, out-of-sample for filters).
+| Pair    | Net P&L     | # Trades | Win%  | MaxDD     | Sharpe* |
+|---------|------------:|---------:|------:|----------:|--------:|
+| EURUSD  |    $+18,821 |   35,560 | 74.7% | $-21,998  | 1.5     |
+| AUDUSD  |   $+364,773 |   28,348 | 85.3% | $-3,868   | 21.5    |
+| NZDUSD  |   $+371,562 |   24,917 | 88.7% | $-14,238  | 14.0    |
+| USDCHF  |   $+338,450 |   24,500 | 84.4% | $-8,419   | 19.3    |
+| USDCAD  |    $+52,832 |   29,860 | 79.4% | $-17,846  | 4.6     |
+| **Portfolio** | **$+1,146,439** | **143,185** | **81.9%** | **$-26,201** | – |
 
-### Without time filters (comparison)
+*Per-trade annualized Sharpe — implausibly high (real strategies rarely exceed 5). Treat magnitudes with skepticism until live-validated.
 
-| Year | Total | Win rate | Trades |
-|------|-------|----------|--------|
-| 2022 | +$32,036 | 82.8% | 2,212 |
-| 2023 | +$63,735 | 86.4% | 3,594 |
-| 2024 | +$97,893 | 88.5% | 4,957 |
+### With recommended risk caps (`--risk-usd 50 --max-lot 0.5 --daily-dd-limit-pair 150`)
 
-Filters reduce trades ~12% while maintaining similar or better PnL, with a 1–2pp higher win rate.
+Approximately half the absolute P&L of the table above (since 0.5 lot ≈ half the 1-lot result), with materially lower drawdowns and a hard daily-loss ceiling per pair.
 
-### Best individual pairs (unfiltered, 2022–2024)
+### 2026 out-of-sample only
 
-| Pair | 2022 | 2023 | 2024 |
-|------|------|------|------|
-| NZDUSD | +$12,049 | +$27,071 | +$41,414 |
-| AUDUSD | +$8,894 | +$16,467 | +$25,477 |
-| USDCHF | +$5,857 | +$14,048 | +$17,616 |
-| GBPUSD | +$3,240 | +$526 | +$1,185 |
-| EURUSD | +$1,869 | +$2,378 | +$2,226 |
-| USDJPY | negative — excluded | | |
+| Period      | Net P&L (1 lot) | MaxDD     |
+|-------------|----------------:|----------:|
+| 2026 YTD    |    $+198,352    | $-3,037   |
 
 ---
 
-## Key Parameters (strategy1_config.json)
+## Account sizing
 
-```json
-{
-  "lookback":   20,    // bars for rolling range
-  "atr_period": 14,    // ATR smoothing period
-  "tp_atr":     1.0,   // TP = 1× ATR from entry
-  "sl_atr":     2.0,   // SL = 2× ATR from entry
-  "tight_atr":  1.5,   // max range size in ATR units
-  "commission": 7.0,   // USD round-trip
-  "timeframe":  "1m"
-}
-```
+### Personal IB account (Cyprus retail / EU CySEC, 30:1 leverage)
 
-To edit filters or add/remove pairs, update `scripts/strategy1_config.json`.
+For trading 1 lot per pair across all 5 pairs concurrently:
+
+| Recommendation | Account size | Coverage |
+|---|---:|---|
+| Bare minimum | $20K | margin + 1× backtest DD |
+| Practical    | $40-50K | margin + 2-3× backtest DD |
+| Comfortable  | $100K | full real-world DD buffer |
+
+Margin per pair at 30:1 leverage is small ($2-4K each, $15-22K total for 5 pairs concurrently). The dominant factor is drawdown buffer, not margin.
+
+### $100K prop-firm challenge ($5K daily / $10K trailing-EOD DD, target $15K)
+
+Tested via 122 rolling-Monday starts on 2024-2026 data with the validated config:
+
+| Sizing | Pass rate | Blow-ups | Avg days to $15K | 90th-pct days |
+|--------|----------:|---------:|-----------------:|--------------:|
+| Full size (max-lot=1, $100 risk, $500 daily-DD) | 97.5% | 1.6% | **9.4** | 13 |
+| **Half size** (max-lot=0.5, $50 risk, $150 daily-DD) | **97.5%** | **0.0%** | **20.5** | 27 |
+
+**Recommended for prop firm: half size.** Same pass rate, zero historical blow-ups, ~3 weeks to target instead of 2.
 
 ---
 
-## Caveats
+## Verified properties
 
-- Commission is fixed at $7 (≈ 0.7 pip). Real slippage on 1m bars may be higher.
-- USD/YYY P&L conversion uses entry price as approximation.
-- Time filters were optimized on 2022–2024 (in-sample). 2025 is the first clean OOS year.
-- Results assume unlimited concurrent positions across pairs (no margin/allocation model).
+- **No look-ahead** — every input at decision time uses only bars ≤ i. Audited in code (top of `strategy1_backtest_curves.py`).
+- **Cost model symmetry** — entry, SL exit, and forced-close fills are modeled with the same spread + commission mechanics in both backtest and live.
+- **Gap-aware SL fills** — when the bar gapped past the stop at the open, real fill is at the open price, not the stop price. Captures weekend / news risk that bar-level data otherwise misses.
+- **Live bot mirrors backtest semantics 1:1** — the same evaluate-entry function runs offline and online; sizing, daily-DD, and overnight rules use the same parameters.
+
+---
+
+## Caveats before risking real money
+
+1. **Sharpe ratios of 14-22 per pair are implausibly high** for real strategies. Most likely causes:
+   - Polygon mid-quote bars don't fully reflect achievable retail fills, especially during fast moves.
+   - The 1-pip-ish cost model may underestimate real-world slippage during news minutes.
+   - Bar-level resolution misses intra-bar adverse fills.
+
+   Real-world performance typically lands at 50-70% of backtest. Plan accordingly.
+
+2. **Live-paper-trade for at least 2-4 weeks** with the spread guard ON before paying any prop-firm fee or trading real capital. Track:
+   - Actual fill quality vs the bar's close price
+   - Frequency of `skip_spread` events vs trade attempts
+   - Realised vs expected daily P&L
+
+   If your live $/day is ≥ 70% of backtest, you're in good shape. If < 50%, revisit.
+
+3. **Friday-evening + weekend exposure remains a tail risk** even with the gap-aware SL fix. SNB-2015-style events and similar black swans aren't in the dataset and aren't modelled. Run with `--no-overnight` for unattended live trading.
+
+4. **GBPUSD is excluded for a reason** — it both showed weak edge in backtest and exhibited regime instability across 2024 vs 2025 vs 2026. Don't add it back without re-validating.
+
+5. **The strategy is not robust to high IB commission floors at small lot sizes.** At 0.1 lot the $4 round-trip minimum eats most of the per-trade edge. Don't run smaller than 0.3 lot per pair.
+
+6. **MaxDD scales with lot size linearly.** If you want to halve risk, halve all sizing parameters together: `--lot 0.25` (or `--risk-usd 25 --max-lot 0.25`) and `--daily-dd-limit-pair 75`.

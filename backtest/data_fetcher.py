@@ -49,6 +49,32 @@ def _load_cache(symbol: str, timeframe: str, start: str, end: str) -> pd.DataFra
     p = _cache_path(symbol, timeframe, start, end)
     if p.exists():
         return pd.read_parquet(p)
+    # 3. Cross-chunk assembly: combine multiple cached date-range files to
+    #    cover the requested window. Only returns if the result fully spans
+    #    the requested range (otherwise we'd silently serve a gap-y result).
+    chunks = sorted(_CACHE_DIR.glob(f"{symbol}_{timeframe}_*.parquet"))
+    if chunks:
+        parts = []
+        for cp in chunks:
+            try:
+                parts.append(pd.read_parquet(cp))
+            except Exception:
+                continue
+        if parts:
+            combined = pd.concat(parts).sort_index()
+            combined = combined[~combined.index.duplicated(keep="last")]
+            req_start = pd.Timestamp(start, tz="UTC")
+            req_end   = pd.Timestamp(end,   tz="UTC") + pd.Timedelta(days=1)
+            sliced = combined[(combined.index >= req_start) &
+                              (combined.index < req_end)]
+            if not sliced.empty:
+                # Coverage check: only serve if cache actually covers the
+                # requested window (within ~2 days slack for weekends/start)
+                cache_start = combined.index.min()
+                cache_end   = combined.index.max()
+                slack = pd.Timedelta(days=2)
+                if cache_start <= req_start + slack and cache_end + slack >= req_end:
+                    return sliced
     return None
 
 
