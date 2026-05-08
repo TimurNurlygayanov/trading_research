@@ -104,6 +104,7 @@ from strategy1_live_ib import (
     DEFAULT_MAX_SPREAD_PIPS,
     FADE,
 )
+from strategy1 import _atr  # ATR helper reused for pre-computing intra-bar levels
 
 CONFIG_PATH = Path(__file__).parent / "strategy1_config.json"
 
@@ -166,6 +167,9 @@ def _resolve_max_slippages(specs: list[str] | None, pairs: list[str]) -> dict[st
 
 
 def _format_stats(s: dict) -> str:
+    pw      = s.get("signals_price_wait", 0)
+    pw_exp  = s.get("signals_price_wait_expired", 0)
+    pw_part = f"  price_wait={pw}  price_wait_exp={pw_exp}" if pw or pw_exp else ""
     return (f"signals={s['signals_total']}  "
             f"placed={s['trades_placed']}  "
             f"skip_inpos={s['signals_skipped_inpos']}  "
@@ -174,7 +178,8 @@ def _format_stats(s: dict) -> str:
             f"skip_spread={s['signals_skipped_spread']}  "
             f"skip_slippage={s.get('signals_skipped_slippage', 0)}  "
             f"skip_nodata={s['signals_skipped_nodata']}  "
-            f"force_closed={s.get('force_closes', 0)}")
+            f"force_closed={s.get('force_closes', 0)}"
+            + pw_part)
 
 
 def _resolve_symbol_map(args, pairs: list[str]) -> dict[str, str]:
@@ -249,16 +254,20 @@ class MT5Trader:
         self.broker_offset_hours = broker_offset_hours
         self._last_bar_time: dict[str, datetime] = {}  # logical → UTC bar time
         self._symbol_info: dict[str, object] = {}
+        # sym → (ticket, placed_monotonic_time) for pending limit orders
+        self._pending_orders: dict[str, tuple[int, float]] = {}
         self.stats = {
-            "signals_total":            0,
-            "signals_skipped_inpos":    0,
-            "signals_skipped_spread":   0,
-            "signals_skipped_slippage": 0,
-            "signals_skipped_nodata":   0,
-            "signals_skipped_dailydd":  0,
-            "signals_skipped_session":  0,
-            "trades_placed":            0,
-            "force_closes":             0,
+            "signals_total":               0,
+            "signals_skipped_inpos":       0,
+            "signals_skipped_spread":      0,
+            "signals_skipped_slippage":    0,
+            "signals_skipped_nodata":      0,
+            "signals_skipped_dailydd":     0,
+            "signals_skipped_session":     0,
+            "trades_placed":               0,
+            "force_closes":                0,
+            "signals_price_wait":          0,
+            "signals_price_wait_expired":  0,
         }
 
     # — connection lifecycle —
@@ -471,6 +480,39 @@ class MT5Trader:
         tp = _round_price(sig["tp_price"], info.point, info.digits)
         sl = _round_price(sig["sl_price"], info.point, info.digits)
 
+        # Validate SL/TP against the broker's minimum stop level (retcode 10016).
+        # MT5 checks SL/TP vs the CLOSING side of the spread, not the fill side:
+        #   BUY position closes via SELL at bid  → SL must be < bid - min_dist
+        #                                          TP must be > bid + min_dist
+        #   SELL position closes via BUY  at ask  → SL must be > ask + min_dist
+        #                                           TP must be < ask - min_dist
+        # Using entry_px (ask for BUY, bid for SELL) misses the spread on the
+        # stop side — a narrow SL on SELL can be below ask even when above bid.
+        stops = int(getattr(info, "trade_stops_level", 0) or 0)
+        min_dist = max(stops, 1) * info.point
+        if action_buy:
+            if sl >= tick.bid - min_dist:
+                log.warning("SKIP %s BUY: SL %.5f ≥ bid %.5f - min_dist %.5f "
+                            "(stops_level=%d pts)",
+                            sym, sl, tick.bid, min_dist, stops)
+                return False
+            if tp <= tick.bid + min_dist:
+                log.warning("SKIP %s BUY: TP %.5f ≤ bid %.5f + min_dist %.5f "
+                            "(stops_level=%d pts)",
+                            sym, tp, tick.bid, min_dist, stops)
+                return False
+        else:
+            if sl <= tick.ask + min_dist:
+                log.warning("SKIP %s SELL: SL %.5f ≤ ask %.5f + min_dist %.5f "
+                            "(stops_level=%d pts)",
+                            sym, sl, tick.ask, min_dist, stops)
+                return False
+            if tp >= tick.ask - min_dist:
+                log.warning("SKIP %s SELL: TP %.5f ≥ ask %.5f - min_dist %.5f "
+                            "(stops_level=%d pts)",
+                            sym, tp, tick.ask, min_dist, stops)
+                return False
+
         if self.dry_run:
             log.info("[DRY-RUN] %s %s lots=%.2f  entry≈%.5f  TP=%.5f  SL=%.5f",
                      sym, sig["action"], lots, entry_px, tp, sl)
@@ -502,6 +544,145 @@ class MT5Trader:
         log.info("PLACED %s %s lots=%.2f  fill=%.5f  TP=%.5f  SL=%.5f  ticket=%d",
                  sym, sig["action"], lots, result.price, tp, sl, result.order)
         return True
+
+    def submit_pending(self, sym: str, sig: dict, lots: float,
+                       expiry_minutes: int) -> bool:
+        """Place a pending order at the midpoint of TP and SL (1:1 R:R, 1.5×ATR each side).
+
+        Order type is chosen by comparing limit_px to current market price:
+          fade  BUY  → midpoint below current price → BUY  LIMIT
+          fade  SELL → midpoint above current price → SELL LIMIT
+          break BUY  → midpoint above current price → BUY  STOP
+          break SELL → midpoint below current price → SELL STOP
+        """
+        info = self._symbol_info[sym]
+        sym_mt5 = self.symbol_map[sym]
+        action_buy = (sig["action"] == "BUY")
+
+        # Midpoint of TP and SL → 1:1 R:R from fill price regardless of mode.
+        limit_px = _round_price((sig["tp_price"] + sig["sl_price"]) / 2,
+                                info.point, info.digits)
+        tp = _round_price(sig["tp_price"], info.point, info.digits)
+        sl = _round_price(sig["sl_price"], info.point, info.digits)
+
+        # Need current market to classify and validate the pending order.
+        tick = self.mt5.symbol_info_tick(sym_mt5)
+        if tick is None:
+            log.warning("SKIP PENDING %s: no live tick for price validation", sym)
+            return False
+
+        # If the market has already reached or passed the pending price, enter
+        # at market immediately — we'll get an equal or better fill than waiting.
+        #   BUY:  ask already ≤ limit_px → price came down to/past our entry
+        #   SELL: bid already ≥ limit_px → price came up to/past our entry
+        # This also covers breakout stops: if price already broke through the
+        # stop level (ask ≥ limit for BUY STOP, bid ≤ limit for SELL STOP),
+        # the pending would fill instantly anyway — skip the round-trip.
+        if action_buy and tick.ask <= limit_px:
+            log.info("MARKET FALLBACK %s BUY: ask %.5f ≤ limit %.5f",
+                     sym, tick.ask, limit_px)
+            return self.submit_market(sym, sig, lots)
+        if not action_buy and tick.bid >= limit_px:
+            log.info("MARKET FALLBACK %s SELL: bid %.5f ≥ limit %.5f",
+                     sym, tick.bid, limit_px)
+            return self.submit_market(sym, sig, lots)
+
+        # Decide LIMIT vs STOP based on where limit_px sits relative to market:
+        #   BUY  LIMIT → price < ask  (retracement entry below market)
+        #   BUY  STOP  → price > ask  (breakout entry above market)
+        #   SELL LIMIT → price > bid  (retracement entry above market)
+        #   SELL STOP  → price < bid  (breakout entry below market)
+        if action_buy:
+            order_type = (self.mt5.ORDER_TYPE_BUY_LIMIT
+                          if limit_px < tick.ask
+                          else self.mt5.ORDER_TYPE_BUY_STOP)
+            order_label = "BUY LIMIT" if limit_px < tick.ask else "BUY STOP"
+        else:
+            order_type = (self.mt5.ORDER_TYPE_SELL_LIMIT
+                          if limit_px > tick.bid
+                          else self.mt5.ORDER_TYPE_SELL_STOP)
+            order_label = "SELL LIMIT" if limit_px > tick.bid else "SELL STOP"
+
+        # MT5 enforces trade_stops_level points minimum distance from market.
+        # Violating it gives retcode 10015 (INVALID_PRICE). Skip rather than crash.
+        stops = int(getattr(info, "trade_stops_level", 0) or 0)
+        min_dist = max(stops, 1) * info.point
+        if action_buy:
+            ref_price = tick.ask
+            too_close = abs(limit_px - ref_price) < min_dist
+        else:
+            ref_price = tick.bid
+            too_close = abs(limit_px - ref_price) < min_dist
+        if too_close:
+            log.warning("SKIP PENDING %s %s: limit %.5f too close to %.5f "
+                        "(need ≥%.5f gap, stops_level=%d pts)",
+                        sym, order_label, limit_px, ref_price, min_dist, stops)
+            return False
+
+        if self.dry_run:
+            log.info("[DRY-RUN PENDING] %s %s lots=%.2f  limit=%.5f  TP=%.5f  SL=%.5f"
+                     "  expiry=%dm",
+                     sym, order_label, lots, limit_px, tp, sl, expiry_minutes)
+            return True
+
+        # ORDER_TIME_GTC — we cancel manually after expiry_minutes.
+        # ORDER_TIME_SPECIFIED is widely rejected by brokers (retcode 10022).
+        request = {
+            "action":       self.mt5.TRADE_ACTION_PENDING,
+            "symbol":       sym_mt5,
+            "volume":       float(lots),
+            "type":         order_type,
+            "price":        limit_px,
+            "sl":           sl,
+            "tp":           tp,
+            "deviation":    20,
+            "magic":        MAGIC_NUMBER,
+            "comment":      "strategy1_pending",
+            "type_time":    self.mt5.ORDER_TIME_GTC,
+            "type_filling": _resolve_filling_mode(self.mt5, info),
+        }
+        result = self.mt5.order_send(request)
+        if result is None:
+            log.error("PENDING ORDER FAILED %s: order_send returned None  err=%s",
+                      sym, self.mt5.last_error())
+            return False
+        if result.retcode != self.mt5.TRADE_RETCODE_DONE:
+            log.error("PENDING ORDER REJECT %s  retcode=%d  comment=%s",
+                      sym, result.retcode, result.comment)
+            return False
+        self._pending_orders[sym] = (result.order, time.monotonic())
+        log.info("PENDING PLACED %s %s lots=%.2f  limit=%.5f  TP=%.5f  SL=%.5f"
+                 "  expiry=%dm  ticket=%d",
+                 sym, order_label, lots, limit_px, tp, sl,
+                 expiry_minutes, result.order)
+        return True
+
+    def cancel_expired_pending(self, expiry_minutes: int) -> None:
+        """Cancel any pending limit orders older than expiry_minutes."""
+        if not self._pending_orders:
+            return
+        now = time.monotonic()
+        expired = [sym for sym, (_, placed) in self._pending_orders.items()
+                   if (now - placed) >= expiry_minutes * 60]
+        for sym in expired:
+            ticket, _ = self._pending_orders.pop(sym)
+            sym_mt5 = self.symbol_map[sym]
+            orders = self.mt5.orders_get(symbol=sym_mt5)
+            if not orders or not any(o.ticket == ticket for o in orders):
+                # Already filled or gone — nothing to cancel
+                continue
+            result = self.mt5.order_send({
+                "action": self.mt5.TRADE_ACTION_REMOVE,
+                "order":  ticket,
+            })
+            if result and result.retcode == self.mt5.TRADE_RETCODE_DONE:
+                log.info("PENDING CANCELLED %s ticket=%d (expired after %dm)",
+                         sym, ticket, expiry_minutes)
+                self.stats["force_closes"] += 1
+            else:
+                rc = getattr(result, "retcode", None)
+                log.warning("PENDING CANCEL FAILED %s ticket=%d retcode=%s",
+                            sym, ticket, rc)
 
     def force_close_all(self, logical_pairs: list[str], reason: str) -> int:
         """Cancel all positions across the given pairs. Returns count closed."""
@@ -568,6 +749,9 @@ class TickBarBuilder:
         self.current_bar: dict[str, dict | None] = {}
         self.last_tick_time_msc: dict[str, int] = {}
         self.last_tick_wall_ts: dict[str, float] = {}  # monotonic seconds, for staleness logs
+        self.last_mid: dict[str, float] = {}           # latest tick mid-price
+        self.last_bid: dict[str, float] = {}           # latest tick bid
+        self.last_ask: dict[str, float] = {}           # latest tick ask
 
     def seed(self, sym: str, df_with_partial: pd.DataFrame) -> None:
         """Seed builder with historical bars + the partial current bar.
@@ -618,6 +802,9 @@ class TickBarBuilder:
         if not (bid > 0 and ask > 0 and ask >= bid):
             return None
         mid = (bid + ask) / 2.0
+        self.last_mid[sym] = mid
+        self.last_bid[sym] = bid
+        self.last_ask[sym] = ask
 
         # Broker time → UTC. tick.time/time_msc are in broker timezone.
         broker_dt = datetime.fromtimestamp(time_msc / 1000.0, tz=timezone.utc)
@@ -705,14 +892,120 @@ class TickBarBuilder:
 
 # ── Live driver ───────────────────────────────────────────────────────────────
 
+def _check_and_submit(
+    trader: MT5Trader,
+    sym: str,
+    sig: dict,
+    args,
+    max_spread_pips,
+    max_slippage_pips,
+    overnight: dict,
+    tag: str = "",
+) -> bool:
+    """Apply all entry guards and submit if clear. Returns True if order placed."""
+    if trader.has_open_position(sym):
+        trader.stats["signals_skipped_inpos"] += 1
+        return False
+
+    bar_t = sig["time"]
+    no_entry_after_hour  = overnight.get("no_entry_after_hour")
+    no_friday_after_hour = overnight.get("no_friday_after_hour")
+    if no_entry_after_hour is not None and bar_t.hour >= no_entry_after_hour:
+        trader.stats["signals_skipped_session"] += 1
+        log.info("SKIP %s%s: hour %d ≥ no_entry_after_hour=%d",
+                 sym, tag, bar_t.hour, no_entry_after_hour)
+        return False
+    if (no_friday_after_hour is not None
+            and bar_t.dayofweek == 4
+            and bar_t.hour >= no_friday_after_hour):
+        trader.stats["signals_skipped_session"] += 1
+        log.info("SKIP %s%s: Friday %d:00 ≥ no_friday_after_hour=%d",
+                 sym, tag, bar_t.hour, no_friday_after_hour)
+        return False
+
+    if trader.is_daily_blocked(sym):
+        trader.stats["signals_skipped_dailydd"] += 1
+        log.info("SKIP %s%s: daily DD limit hit (today PnL=$%+.2f, limit=$-%.0f)",
+                 sym, tag, trader.daily_pnl(sym), args.daily_dd_limit_pair)
+        return False
+
+    trader.stats["signals_total"] += 1
+    log.info("SIGNAL%s %s @ %s  %s  entry=%.5f  TP=%.5f  SL=%.5f",
+             tag, sym, sig["time"].strftime("%Y-%m-%d %H:%M"),
+             sig["action"], sig["entry_price"], sig["tp_price"], sig["sl_price"])
+
+    if max_spread_pips is not None:
+        limit  = max_spread_pips.get(sym)
+        spread = trader.current_spread_pips(sym)
+        if spread is None:
+            log.info("SKIP %s%s: no live quote yet (spread guard)", sym, tag)
+            trader.stats["signals_skipped_nodata"] += 1
+            return False
+        if limit is not None and spread > limit:
+            log.info("SKIP %s%s: spread %.2f pips > limit %.2f", sym, tag, spread, limit)
+            trader.stats["signals_skipped_spread"] += 1
+            return False
+        log.info("PASS %s%s: spread %.2f pips ≤ limit %.2f", sym, tag, spread,
+                 limit if limit is not None else -1)
+
+    if max_slippage_pips is not None:
+        limit = max_slippage_pips.get(sym)
+        result = trader.entry_slippage_pips(sym, sig)
+        if result is None:
+            log.info("SKIP %s%s: no live quote yet (slippage guard)", sym, tag)
+            trader.stats["signals_skipped_nodata"] += 1
+            return False
+        slip, fillable = result
+        if limit is not None and slip > limit:
+            log.info("SKIP %s%s: slippage %+.2f pips > limit %.2f "
+                     "(signal=%.5f live=%.5f, against us)",
+                     sym, tag, slip, limit, sig["entry_price"], fillable)
+            trader.stats["signals_skipped_slippage"] += 1
+            return False
+        if slip < 0:
+            log.info("PASS %s%s: slippage %+.2f pips (in our favor, "
+                     "signal=%.5f live=%.5f)", sym, tag, slip,
+                     sig["entry_price"], fillable)
+        else:
+            log.info("PASS %s%s: slippage %+.2f pips ≤ limit %.2f "
+                     "(signal=%.5f live=%.5f)", sym, tag, slip,
+                     limit if limit is not None else -1,
+                     sig["entry_price"], fillable)
+
+    lots, was_capped = trader.size_lots(sym, sig, args)
+    if lots <= 0:
+        log.info("SKIP %s%s: computed lots=0 (zero SL distance / step rounding)",
+                 sym, tag)
+        return False
+    if was_capped:
+        log.info("CAP %s%s: would have wanted >max-lot at risk=$%.0f, "
+                 "capping at %.2f lots", sym, tag,
+                 args.risk_usd if args.risk_usd else 0, lots)
+
+    if getattr(args, "pending_entry", False):
+        if trader.submit_pending(sym, sig, lots, args.expiry_minutes):
+            trader.stats["trades_placed"] += 1
+            return True
+    else:
+        if trader.submit_market(sym, sig, lots):
+            trader.stats["trades_placed"] += 1
+            return True
+    return False
+
+
 def _evaluate_one_symbol(trader: MT5Trader, sym: str, p: dict, pair_cfg: dict,
                          args, max_spread_pips, max_slippage_pips,
                          overnight: dict, logical_pairs: list[str],
-                         df: pd.DataFrame) -> None:
+                         df: pd.DataFrame) -> dict | None:
+    """
+    Evaluate bar-close signal. Returns the signal dict when --price-improvement
+    is active (caller handles submission). Otherwise submits via _check_and_submit
+    and returns None.
+    """
     warmup = p["lookback"] + p["atr_period"] + 1
     if df is None or len(df) < warmup + 1:
         trader.stats["signals_skipped_nodata"] += 1
-        return
+        return None
 
     # Drop the partial (current) last bar — same as IB live & backtest.
     closed_df = df.iloc[:-1]
@@ -720,100 +1013,93 @@ def _evaluate_one_symbol(trader: MT5Trader, sym: str, p: dict, pair_cfg: dict,
 
     # Idempotency: only act once per closed bar per symbol.
     if trader._last_bar_time.get(sym) == closed_bar_time:
-        return
+        return None
     trader._last_bar_time[sym] = closed_bar_time
 
     sig = evaluate_entry(closed_df, p, pair_cfg,
                          use_filters=not args.no_filters)
-    # close_by_hour is enforced by the wall-clock loop in run_live so it fires
-    # even when a pair stops ticking; no per-bar trigger needed here.
     if sig is None:
-        return
+        return None
 
+    if getattr(args, "price_improvement", False):
+        return sig  # caller handles price-gating and submission
+
+    _check_and_submit(trader, sym, sig, args, max_spread_pips,
+                      max_slippage_pips, overnight)
+    return None
+
+
+
+
+def _enqueue_price_wait(
+    price_wait: dict,
+    trader: MT5Trader,
+    sym: str,
+    sig: dict,
+    args,
+    overnight: dict,
+) -> None:
+    """
+    Apply pre-entry guards and either enter immediately (if price already
+    favourable) or park the signal in `price_wait` for tick-level monitoring.
+
+    Called only when --price-improvement is active.
+
+    Good price:
+      BUY  → enter when ask ≤ sig["entry_price"]  (price came back to signal close)
+      SELL → enter when bid ≥ sig["entry_price"]
+    """
+    bar_t = sig["time"]
+    no_entry = overnight.get("no_entry_after_hour")
+    no_fri   = overnight.get("no_friday_after_hour")
+
+    if no_entry is not None and bar_t.hour >= no_entry:
+        trader.stats["signals_skipped_session"] += 1
+        return
+    if no_fri is not None and bar_t.dayofweek == 4 and bar_t.hour >= no_fri:
+        trader.stats["signals_skipped_session"] += 1
+        return
+    if trader.is_daily_blocked(sym):
+        trader.stats["signals_skipped_dailydd"] += 1
+        return
     if trader.has_open_position(sym):
         trader.stats["signals_skipped_inpos"] += 1
         return
 
-    bar_t = sig["time"]
-    no_entry_after_hour  = overnight.get("no_entry_after_hour")
-    no_friday_after_hour = overnight.get("no_friday_after_hour")
-    if no_entry_after_hour is not None and bar_t.hour >= no_entry_after_hour:
-        trader.stats["signals_skipped_session"] += 1
-        log.info("SKIP %s: hour %d ≥ no_entry_after_hour=%d",
-                 sym, bar_t.hour, no_entry_after_hour)
+    lots, was_capped = trader.size_lots(sym, sig, args)
+    if lots <= 0:
         return
-    if (no_friday_after_hour is not None
-            and bar_t.dayofweek == 4
-            and bar_t.hour >= no_friday_after_hour):
-        trader.stats["signals_skipped_session"] += 1
-        log.info("SKIP %s: Friday %d:00 ≥ no_friday_after_hour=%d",
-                 sym, bar_t.hour, no_friday_after_hour)
-        return
-
-    if trader.is_daily_blocked(sym):
-        trader.stats["signals_skipped_dailydd"] += 1
-        log.info("SKIP %s: daily DD limit hit (today PnL=$%+.2f, limit=$-%.0f)",
-                 sym, trader.daily_pnl(sym), args.daily_dd_limit_pair)
-        return
+    if was_capped:
+        log.info("CAP %s: risk-based lots capped at %.2f", sym, lots)
 
     trader.stats["signals_total"] += 1
     log.info("SIGNAL %s @ %s  %s  entry=%.5f  TP=%.5f  SL=%.5f",
              sym, sig["time"].strftime("%Y-%m-%d %H:%M"),
              sig["action"], sig["entry_price"], sig["tp_price"], sig["sl_price"])
 
-    if max_spread_pips is not None:
-        limit  = max_spread_pips.get(sym)
-        spread = trader.current_spread_pips(sym)
-        if spread is None:
-            log.info("SKIP %s: no live quote yet (spread guard)", sym)
-            trader.stats["signals_skipped_nodata"] += 1
-            return
-        if limit is not None and spread > limit:
-            log.info("SKIP %s: spread %.2f pips > limit %.2f", sym, spread, limit)
-            trader.stats["signals_skipped_spread"] += 1
-            return
-        log.info("PASS %s: spread %.2f pips ≤ limit %.2f", sym, spread,
-                 limit if limit is not None else -1)
+    ba = trader.get_bid_ask(sym)
+    target = sig["entry_price"]
+    already_good = False
+    if ba is not None:
+        bid_now, ask_now = ba
+        already_good = ((sig["action"] == "BUY"  and ask_now <= target) or
+                        (sig["action"] == "SELL" and bid_now >= target))
 
-    # Slippage guard: how far has the live fillable price moved from the
-    # signal's intended entry? Favorable moves (slip < 0) always pass through —
-    # we only block when the market has run AGAINST the signal by more than
-    # `limit` pips, which means our fill would be materially worse than the
-    # bar-close price the strategy decided on.
-    if max_slippage_pips is not None:
-        limit = max_slippage_pips.get(sym)
-        result = trader.entry_slippage_pips(sym, sig)
-        if result is None:
-            log.info("SKIP %s: no live quote yet (slippage guard)", sym)
-            trader.stats["signals_skipped_nodata"] += 1
-            return
-        slip, fillable = result
-        if limit is not None and slip > limit:
-            log.info("SKIP %s: slippage %+.2f pips > limit %.2f "
-                     "(signal=%.5f live=%.5f, against us)",
-                     sym, slip, limit, sig["entry_price"], fillable)
-            trader.stats["signals_skipped_slippage"] += 1
-            return
-        if slip < 0:
-            log.info("PASS %s: slippage %+.2f pips (in our favor, signal=%.5f live=%.5f)",
-                     sym, slip, sig["entry_price"], fillable)
-        else:
-            log.info("PASS %s: slippage %+.2f pips ≤ limit %.2f (signal=%.5f live=%.5f)",
-                     sym, slip, limit if limit is not None else -1,
-                     sig["entry_price"], fillable)
-
-    lots, was_capped = trader.size_lots(sym, sig, args)
-    if lots <= 0:
-        log.info("SKIP %s: computed lots=0 (zero SL distance / step rounding)", sym)
-        return
-    if was_capped:
-        log.info("CAP %s: would have wanted >max-lot at risk=$%.0f, capping at %.2f lots",
-                 sym, args.risk_usd, lots)
-
-    if trader.submit_market(sym, sig, lots):
-        trader.stats["trades_placed"] += 1
-
-
+    if already_good:
+        log.info("PRICE-IMPR %s %s: price already at/past target=%.5f — immediate entry",
+                 sym, sig["action"], target)
+        if trader.submit_market(sym, sig, lots):
+            trader.stats["trades_placed"] += 1
+    else:
+        price_wait[sym] = {
+            "sig":       sig,
+            "lots":      lots,
+            "placed_at": time.monotonic(),
+        }
+        trader.stats["signals_price_wait"] += 1
+        ref = "ask" if sig["action"] == "BUY" else "bid"
+        log.info("PRICE-WAIT %s %s  target=%s≤%.5f  lots=%.2f  expires=%dm",
+                 sym, sig["action"], ref, target, lots, args.expiry_minutes)
 
 
 def run_live(args, cfg) -> None:
@@ -829,6 +1115,7 @@ def run_live(args, cfg) -> None:
     p["lookback"] = args.lookback
     if args.no_tight:
         p["tight_atr"] = None
+    p["max_breakout_atr"] = args.max_breakout_atr  # None = disabled
     if args.mode == "breakout":
         # Flip direction: long above range high, short below range low.
         # Swap TP/SL distances so TP=2×ATR (wide target) and SL=1×ATR (tight stop).
@@ -920,6 +1207,15 @@ def run_live(args, cfg) -> None:
         last_eval_minute: datetime | None = None
         last_minute_tick: int | None = None
         bars_emitted      = {s: 0 for s in logical_pairs}
+        # pending_levels[sym]: range+ATR for the bar currently forming, used
+        # by --intra-bar to enter as soon as a tick crosses the range boundary.
+        # Refreshed after each bar close. None = no valid signal level yet.
+        pending_levels: dict[str, dict | None] = {s: None for s in logical_pairs}
+
+        # price_wait[sym]: signal queued for --price-improvement mode. Cleared when
+        # the price condition is met, position opened externally, or it expires.
+        # {sig, lots, placed_at (monotonic seconds)}
+        price_wait: dict[str, dict] = {}
 
         close_by_hour = overnight.get("close_by_hour")
 
@@ -930,11 +1226,93 @@ def run_live(args, cfg) -> None:
             # 1. Poll ticks — updates in-progress OHLCV bars for all pairs.
             #    Tick rollovers update history but do NOT trigger evaluation;
             #    the scheduled pass below handles all pairs uniformly.
+            if args.pending_entry:
+                trader.cancel_expired_pending(args.expiry_minutes)
+
             for sym in logical_pairs:
                 try:
                     builder.poll(sym)
                 except Exception:
                     log.exception("tick poll failed for %s", sym)
+
+            # 1b. Intra-bar entry (--intra-bar, fade mode only).
+            #     After each bar close we pre-compute range+ATR from the closed
+            #     bars (pending_levels). On every tick we check whether the new
+            #     mid has crossed the range boundary. If so, we enter immediately
+            #     — at the range edge rather than at the bar close, which can be
+            #     1-2 pips further away. The scheduled bar-close eval still runs
+            #     as a fallback, but has_open_position will block double-entry.
+            if args.intra_bar and args.mode == "fade":
+                for sym in logical_pairs:
+                    lvl = pending_levels.get(sym)
+                    if not lvl:
+                        continue
+                    mid = builder.last_mid.get(sym)
+                    if mid is None:
+                        continue
+                    crossed_high = mid > lvl["range_high"]
+                    crossed_low  = mid < lvl["range_low"]
+                    if not crossed_high and not crossed_low:
+                        continue
+                    # Consume the level — one entry per bar.
+                    pending_levels[sym] = None
+                    direction = -1 if crossed_high else 1
+                    atr_e     = lvl["atr"]
+                    sig = {
+                        "time":        lvl["next_bar_time"],
+                        "action":      "BUY" if direction == 1 else "SELL",
+                        "direction":   direction,
+                        "entry_price": mid,
+                        "tp_price":    mid + p["tp_atr"] * atr_e * direction,
+                        "sl_price":    mid - p["sl_atr"] * atr_e * direction,
+                        "atr":         atr_e,
+                        "range_high":  lvl["range_high"],
+                        "range_low":   lvl["range_low"],
+                    }
+                    # Mark bar as handled so bar-close eval skips it.
+                    trader._last_bar_time[sym] = lvl["next_bar_time"]
+                    log.info("INTRA-BAR %s  %s  mid=%.5f  range=%.5f–%.5f",
+                             sym, sig["action"], mid,
+                             lvl["range_low"], lvl["range_high"])
+                    try:
+                        _check_and_submit(trader, sym, sig, args,
+                                          max_spread_pips, max_slippage_pips,
+                                          overnight, tag=" [intra]")
+                    except Exception:
+                        log.exception("intra-bar submit failed for %s", sym)
+
+            # 1c. Price-improvement: check waiting signals against current bid/ask.
+            if args.price_improvement and price_wait:
+                for pw_sym in list(price_wait):
+                    pw = price_wait[pw_sym]
+                    # Expire
+                    if time.monotonic() - pw["placed_at"] >= args.expiry_minutes * 60:
+                        log.info("PRICE-WAIT EXPIRED %s %s (no improvement in %dm)",
+                                 pw_sym, pw["sig"]["action"], args.expiry_minutes)
+                        trader.stats["signals_price_wait_expired"] += 1
+                        del price_wait[pw_sym]
+                        continue
+                    # Drop if a position opened externally (intra-bar, forced, etc.)
+                    if trader.has_open_position(pw_sym):
+                        del price_wait[pw_sym]
+                        continue
+                    # Check price condition
+                    ba = trader.get_bid_ask(pw_sym)
+                    if ba is None:
+                        continue
+                    bid_now, ask_now = ba
+                    pw_sig  = pw["sig"]
+                    target  = pw_sig["entry_price"]
+                    reached = ((pw_sig["action"] == "BUY"  and ask_now <= target) or
+                               (pw_sig["action"] == "SELL" and bid_now >= target))
+                    if not reached:
+                        continue
+                    ref_str = f"ask={ask_now:.5f}" if pw_sig["action"] == "BUY" else f"bid={bid_now:.5f}"
+                    log.info("PRICE-WAIT HIT %s %s  %s ≤/≥ target=%.5f",
+                             pw_sym, pw_sig["action"], ref_str, target)
+                    del price_wait[pw_sym]
+                    if trader.submit_market(pw_sym, pw_sig, pw["lots"]):
+                        trader.stats["trades_placed"] += 1
 
             # 2. Scheduled evaluation: once per minute at T+EVAL_OFFSET_MS.
             #    Force-close any pair whose bar hasn't been rolled over by a
@@ -956,9 +1334,37 @@ def run_live(args, cfg) -> None:
                         log.info("BAR-CLOSE %s @ %s  closed_bars=%d  src=%s",
                                  sym, prev_minute.strftime("%Y-%m-%d %H:%M UTC"),
                                  len(df) - 1 if len(df) > 0 else 0, source)
-                        _evaluate_one_symbol(trader, sym, p, cfg["pairs"][sym], args,
-                                             max_spread_pips, max_slippage_pips,
-                                             overnight, logical_pairs, df)
+                        sig = _evaluate_one_symbol(
+                            trader, sym, p, cfg["pairs"][sym], args,
+                            max_spread_pips, max_slippage_pips,
+                            overnight, logical_pairs, df)
+                        if sig is not None:
+                            # --price-improvement path: gate on bid/ask before submitting.
+                            _enqueue_price_wait(
+                                price_wait, trader, sym, sig, args, overnight)
+                        # Refresh pending levels for the next bar so intra-bar
+                        # entry can fire during the bar that is now forming.
+                        if args.intra_bar and args.mode == "fade":
+                            closed = builder.closed_bars(sym)
+                            min_len = p["lookback"] + p["atr_period"]
+                            if len(closed) >= min_len:
+                                try:
+                                    atr_e = float(_atr(closed, p["atr_period"])[-1])
+                                    window = closed.iloc[-p["lookback"]:]
+                                    rh = float(window["High"].max())
+                                    rl = float(window["Low"].min())
+                                    tight = p.get("tight_atr")
+                                    if tight is None or (rh - rl) < tight * atr_e:
+                                        pending_levels[sym] = {
+                                            "range_high":   rh,
+                                            "range_low":    rl,
+                                            "atr":          atr_e,
+                                            "next_bar_time": this_eval_minute,
+                                        }
+                                    else:
+                                        pending_levels[sym] = None
+                                except Exception:
+                                    pending_levels[sym] = None
                     except Exception:
                         log.exception("evaluate failed for %s", sym)
 
@@ -1055,6 +1461,12 @@ def main() -> None:
     # Pair selection & filters
     ap.add_argument("--pairs",    nargs="+", default=None,
                     help=f"Pairs to trade. Default: {' '.join(DEFAULT_PAIRS)}")
+    ap.add_argument("--intra-bar", action="store_true", default=False,
+                    help="(fade mode only) Enter as soon as a tick crosses the range "
+                         "boundary during the bar, rather than waiting for bar close. "
+                         "Gives a better entry price — you fade at the range edge "
+                         "instead of 1-2 pips past it. Bar-close evaluation still "
+                         "runs as a fallback if no intra-bar entry fired.")
     ap.add_argument("--mode", choices=["fade", "breakout"], default="fade",
                     help="'fade' (default): short above range high, long below range low. "
                          "'breakout': long above range high, short below range low, "
@@ -1067,6 +1479,11 @@ def main() -> None:
                     help="Disable the range-tightness filter (validated default).")
     ap.add_argument("--use-tight", dest="no_tight", action="store_false",
                     help="Re-enable the range-tightness filter (legacy).")
+    ap.add_argument("--max-breakout-atr", type=float, default=None,
+                    dest="max_breakout_atr",
+                    help="Skip fade entries where the bar closed more than N×ATR past the "
+                         "range edge. E.g. 0.5 means ignore large momentum breakouts. "
+                         "Default: disabled (fade all breakouts).")
     ap.add_argument("--lookback", type=int, default=10,
                     help="Range lookback in bars (validated default: 10).")
     # Overnight
@@ -1091,6 +1508,23 @@ def main() -> None:
                     help="Slippage limits in pips. Single global value or "
                          "per-pair (e.g. 'EURUSD=0.5 NZDUSD=2.0'). Defaults from "
                          "DEFAULT_MAX_SLIPPAGE_PIPS when --slippage-guard is set.")
+    # Price-improvement entry
+    ap.add_argument("--price-improvement", action="store_true", default=False,
+                    help="After a bar-close signal, wait for the market to reach the "
+                         "signal's entry price before submitting a market order. "
+                         "BUY: enter when ask ≤ bar-close. SELL: enter when bid ≥ bar-close. "
+                         "If price never improves within --expiry-minutes, the signal is dropped.")
+    # Pending limit entry
+    ap.add_argument("--pending-entry", action="store_true", default=False,
+                    help="Place a SELL LIMIT / BUY LIMIT at the midpoint of TP and SL "
+                         "instead of a market order. Entry price = (tp + sl) / 2, which "
+                         "is 0.5×ATR past the range edge — gives 1:1 R:R (1.5×ATR to "
+                         "each side). The order cancels automatically via MT5 expiry if "
+                         "not filled within --expiry-minutes. Pending orders also block "
+                         "double-entry (has_open_position checks orders too).")
+    ap.add_argument("--expiry-minutes", type=int, default=3,
+                    help="Minutes before an unfilled pending limit order is cancelled "
+                         "(default: 3). Only used with --pending-entry.")
     # Misc
     ap.add_argument("--dry-run", action="store_true",
                     help="Log signals + computed orders, never call order_send.")

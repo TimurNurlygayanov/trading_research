@@ -117,11 +117,12 @@ def evaluate_entry(df: pd.DataFrame, p: dict, pair_cfg: dict,
     df: OHLCV with DatetimeIndex (UTC), at least lookback + atr_period + 1 rows.
     Returns a signal dict or None.
     """
-    lookback   = p["lookback"]
-    atr_period = p["atr_period"]
-    tp_atr     = p["tp_atr"]
-    sl_atr     = p["sl_atr"]
-    tight_atr  = p.get("tight_atr")
+    lookback         = p["lookback"]
+    atr_period       = p["atr_period"]
+    tp_atr           = p["tp_atr"]
+    sl_atr           = p["sl_atr"]
+    tight_atr        = p.get("tight_atr")
+    max_breakout_atr = p.get("max_breakout_atr")  # skip if bar closed too far past range
 
     if len(df) < lookback + atr_period + 1:
         return None
@@ -149,9 +150,17 @@ def evaluate_entry(df: pd.DataFrame, p: dict, pair_cfg: dict,
     close = float(bar["Close"])
     if close > range_high:
         direction = -1 if FADE else 1
+        breakout_dist = close - range_high
     elif close < range_low:
         direction = 1 if FADE else -1
+        breakout_dist = range_low - close
     else:
+        return None
+
+    # Skip if the bar blew far past the range edge — that's momentum, not noise.
+    # Large breakouts (>max_breakout_atr × ATR past the range) tend to continue
+    # rather than revert; the fade strategy loses edge on them.
+    if max_breakout_atr is not None and atr_e > 0 and breakout_dist > max_breakout_atr * atr_e:
         return None
 
     tp_price = close + tp_atr * atr_e * direction
@@ -494,7 +503,8 @@ async def run_live(args, cfg) -> None:
     if args.lot is not None and args.risk_usd is not None:
         raise SystemExit("Pass exactly one of --lot or --risk-usd")
 
-    p     = cfg["params"]
+    p = dict(cfg["params"])  # copy — CLI flags may override
+    p["max_breakout_atr"] = args.max_breakout_atr
     pairs = args.pairs or list(cfg["pairs"].keys())
     max_spread_pips = _resolve_max_spreads(args.max_spread_pips, pairs) \
                       if args.spread_guard else None
@@ -754,6 +764,11 @@ def main() -> None:
                     help="Subset of pairs from strategy1_config.json")
     ap.add_argument("--no-filters", action="store_true",
                     help="Ignore the hour/day filters from config")
+    ap.add_argument("--max-breakout-atr", type=float, default=None,
+                    dest="max_breakout_atr",
+                    help="Skip fade entries where the bar closed more than N×ATR past the "
+                         "range edge. E.g. 0.5 skips large momentum breakouts. "
+                         "Default: disabled (all breakouts are faded).")
     ap.add_argument("--no-overnight", action="store_true",
                     help="Apply intraday-only defaults: close-by-hour=21, "
                          "no-entry-after-hour=20, no-friday-after-hour=17 (UTC). "
