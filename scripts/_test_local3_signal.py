@@ -5,8 +5,9 @@ local3 logic (faster than argmax over a 20-bar window):
   LONG  if dema[-1] > dema[-3] AND dema[-3] < dema[-5]   (V-shape, dema[-3] is the bottom)
   SHORT if dema[-1] < dema[-3] AND dema[-3] > dema[-5]   (inverted-V, dema[-3] is the top)
 
-Runs combined 1h+5m simulation on all 8 default pairs with both signal types
-and prints IS/OOS metrics side-by-side.
+Runs the 1h backtest on all 8 default pairs (per-pair, no FTMO filter — this
+script is purely a signal-shape comparison) and prints IS/OOS metrics
+side-by-side.
 """
 from __future__ import annotations
 import sys
@@ -52,28 +53,23 @@ def _compute_signals_local3(df, ema_period, window, min_swing_pips,
     return sigs
 
 
-def run_backtest(data_1h, data_5m, oos_start):
+def run_backtest(data_1h, oos_start):
     is_trades, oos_trades = [], []
     common_kw = dict(
-        ema_1h=9, ema_5m=20, window=20, min_swing=0.0,
-        lots_1h=2.0, lots_5m=1.0,
+        ema_1h=9, window=20, min_swing=0.0,
+        lots_1h=2.0,
         close_profit=True, daily_stop_usd=0.0,
-        min_bars_5m=3, min_bars_1h=2,
-        partial_usd=0.0, sl_pips=0.0,
-        sl_pips_1h=40.0, sl_pips_5m=0.0,
+        min_bars_1h=2,
+        partial_usd=0.0,
+        sl_pips_1h=40.0,
         max_dist_pips=0.0,
+        early_1h=True,
     )
     for pair in PAIRS:
         df1 = data_1h.get(pair)
-        df5 = data_5m.get(pair)
-        if df1 is None or df5 is None or df1.empty or df5.empty:
+        if df1 is None or df1.empty:
             continue
-        for t in cb.simulate_combined(
-            pair, df1, df5,
-            n_exit=0, no_block=False,
-            early_1h=True, early_5m=False,
-            **common_kw,
-        ):
+        for t in cb.simulate_pair(pair, df1, n_exit=0, **common_kw):
             (is_trades if t["time"] < oos_start else oos_trades).append(t)
     return is_trades, oos_trades
 
@@ -109,15 +105,13 @@ def metrics_line(trades, period):
 def main():
     print("Loading 1h data…")
     data_1h = _load_data_mt5(PAIRS, "2026-01-01", "2026-05-07", timeframe="1h")
-    print("Loading 5m data…")
-    data_5m = _load_data_mt5(PAIRS, "2026-01-01", "2026-05-07", timeframe="5m")
     oos_start = pd.Timestamp("2026-04-01", tz="UTC")
 
     print("\n" + "=" * 130)
     print("  ARGMAX/ARGMIN over 20-bar window  (current default)")
     print("=" * 130)
     cb._compute_signals = _original_compute_signals
-    is_t, oos_t = run_backtest(data_1h, data_5m, oos_start)
+    is_t, oos_t = run_backtest(data_1h, oos_start)
     print(metrics_line(is_t, "IS"))
     print(metrics_line(oos_t, "OOS"))
 
@@ -125,7 +119,7 @@ def main():
     print("  LOCAL3  (V-shape on dema[-1], dema[-3], dema[-5])")
     print("=" * 130)
     cb._compute_signals = _compute_signals_local3
-    is_t, oos_t = run_backtest(data_1h, data_5m, oos_start)
+    is_t, oos_t = run_backtest(data_1h, oos_start)
     print(metrics_line(is_t, "IS"))
     print(metrics_line(oos_t, "OOS"))
 

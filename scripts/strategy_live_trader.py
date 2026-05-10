@@ -1,42 +1,45 @@
 """
-Live trader: Combined 1h (EMA9) + 5m (EMA20) double-EMA extrema strategy.
+Live trader: 1h double-EMA extrema strategy.
 
 Signal logic (same as backtest):
   - Double EMA of HL/2: DEMA = EMA(EMA((H+L)/2, p), p)
   - argmax/argmin in sliding window → peak = SHORT, valley = LONG
-  - 1h signal is the anchor; 5m signal opposing active 1h direction is blocked
-  - Same direction: 1h + 5m positions may be open simultaneously (max 0.75 lots)
+  - 1h signal only (5m removed for FTMO compliance and lower trade frequency)
+
+FTMO compliance (always on):
+  - Hedge filter — blocks any new entry that would create OPPOSING exposure on
+    a currency the bot already holds.  e.g. LONG EURUSD blocks SHORT GBPUSD,
+    LONG USDCHF, and SHORT EURJPY (all would hedge USD or EUR exposure).
+  - Cumulative correlation cap — limits how many concurrent positions can share
+    the same currency direction.  --max-ccy-exposure=2 means at most 2 anti-USD
+    positions (or 2 long-EUR positions, etc.) may be open at once.
 
 Order management:
-  - Entry:  market order using Ask (BUY) or Bid (SELL)
-  - TP:     embedded in entry order (broker-side limit), fired when
-            Bid >= TP (long) or Ask <= TP (short)
-  - Exit:   market close on opposite signal; or broker closes via TP/SL
-  - SL:     1h positions get 40-pip hard SL by default (caps tail risk);
-            5m positions have no SL — close_profit handles 5m exits
+  - Entry: market order at Ask (BUY) or Bid (SELL)
+  - TP:    embedded in entry order (broker-side limit)
+  - SL:    hard 40-pip SL by default (caps tail risk)
+  - Exit:  market close on opposite 1h signal; or broker closes via TP/SL
 
 Daily circuit-breaker (portfolio-level):
   - Tracks realized + unrealized P&L across all pairs every poll cycle
   - If total daily P&L < -daily_stop_usd: close ALL positions, halt until midnight UTC
 
 Risk note (FTMO $100k swing — challenge-safe defaults):
-  - Default lots: 0.5 (1h) + 0.25 (5m) — quarter of backtest lot sizes
-  - OOS scaled worst day: ~-$64;  daily stop at -$1000 = 5x FTMO buffer
-  - Scale to 1.0 + 0.5 lots only after passing the challenge phase
+  - Default lots: 0.5
+  - Daily stop: $1000
 
 Usage
 -----
   python -m scripts.strategy_live_trader \\
       --login 1513313327 --server FTMO-Demo \\
       [--pairs EURUSD AUDUSD NZDUSD USDCHF USDCAD GBPUSD USDJPY EURJPY] \\
-      [--ema-1h 9] [--ema-5m 20] [--window 20] \\
-      [--lots-1h 0.5] [--lots-5m 0.25] \\
-      [--tp-1h-pips 10] [--tp-5m-pips 3] \\
-      [--sl-pips-1h 40] [--sl-pips-5m 0] \\
+      [--ema-1h 9] [--window 20] \\
+      [--lots-1h 0.5] \\
+      [--tp-1h-pips 10] [--sl-pips-1h 40] \\
       [--max-dist-pips 0] \\
+      [--max-ccy-exposure 2] \\
       [--daily-stop 1000] \\
-      [--min-bars-5m 3] [--min-bars-1h 2] \\
-      [--partial-usd 0.0]
+      [--min-bars-1h 2]
 """
 from __future__ import annotations
 
@@ -44,6 +47,7 @@ import argparse
 import logging
 import sys
 import time
+from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -78,9 +82,7 @@ log = logging.getLogger("live_trader")
 # ── Constants ─────────────────────────────────────────────────────────────────
 
 MAGIC             = 202601  # unique identifier for this bot's orders
-POLL_SECS         = 10      # normal sleep between polls
-POLL_SECS_NEAR    = 1       # tight polling within NEAR_BAR_SECS of bar close
-NEAR_BAR_SECS     = 12      # switch to tight polling this many seconds before bar
+POLL_SECS         = 30      # poll cycle (1h cadence — sub-second precision unneeded)
 BARS_NEEDED       = 120     # bars fetched per signal computation (warmup + window)
 MAX_SLIPPAGE      = 20      # max deviation in points (~2 pips for 5-digit broker)
 MAX_SPREAD_FACTOR = 3.0     # skip entry if spread > 3× typical full spread
@@ -92,13 +94,6 @@ SUNDAY_REOPEN_HOUR   = 21   # markets re-open Sunday ~21:00 UTC
 
 PAIRS_DEFAULT = ["EURUSD", "AUDUSD", "NZDUSD", "USDCHF", "USDCAD",
                  "GBPUSD", "USDJPY", "EURJPY"]
-
-# USD direction when BUYing a pair: -1 = buying this pair sells USD; +1 = buys USD
-USD_SIDE = {
-    "EURUSD": -1, "AUDUSD": -1, "NZDUSD": -1, "GBPUSD": -1,
-    "USDCHF": +1, "USDCAD": +1, "USDJPY": +1,
-    "EURGBP":  0, "EURJPY":  0,
-}
 
 TF_MT5: dict[str, int] = {}   # populated after mt5 import in main()
 
@@ -203,12 +198,6 @@ def pip_size(symbol: str) -> float:
 
 # ── Schedule helpers ──────────────────────────────────────────────────────────
 
-def _secs_to_next_5m_bar() -> float:
-    """Seconds remaining until the next 5m bar closes."""
-    now = datetime.now(timezone.utc)
-    secs_in_bar = (now.minute % 5) * 60 + now.second + now.microsecond / 1e6
-    return 300.0 - secs_in_bar
-
 def _is_friday_no_new_entry() -> bool:
     """True from Friday 14:00 UTC — no new positions until Monday."""
     now = datetime.now(timezone.utc)
@@ -223,6 +212,18 @@ def _is_weekend() -> bool:
         wd == 5 or                                        # Saturday
         (wd == 6 and now.hour < SUNDAY_REOPEN_HOUR)      # Sunday before open
     )
+
+
+# ── Currency exposure (FTMO hedge & correlation filter) ──────────────────────
+
+def position_currencies(symbol: str, direction: int) -> dict[str, int]:
+    """
+    Decompose a position into per-currency exposure.
+      LONG  EURUSD  → {EUR: +1, USD: -1}
+      SHORT USDJPY  → {USD: -1, JPY: +1}
+    Assumes a 6-char BASEQUO symbol.
+    """
+    return {symbol[:3]: direction, symbol[3:6]: -direction}
 
 
 # ── Orders ────────────────────────────────────────────────────────────────────
@@ -370,19 +371,14 @@ def portfolio_daily_pnl() -> float:
 
 class PairState:
     """Tracks bot-owned position state for one symbol."""
-    __slots__ = ("symbol", "pos_1h", "pos_5m", "last_bar_1h", "last_bar_5m",
-                 "bars_held_1h", "bars_held_5m", "partial_done_5m")
+    __slots__ = ("symbol", "pos_1h", "last_bar_1h", "bars_held_1h")
 
     def __init__(self, symbol: str):
         self.symbol      = symbol
-        # each pos: {"ticket": int, "dir": ±1, "lots": float}
+        # pos: {"ticket": int, "dir": ±1, "lots": float}
         self.pos_1h: Optional[dict] = None
-        self.pos_5m: Optional[dict] = None
         self.last_bar_1h: Optional[pd.Timestamp] = None
-        self.last_bar_5m: Optional[pd.Timestamp] = None
-        self.bars_held_1h    = 0   # 1h bars elapsed since pos_1h opened
-        self.bars_held_5m    = 0   # 5m bars elapsed since pos_5m opened
-        self.partial_done_5m = False  # True once partial close fired on pos_5m
+        self.bars_held_1h = 0   # 1h bars elapsed since pos_1h opened
 
 
 # ── Live trader ───────────────────────────────────────────────────────────────
@@ -391,21 +387,14 @@ class LiveTrader:
     def __init__(self, args):
         self.pairs        = args.pairs
         self.ema_1h       = args.ema_1h
-        self.ema_5m       = args.ema_5m
         self.window       = args.window
         self.lots_1h      = args.lots_1h
-        self.lots_5m      = args.lots_5m
         self.tp_1h        = args.tp_1h_pips
-        self.tp_5m        = args.tp_5m_pips
-        # SL: per-timeframe values; fall back to unified --sl-pips if not set
-        self.sl_1h        = args.sl_pips_1h if args.sl_pips_1h > 0 else args.sl_pips
-        self.sl_5m        = args.sl_pips_5m if args.sl_pips_5m > 0 else args.sl_pips
+        self.sl_1h        = args.sl_pips_1h
         self.daily_stop   = args.daily_stop
-        self.min_bars_5m  = args.min_bars_5m
         self.min_bars_1h  = args.min_bars_1h
-        self.partial_usd  = args.partial_usd
         self.max_dist_pips = args.max_dist_pips
-        self.usd_filter    = args.usd_filter
+        self.max_ccy_exp   = args.max_ccy_exposure
         self.early_1h      = args.early_1h
 
         self.states    = {p: PairState(p) for p in self.pairs}
@@ -430,108 +419,85 @@ class LiveTrader:
 
     def _close_all(self, reason: str) -> None:
         for st in self.states.values():
-            for attr in ("pos_1h", "pos_5m"):
-                pos = getattr(st, attr)
-                if pos:
-                    close_order(pos["ticket"], st.symbol,
-                                pos["dir"], pos["lots"], reason)
-                    setattr(st, attr, None)
+            if st.pos_1h:
+                close_order(st.pos_1h["ticket"], st.symbol,
+                            st.pos_1h["dir"], st.pos_1h["lots"], reason)
+                st.pos_1h = None
+                st.bars_held_1h = 0
 
     # ── State reconciliation ──────────────────────────────────────────────────
 
     def _sync(self) -> None:
         """
         Reconcile internal state with actual MT5 open positions.
-        Called every poll cycle to detect broker-side TP hits.
-        On startup also restores state from positions opened in a previous run.
-        Keeps pos["lots"] current so partial closes are reflected correctly.
+        Detects broker-side TP/SL hits and (on startup) restores positions
+        from a previous run.  Any legacy 5m positions left over from the old
+        combined strategy are closed immediately.
         """
         open_tickets: set[int] = set()
         positions = mt5.positions_get() or []
         for p in positions:
             if p.magic != MAGIC:
                 continue
+            cmt = p.comment or ""
+            # Close legacy 5m positions from the old combined strategy
+            if "5m" in cmt:
+                log.warning("Legacy 5m position detected — closing  %s ticket=%d",
+                            p.symbol, p.ticket)
+                dir_ = 1 if p.type == mt5.POSITION_TYPE_BUY else -1
+                close_order(p.ticket, p.symbol, dir_, p.volume, "5m_deprecated")
+                continue
             open_tickets.add(p.ticket)
             if p.symbol not in self.states:
                 continue
-            st  = self.states[p.symbol]
-            dir = 1 if p.type == mt5.POSITION_TYPE_BUY else -1
-            cmt = p.comment or ""
-            if "1h" in cmt:
-                if st.pos_1h is None:
-                    st.pos_1h = {"ticket": p.ticket, "dir": dir, "lots": p.volume}
-                    log.info("Restored 1h  %-8s  ticket=%d  dir=%+d",
-                             p.symbol, p.ticket, dir)
-                else:
-                    st.pos_1h["lots"] = p.volume   # keep lots current after any partial
-            elif "5m" in cmt:
-                if st.pos_5m is None:
-                    st.pos_5m = {"ticket": p.ticket, "dir": dir, "lots": p.volume}
-                    log.info("Restored 5m  %-8s  ticket=%d  dir=%+d",
-                             p.symbol, p.ticket, dir)
-                else:
-                    st.pos_5m["lots"] = p.volume   # keep lots current after any partial
+            st   = self.states[p.symbol]
+            dir_ = 1 if p.type == mt5.POSITION_TYPE_BUY else -1
+            if st.pos_1h is None:
+                st.pos_1h = {"ticket": p.ticket, "dir": dir_, "lots": p.volume}
+                log.info("Restored 1h  %-8s  ticket=%d  dir=%+d",
+                         p.symbol, p.ticket, dir_)
+            else:
+                st.pos_1h["lots"] = p.volume   # keep lots current
 
-        # Clear state for positions no longer in MT5 (TP hit or manual close)
+        # Clear state for positions no longer in MT5 (TP/SL hit or manual close)
         for st in self.states.values():
-            for attr in ("pos_1h", "pos_5m"):
-                pos = getattr(st, attr)
-                if pos and pos["ticket"] not in open_tickets:
-                    log.info("%-8s  %s ticket=%d closed (TP/manual)",
-                             st.symbol, attr, pos["ticket"])
-                    setattr(st, attr, None)
-                    if attr == "pos_1h":
-                        st.bars_held_1h = 0
-                    else:
-                        st.bars_held_5m = 0
-                        st.partial_done_5m = False
+            if st.pos_1h and st.pos_1h["ticket"] not in open_tickets:
+                log.info("%-8s  1h ticket=%d closed (TP/SL/manual)",
+                         st.symbol, st.pos_1h["ticket"])
+                st.pos_1h = None
+                st.bars_held_1h = 0
 
-    # ── Partial close ─────────────────────────────────────────────────────────
+    # ── FTMO hedge & correlation filter ───────────────────────────────────────
 
-    def _check_partial_close(self) -> None:
-        """Close half the 5m position when its unrealized P&L >= partial_usd."""
-        if self.partial_usd <= 0:
-            return
+    def _net_currency_exposure(self) -> dict[str, int]:
+        """Net per-currency exposure in number of bot positions (sign = direction)."""
+        net: dict[str, int] = defaultdict(int)
         for st in self.states.values():
-            if not st.pos_5m or st.partial_done_5m:
-                continue
-            mt5_pos = mt5.positions_get(ticket=st.pos_5m["ticket"])
-            if not mt5_pos:
-                continue
-            profit = mt5_pos[0].profit
-            if profit >= self.partial_usd:
-                half = round(st.pos_5m["lots"] / 2, 2)
-                log.info("PARTIAL  %-8s  5m  profit=%.2f >= %.2f  closing %.2f lots",
-                         st.symbol, profit, self.partial_usd, half)
-                if close_order(st.pos_5m["ticket"], st.symbol,
-                               st.pos_5m["dir"], half, "partial_close"):
-                    st.pos_5m["lots"] = round(st.pos_5m["lots"] - half, 2)
-                    st.partial_done_5m = True
-
-    # ── USD correlation filter ────────────────────────────────────────────────
-
-    def _net_usd_exposure(self) -> int:
-        """Net USD direction across all open positions (>0 = net long USD, <0 = net short)."""
-        net = 0
-        for st in self.states.values():
-            usd = USD_SIDE.get(st.symbol, 0)
             if st.pos_1h:
-                net += st.pos_1h["dir"] * usd
-            if st.pos_5m:
-                net += st.pos_5m["dir"] * usd
+                for ccy, side in position_currencies(
+                        st.symbol, st.pos_1h["dir"]).items():
+                    net[ccy] += side
         return net
 
-    def _usd_allowed(self, symbol: str, direction: int) -> bool:
-        """Return False if opening this position would put us on both sides of USD."""
-        if not self.usd_filter:
-            return True
-        net = self._net_usd_exposure()
-        if net == 0:
-            return True
-        new_usd = direction * USD_SIDE.get(symbol, 0)
-        if new_usd == 0:
-            return True  # non-USD pair or neutral
-        return (net > 0) == (new_usd > 0)
+    def _entry_blocked(self, symbol: str, direction: int) -> Optional[str]:
+        """
+        FTMO hedge & cumulative-correlation gate.
+
+        Returns the reason a new entry is blocked, or None if allowed.
+          - hedge_<CCY>    : opposing exposure on a currency we already hold
+          - max_exp_<CCY>  : would push net exposure above --max-ccy-exposure
+        """
+        new_exp = position_currencies(symbol, direction)
+        cur_net = self._net_currency_exposure()
+        for ccy, side in new_exp.items():
+            cur = cur_net.get(ccy, 0)
+            # Hedge: any opposing sign on a currency we already hold
+            if cur != 0 and (cur > 0) != (side > 0):
+                return f"hedge_{ccy}"
+            # Cumulative cap on per-currency net exposure
+            if abs(cur + side) > self.max_ccy_exp:
+                return f"max_exp_{ccy}"
+        return None
 
     # ── Signal handling ───────────────────────────────────────────────────────
 
@@ -553,15 +519,7 @@ class LiveTrader:
             st.pos_1h = None
             st.bars_held_1h = 0
 
-            # 1h flip also clears a 5m position that was in the OLD 1h direction
-            if st.pos_5m and st.pos_5m["dir"] == -sig:
-                close_order(st.pos_5m["ticket"], st.symbol,
-                            st.pos_5m["dir"], st.pos_5m["lots"], "flip_1h_clear")
-                st.pos_5m = None
-                st.bars_held_5m = 0
-                st.partial_done_5m = False
-
-        # Distance filter: skip entry if close is too far from DEMA
+        # Distance filter
         if self.max_dist_pips > 0:
             dist = dema_distance_pips(bars, self.ema_1h, st.symbol)
             if dist > self.max_dist_pips:
@@ -569,9 +527,12 @@ class LiveTrader:
                          st.symbol, dist, self.max_dist_pips)
                 return
 
-        if not self._usd_allowed(st.symbol, sig):
-            log.info("%-8s  1h entry blocked — USD filter  net_usd=%+d",
-                     st.symbol, self._net_usd_exposure())
+        # FTMO hedge / correlation filter (always on)
+        block_reason = self._entry_blocked(st.symbol, sig)
+        if block_reason:
+            log.info("%-8s  1h entry blocked — %s  net_ccy=%s",
+                     st.symbol, block_reason,
+                     dict(self._net_currency_exposure()))
             return
 
         if _is_friday_no_new_entry():
@@ -580,115 +541,49 @@ class LiveTrader:
             return
 
         ticket = open_order(st.symbol, sig, self.lots_1h,
-                            self.tp_1h, self.sl_1h, f"ema_1h_{'+' if sig==1 else '-'}")
+                            self.tp_1h, self.sl_1h,
+                            f"ema_1h_{'+' if sig == 1 else '-'}")
         if ticket:
             st.pos_1h = {"ticket": ticket, "dir": sig, "lots": self.lots_1h}
             st.bars_held_1h = 0
 
-    def _handle_5m(self, st: PairState, sig: int, bars: pd.DataFrame) -> None:
-        if sig == 0:
-            return
-
-        # Block: 5m signal opposing active 1h direction
-        if st.pos_1h and sig == -st.pos_1h["dir"]:
-            log.debug("%-8s  5m %+d blocked by 1h %+d", st.symbol, sig, st.pos_1h["dir"])
-            return
-
-        if st.pos_5m:
-            if sig == st.pos_5m["dir"]:
-                return  # already in this direction
-            # min_bars guard: don't exit on a whipsaw signal too soon after entry
-            if st.bars_held_5m < self.min_bars_5m:
-                log.debug("%-8s  5m exit blocked (bars_held=%d < min=%d)",
-                          st.symbol, st.bars_held_5m, self.min_bars_5m)
-                return
-            # 5m direction flip — close and reopen (unless blocked by 1h)
-            close_order(st.pos_5m["ticket"], st.symbol,
-                        st.pos_5m["dir"], st.pos_5m["lots"], "flip_5m")
-            st.pos_5m = None
-            st.bars_held_5m = 0
-            st.partial_done_5m = False
-
-        # Distance filter: skip entry if close is too far from DEMA
-        if self.max_dist_pips > 0:
-            dist = dema_distance_pips(bars, self.ema_5m, st.symbol)
-            if dist > self.max_dist_pips:
-                log.debug("%-8s  5m entry skipped — dist=%.1f pips > max=%.1f",
-                          st.symbol, dist, self.max_dist_pips)
-                return
-
-        if not self._usd_allowed(st.symbol, sig):
-            log.debug("%-8s  5m entry blocked — USD filter  net_usd=%+d",
-                      st.symbol, self._net_usd_exposure())
-            return
-
-        if _is_friday_no_new_entry():
-            log.debug("%-8s  5m entry skipped — Friday cutoff (≥%02d:00 UTC)",
-                      st.symbol, FRIDAY_NO_ENTRY_HOUR)
-            return
-
-        ticket = open_order(st.symbol, sig, self.lots_5m,
-                            self.tp_5m, self.sl_5m, f"ema_5m_{'+' if sig==1 else '-'}")
-        if ticket:
-            st.pos_5m = {"ticket": ticket, "dir": sig, "lots": self.lots_5m}
-            st.bars_held_5m = 0
-            st.partial_done_5m = False
-
     # ── Per-pair processing ───────────────────────────────────────────────────
 
     def _process_pair(self, st: PairState) -> None:
-        # 1h: check for new closed bar
         bars_1h = get_bars(st.symbol, "1h", BARS_NEEDED)
-        if bars_1h is not None and not bars_1h.empty:
-            bar_ts = bars_1h.index[-1]
-            if bar_ts != st.last_bar_1h:
-                st.last_bar_1h = bar_ts
-                if st.pos_1h:
-                    st.bars_held_1h += 1
-                sig = compute_signal(bars_1h, self.ema_1h, self.window,
-                                     early_entry=self.early_1h)
-                log.debug("%-8s  1h bar %s  sig=%+d  bars_held=%d",
-                          st.symbol, bar_ts, sig, st.bars_held_1h)
-                self._handle_1h(st, sig, bars_1h)
-
-        # 5m: check for new closed bar
-        bars_5m = get_bars(st.symbol, "5m", BARS_NEEDED)
-        if bars_5m is not None and not bars_5m.empty:
-            bar_ts = bars_5m.index[-1]
-            if bar_ts != st.last_bar_5m:
-                st.last_bar_5m = bar_ts
-                if st.pos_5m:
-                    st.bars_held_5m += 1
-                sig = compute_signal(bars_5m, self.ema_5m, self.window)
-                log.debug("%-8s  5m bar %s  sig=%+d  bars_held=%d",
-                          st.symbol, bar_ts, sig, st.bars_held_5m)
-                self._handle_5m(st, sig, bars_5m)
+        if bars_1h is None or bars_1h.empty:
+            return
+        bar_ts = bars_1h.index[-1]
+        if bar_ts == st.last_bar_1h:
+            return
+        st.last_bar_1h = bar_ts
+        if st.pos_1h:
+            st.bars_held_1h += 1
+        sig = compute_signal(bars_1h, self.ema_1h, self.window,
+                             early_entry=self.early_1h)
+        log.debug("%-8s  1h bar %s  sig=%+d  bars_held=%d",
+                  st.symbol, bar_ts, sig, st.bars_held_1h)
+        self._handle_1h(st, sig, bars_1h)
 
     # ── Main loop ─────────────────────────────────────────────────────────────
 
     def run(self) -> None:
         log.info(
-            "Starting  pairs=%s  ema=%d/%d  w=%d  "
-            "lots=%.1f/%.1f  tp=%.0f/%.0f pips  "
-            "sl_1h=%.0f sl_5m=%.0f pips  stop=$%.0f  "
-            "min_bars=%d/%d  partial=$%.0f  max_dist=%.1f pips  usd_filter=%s",
-            self.pairs, self.ema_1h, self.ema_5m, self.window,
-            self.lots_1h, self.lots_5m,
-            self.tp_1h, self.tp_5m,
-            self.sl_1h, self.sl_5m, self.daily_stop,
-            self.min_bars_5m, self.min_bars_1h,
-            self.partial_usd, self.max_dist_pips,
-            "on" if self.usd_filter else "off",
+            "Starting  pairs=%s  ema=%d  w=%d  lots=%.2f  "
+            "tp=%.0f sl=%.0f pips  stop=$%.0f  min_bars=%d  "
+            "max_dist=%.1f pips  max_ccy_exp=%d",
+            self.pairs, self.ema_1h, self.window,
+            self.lots_1h, self.tp_1h, self.sl_1h, self.daily_stop,
+            self.min_bars_1h, self.max_dist_pips, self.max_ccy_exp,
         )
 
-        self._sync()   # restore any positions from a previous run
+        self._sync()   # restore positions; close any legacy 5m
 
         while True:
             try:
                 # Weekend: close any open positions and sleep until market re-opens
                 if _is_weekend():
-                    has_open = any(st.pos_1h or st.pos_5m
-                                   for st in self.states.values())
+                    has_open = any(st.pos_1h for st in self.states.values())
                     if has_open:
                         log.warning("Weekend close  %s — closing all positions",
                                     datetime.now(timezone.utc).strftime("%A %H:%M UTC"))
@@ -703,8 +598,7 @@ class LiveTrader:
                 if self._check_daily_stop():
                     continue
 
-                self._sync()              # detect TP hits; reconcile with broker state
-                self._check_partial_close()  # close half 5m pos when profitable
+                self._sync()              # detect TP/SL hits; reconcile broker state
 
                 for st in self.states.values():
                     self._process_pair(st)
@@ -715,10 +609,7 @@ class LiveTrader:
             except Exception:
                 log.exception("Unhandled error in main loop")
 
-            # Smart sleep: tight polling near 5m bar boundaries for fast detection
-            stt = _secs_to_next_5m_bar()
-            time.sleep(POLL_SECS_NEAR if stt < NEAR_BAR_SECS
-                       else min(stt - NEAR_BAR_SECS, POLL_SECS))
+            time.sleep(POLL_SECS)
 
         log.info("Shutdown — closing all open positions")
         self._close_all("shutdown")
@@ -730,7 +621,7 @@ class LiveTrader:
 def main() -> None:
     ap = argparse.ArgumentParser(
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-        description="Live trader: combined 1h+5m double-EMA strategy",
+        description="Live trader: 1h double-EMA strategy with FTMO hedge filter",
     )
     ap.add_argument("--login",        type=int,   required=True)
     ap.add_argument("--password",     default="",
@@ -740,34 +631,23 @@ def main() -> None:
                     help="Path to terminal64.exe (auto-detected if omitted)")
     ap.add_argument("--pairs",        nargs="+",  default=PAIRS_DEFAULT)
     ap.add_argument("--ema-1h",       type=int,   default=9)
-    ap.add_argument("--ema-5m",       type=int,   default=20)
     ap.add_argument("--window",       type=int,   default=20)
     ap.add_argument("--lots-1h",      type=float, default=0.5,
                     help="Lots per 1h entry (start here, scale after live validation)")
-    ap.add_argument("--lots-5m",      type=float, default=0.25,
-                    help="Lots per 5m entry")
     ap.add_argument("--tp-1h-pips",   type=float, default=10.0,
-                    help="Take-profit in pips for 1h positions (~90%% hit rate)")
-    ap.add_argument("--tp-5m-pips",   type=float, default=3.0,
-                    help="Take-profit in pips for 5m positions (~85%% hit rate)")
-    ap.add_argument("--sl-pips",      type=float, default=0.0,
-                    help="Hard stop-loss in pips for all positions (0 = use per-TF values)")
+                    help="Take-profit in pips for 1h positions")
     ap.add_argument("--sl-pips-1h",   type=float, default=40.0,
                     help="Hard SL for 1h positions in pips (recommended: 40; 0=disabled)")
-    ap.add_argument("--sl-pips-5m",   type=float, default=0.0,
-                    help="Hard SL for 5m positions in pips (0=disabled; close_profit handles exits)")
     ap.add_argument("--max-dist-pips", type=float, default=0.0,
-                    help="Skip entry if close > N pips from DEMA (0=disabled; backtest shows 10+ hurts)")
+                    help="Skip entry if close > N pips from DEMA (0=disabled)")
+    ap.add_argument("--max-ccy-exposure", type=int, default=2,
+                    help="FTMO cumulative-correlation cap: max simultaneous positions "
+                         "sharing the same currency direction (e.g. 2 = at most 2 "
+                         "anti-USD positions can be open at once)")
     ap.add_argument("--daily-stop",   type=float, default=1000.0,
                     help="Portfolio daily loss limit USD — closes all and halts (0=off)")
-    ap.add_argument("--min-bars-5m",  type=int,   default=3,
-                    help="Min 5m bars held before an opposite signal can exit the position")
     ap.add_argument("--min-bars-1h",  type=int,   default=2,
                     help="Min 1h bars held before an opposite signal can exit the position")
-    ap.add_argument("--partial-usd",  type=float, default=0.0,
-                    help="Close half of 5m position when unrealized P&L >= USD (0=off)")
-    ap.add_argument("--usd-filter",   action="store_true", default=False,
-                    help="Block new entries that would oppose net USD exposure across pairs")
     ap.add_argument("--early-1h",     action="store_true", default=True,
                     help="Fire 1h signal on the peak/valley bar itself (1 bar earlier; default ON)")
     ap.add_argument("--no-early-1h",  action="store_false", dest="early_1h",
@@ -781,7 +661,6 @@ def main() -> None:
 
     # Populate timeframe constants after mt5 is imported
     TF_MT5["1h"] = mt5.TIMEFRAME_H1
-    TF_MT5["5m"] = mt5.TIMEFRAME_M5
 
     if not mt5_connect(args.login, args.password, args.server, args.mt5_path):
         sys.exit(1)
