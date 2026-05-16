@@ -50,7 +50,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from scripts.strategy1_regime_backtest import (
-    _load_data_mt5, _ema,
+    _load_data_mt5, _ema, _atr,
     PAIRS, HALF_SPREAD_PIPS, PIP_VALUE, PIP_SIZE, PIP_SIZE_MAP, COMMISSION_PER_LOT,
 )
 
@@ -126,8 +126,13 @@ def simulate_pair(
     partial_usd:    float = 0.0,
     n_exit:         int   = 0,
     sl_pips_1h:     float = 0.0,
+    tp_pips_1h:     float = 0.0,
     max_dist_pips:  float = 0.0,
     early_1h:       bool  = True,
+    reverse_signals: bool  = False,
+    atr_period:     int   = 14,
+    sl_atr_mult:    float = 0.0,
+    tp_atr_mult:    float = 0.0,
 ) -> list[dict]:
     """
     Backtest a single pair on 1h bars.  No cross-pair correlation filter —
@@ -137,6 +142,7 @@ def simulate_pair(
     sp      = HALF_SPREAD_PIPS[pair] * pip_val
     comm    = COMMISSION_PER_LOT
     _ps     = PIP_SIZE_MAP.get(pair, PIP_SIZE)
+    atr_on  = sl_atr_mult > 0 or tp_atr_mult > 0
 
     def _net(gross: float, lots: float) -> float:
         return gross - 2.0 * sp * lots - comm * lots
@@ -145,10 +151,12 @@ def simulate_pair(
                             early_entry=early_1h, pip_size=_ps)
     dema = _ema(_ema((df_1h["High"].values + df_1h["Low"].values) / 2.0,
                      ema_1h), ema_1h)
+    atr_v = _atr(df_1h, atr_period) if atr_on else None
 
     def _empty_pos() -> dict:
         return {"dir": 0, "entry": 0.0, "idx": -1, "time": None,
-                "tf": "1h", "lots_rem": 0.0, "partial_done": False}
+                "tf": "1h", "lots_rem": 0.0, "partial_done": False,
+                "atr_entry": 0.0}
 
     pos: dict       = _empty_pos()
     trades: list[dict] = []
@@ -202,6 +210,39 @@ def simulate_pair(
                 trades.append(t); day_pnl += t["net"]
                 pos = _empty_pos()
 
+        # Hard TP — checked intrabar via bar's H/L (SL above takes priority)
+        if tp_pips_1h > 0 and pos["dir"] != 0:
+            tp_px = pos["entry"] + pos["dir"] * tp_pips_1h * _ps
+            tp_hit = (pos["dir"] == 1 and h >= tp_px) or \
+                     (pos["dir"] == -1 and l <= tp_px)
+            if tp_hit:
+                t = _close(pos, tp_px, ts, pos["lots_rem"], "tp_1h",
+                           i - pos["idx"])
+                trades.append(t); day_pnl += t["net"]
+                pos = _empty_pos()
+
+        # ATR-based SL/TP — checked intrabar via bar's H/L.
+        # SL has priority over TP when both could hit on the same bar.
+        if atr_on and pos["dir"] != 0 and pos["atr_entry"] > 0:
+            if sl_atr_mult > 0:
+                sl_px = pos["entry"] - pos["dir"] * sl_atr_mult * pos["atr_entry"]
+                sl_hit = (pos["dir"] == 1 and l <= sl_px) or \
+                         (pos["dir"] == -1 and h >= sl_px)
+                if sl_hit:
+                    t = _close(pos, sl_px, ts, pos["lots_rem"], "sl_atr",
+                               i - pos["idx"])
+                    trades.append(t); day_pnl += t["net"]
+                    pos = _empty_pos()
+            if pos["dir"] != 0 and tp_atr_mult > 0:
+                tp_px = pos["entry"] + pos["dir"] * tp_atr_mult * pos["atr_entry"]
+                tp_hit = (pos["dir"] == 1 and h >= tp_px) or \
+                         (pos["dir"] == -1 and l <= tp_px)
+                if tp_hit:
+                    t = _close(pos, tp_px, ts, pos["lots_rem"], "tp_atr",
+                               i - pos["idx"])
+                    trades.append(t); day_pnl += t["net"]
+                    pos = _empty_pos()
+
         # Partial close: lock half when half-lot net >= partial_usd
         _partial = False
         if partial_usd > 0 and pos["dir"] != 0 and not pos["partial_done"]:
@@ -227,6 +268,8 @@ def simulate_pair(
 
         # Signal exit / entry
         sig = int(sigs[i]) if i < len(sigs) else 0
+        if reverse_signals:
+            sig = -sig
         if sig != 0 and sig != pos["dir"]:
             too_early = pos["dir"] != 0 and (i - pos["idx"]) < min_bars_1h
             exit_conf = pos["dir"] == 0 or _exit_confirmed(pos["dir"], i)
@@ -241,7 +284,8 @@ def simulate_pair(
                     else:
                         pos = {"dir": sig, "entry": c, "idx": i, "time": ts,
                                "tf": "1h", "lots_rem": lots_1h,
-                               "partial_done": False}
+                               "partial_done": False,
+                               "atr_entry": float(atr_v[i]) if atr_on else 0.0}
                 else:
                     day_pause = True
                     pos       = _empty_pos()
@@ -263,9 +307,14 @@ def simulate_joint(
     min_bars_1h:      int   = 2,
     partial_usd:      float = 0.0,
     sl_pips_1h:       float = 0.0,
+    tp_pips_1h:       float = 0.0,
     max_dist_pips:    float = 0.0,
     max_ccy_exposure: int   = 2,
     early_1h:         bool  = True,
+    reverse_signals:  bool  = False,
+    atr_period:       int   = 14,
+    sl_atr_mult:      float = 0.0,
+    tp_atr_mult:      float = 0.0,
 ) -> list[dict]:
     """
     Run all pairs through a single merged 1h timeline with FTMO compliance:
@@ -274,9 +323,12 @@ def simulate_joint(
       - Cumulative cap: refuses any entry that would push the net per-currency
         exposure above max_ccy_exposure (in number of positions).
     """
+    atr_on = sl_atr_mult > 0 or tp_atr_mult > 0
+
     def _ep() -> dict:
         return {"dir": 0, "entry": 0.0, "idx": -1, "time": None,
-                "tf": "1h", "lots_rem": 0.0, "partial_done": False}
+                "tf": "1h", "lots_rem": 0.0, "partial_done": False,
+                "atr_entry": 0.0}
 
     # Precompute per-pair data
     pp: dict[str, dict] = {}
@@ -291,6 +343,7 @@ def simulate_joint(
                                        early_entry=early_1h, pip_size=_ps),
             "dema":   _ema(_ema((df["High"].values + df["Low"].values) / 2.0,
                                 ema_1h), ema_1h),
+            "atr":    _atr(df, atr_period) if atr_on else None,
             "ts_map": {ts: i for i, ts in enumerate(df.index)},
             "pv":     PIP_VALUE[pair],
             "sp":     HALF_SPREAD_PIPS[pair] * PIP_VALUE[pair],
@@ -364,6 +417,33 @@ def simulate_joint(
                     all_trades.append(t); d["day_pnl"] += t["net"]
                     d["pos"] = _ep(); p = d["pos"]
 
+            # Hard TP (SL above takes priority)
+            if tp_pips_1h > 0 and p["dir"] != 0:
+                tp_px = p["entry"] + p["dir"] * tp_pips_1h * d["ps"]
+                if (p["dir"] == 1 and h >= tp_px) or (p["dir"] == -1 and l <= tp_px):
+                    t = _trade(p, tp_px, ts, p["lots_rem"], "tp_1h",
+                               i - p["idx"], pair)
+                    all_trades.append(t); d["day_pnl"] += t["net"]
+                    d["pos"] = _ep(); p = d["pos"]
+
+            # ATR-based SL/TP — SL has priority over TP on same bar
+            if atr_on and p["dir"] != 0 and p["atr_entry"] > 0:
+                if sl_atr_mult > 0:
+                    sl_px = p["entry"] - p["dir"] * sl_atr_mult * p["atr_entry"]
+                    if (p["dir"] == 1 and l <= sl_px) or (p["dir"] == -1 and h >= sl_px):
+                        t = _trade(p, sl_px, ts, p["lots_rem"], "sl_atr",
+                                   i - p["idx"], pair)
+                        all_trades.append(t); d["day_pnl"] += t["net"]
+                        d["pos"] = _ep(); p = d["pos"]
+                if p["dir"] != 0 and tp_atr_mult > 0:
+                    tp_px = p["entry"] + p["dir"] * tp_atr_mult * p["atr_entry"]
+                    if (p["dir"] == 1 and h >= tp_px) or (p["dir"] == -1 and l <= tp_px):
+                        t = _trade(p, tp_px, ts, p["lots_rem"], "tp_atr",
+                                   i - p["idx"], pair)
+                        all_trades.append(t); d["day_pnl"] += t["net"]
+                        d["pos"] = _ep(); p = d["pos"]
+
+            """
             # Partial close
             _partial = False
             if partial_usd > 0 and p["dir"] != 0 and not p["partial_done"]:
@@ -389,9 +469,12 @@ def simulate_joint(
                                i - p["idx"], pair)
                     all_trades.append(t); d["day_pnl"] += t["net"]
                     d["pos"] = _ep(); p = d["pos"]
+            """
 
             # Signal exit / entry
             sig = int(d["sigs"][i]) if i < len(d["sigs"]) else 0
+            if reverse_signals:
+                sig = -sig
             if sig != 0 and sig != p["dir"]:
                 too_early = p["dir"] != 0 and (i - p["idx"]) < min_bars_1h
                 if not too_early:
@@ -407,7 +490,8 @@ def simulate_joint(
                             d["pos"] = {"dir": sig, "entry": c, "idx": i,
                                         "time": ts, "tf": "1h",
                                         "lots_rem": lots_1h,
-                                        "partial_done": False}
+                                        "partial_done": False,
+                                        "atr_entry": float(d["atr"][i]) if atr_on else 0.0}
                         else:
                             d["pos"] = _ep()
                     else:
@@ -471,6 +555,8 @@ def main() -> None:
                     help="New-extreme confirmation lookback bars (0=off; per-pair sim only)")
     ap.add_argument("--sl-pips-1h",   type=float, default=40.0,
                     help="Hard SL for 1h positions in pips (0=disabled)")
+    ap.add_argument("--tp-pips-1h",   type=float, default=0.0,
+                    help="Hard TP for 1h positions in pips (0=disabled; SL takes priority on same bar)")
     ap.add_argument("--max-dist-pips", type=float, default=0.0,
                     help="Skip entry if close > N pips from DEMA (0=disabled)")
     ap.add_argument("--max-ccy-exposure", type=int, default=2,
@@ -482,6 +568,14 @@ def main() -> None:
                     help="Fire 1h signal on the peak/valley bar itself (1 bar earlier; default ON)")
     ap.add_argument("--no-early-1h",  action="store_false", dest="early_1h",
                     help="Disable early-1h (revert to bar-after-peak confirmation)")
+    ap.add_argument("--reverse-signals", action="store_true", default=False,
+                    help="Flip every signal: LONG↔SHORT. Tests trend-follow instead of fade.")
+    ap.add_argument("--atr-period",   type=int,   default=14,
+                    help="ATR lookback period for ATR-based SL/TP")
+    ap.add_argument("--sl-atr-mult",  type=float, default=0.0,
+                    help="SL distance = N × ATR_at_entry (0 = use fixed --sl-pips-1h)")
+    ap.add_argument("--tp-atr-mult",  type=float, default=0.0,
+                    help="TP distance = N × ATR_at_entry (0 = no TP, use signal flip / close_profit)")
     ap.add_argument("--pairs",        nargs="+",  default=None)
     ap.add_argument("--login",        type=int,   default=None)
     ap.add_argument("--password",     default=None)
@@ -491,6 +585,13 @@ def main() -> None:
 
     pairs     = args.pairs or PAIRS
     oos_start = pd.Timestamp(args.oos_start, tz="UTC")
+
+    # When any TP is active, the 1-2 pip close_profit ratchet would override
+    # it on almost every bar — auto-disable so the TP test is clean.
+    if (args.tp_atr_mult > 0 or args.tp_pips_1h > 0) and args.close_profit:
+        log.info("TP active → auto-disabling close_profit "
+                 "(use --close-profit explicitly to keep both)")
+        args.close_profit = False
 
     log.info("Loading 1h data…")
     data_1h = _load_data_mt5(pairs, args.start, args.end, timeframe="1h",
@@ -515,8 +616,13 @@ def main() -> None:
                 partial_usd=args.partial_usd,
                 n_exit=args.n_exit,
                 sl_pips_1h=args.sl_pips_1h,
+                tp_pips_1h=args.tp_pips_1h,
                 max_dist_pips=args.max_dist_pips,
                 early_1h=args.early_1h,
+                reverse_signals=args.reverse_signals,
+                atr_period=args.atr_period,
+                sl_atr_mult=args.sl_atr_mult,
+                tp_atr_mult=args.tp_atr_mult,
             ):
                 (all_is if t["time"] < oos_start else all_oos).append(t)
     else:
@@ -530,9 +636,14 @@ def main() -> None:
             min_bars_1h=args.min_bars_1h,
             partial_usd=args.partial_usd,
             sl_pips_1h=args.sl_pips_1h,
+            tp_pips_1h=args.tp_pips_1h,
             max_dist_pips=args.max_dist_pips,
             max_ccy_exposure=args.max_ccy_exposure,
             early_1h=args.early_1h,
+            reverse_signals=args.reverse_signals,
+            atr_period=args.atr_period,
+            sl_atr_mult=args.sl_atr_mult,
+            tp_atr_mult=args.tp_atr_mult,
         )
         for t in all_trades:
             (all_is if t["time"] < oos_start else all_oos).append(t)
@@ -545,10 +656,14 @@ def main() -> None:
         mode = "per-pair" if args.per_pair else f"joint (max_ccy_exp={args.max_ccy_exposure})"
         tags = ""
         if args.early_1h: tags += "  early_1h=on"
+        if args.reverse_signals: tags += "  REVERSED"
+        if args.sl_atr_mult > 0 or args.tp_atr_mult > 0:
+            tags += f"  atr({args.atr_period}):sl={args.sl_atr_mult}x/tp={args.tp_atr_mult}x"
         print(f"  {oos_label}  ema_1h={args.ema_1h}  w={args.window}  "
               f"sw={args.min_swing}  lots_1h={args.lots_1h}  "
               f"min_bars={args.min_bars_1h}  partial=${args.partial_usd:.0f}  "
-              f"sl1h={args.sl_pips_1h:.0f}p  dist={args.max_dist_pips:.0f}p  "
+              f"sl1h={args.sl_pips_1h:.0f}p  tp1h={args.tp_pips_1h:.0f}p  "
+              f"dist={args.max_dist_pips:.0f}p  "
               f"cp={args.close_profit}  mode={mode}{tags}")
         print(f"{'='*W}")
         print(f"  Trades: {m['n']}")
@@ -573,6 +688,43 @@ def main() -> None:
             print(f"  Days exceeding -$1000: {sum(1 for p in pnls if p < -1000)}")
             print(f"  Days exceeding -$2000: {sum(1 for p in pnls if p < -2000)}")
             print(f"  Days exceeding -$5000: {sum(1 for p in pnls if p < -5000)}")
+
+            # ── Breakdowns: by pair, by exit type, by entry hour ──
+            def _group(key_fn):
+                g: dict = {}
+                for t in trades:
+                    k = key_fn(t)
+                    b = g.setdefault(k, {"n": 0, "pnl": 0.0, "wins": 0})
+                    b["n"]   += 1
+                    b["pnl"] += t["net"]
+                    b["wins"] += 1 if t["won"] else 0
+                return g
+
+            def _fmt(label_w: int, rows: list[tuple]) -> None:
+                # rows: list of (key, n, pnl, wins) sorted by pnl ascending (worst first)
+                for k, n, pnl, wins in rows:
+                    win_pct = (wins / n * 100) if n else 0.0
+                    ev      = (pnl / n)        if n else 0.0
+                    print(f"    {str(k):<{label_w}}  n={n:>4}  "
+                          f"pnl=${pnl:>+9,.0f}  win%={win_pct:>4.1f}  ev=${ev:>+7.1f}")
+
+            by_pair = _group(lambda t: t["pair"])
+            print(f"\n  By pair:")
+            _fmt(8, sorted([(k, v["n"], v["pnl"], v["wins"])
+                            for k, v in by_pair.items()],
+                           key=lambda r: r[2]))
+
+            by_exit = _group(lambda t: t["exit_type"])
+            print(f"\n  By exit type:")
+            _fmt(14, sorted([(k, v["n"], v["pnl"], v["wins"])
+                             for k, v in by_exit.items()],
+                            key=lambda r: r[2]))
+
+            by_hour = _group(lambda t: t["time"].hour)
+            print(f"\n  By entry hour (broker time, UTC+3):")
+            _fmt(2, sorted([(f"{k:02d}", v["n"], v["pnl"], v["wins"])
+                            for k, v in by_hour.items()],
+                           key=lambda r: int(r[0])))
 
 
 if __name__ == "__main__":
