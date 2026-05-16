@@ -119,32 +119,29 @@ def add_daily_candles(df: pd.DataFrame) -> pd.DataFrame:
 
 def find_swing_points(high: np.ndarray, low: np.ndarray, lookback: int) -> tuple:
     """
-    Detect swing highs and lows.
-    A swing high at i: high[i] > high[i-k] for all k in [-lookback, lookback], k != 0
-    A swing low at i: low[i] < low[i-k] for all k in [-lookback, lookback], k != 0
+    Detect swing points with NO LOOKAHEAD (realistic).
+
+    A swing low is confirmed at bar i when:
+      - low[i] is the minimum of low[i-lookback:i+1]
+      - AND we've seen higher lows before it
+
+    This only uses past/current data, no future bars.
     """
     n = len(high)
     swing_highs = np.full(n, np.nan)
     swing_lows = np.full(n, np.nan)
 
-    for i in range(lookback, n - lookback):
-        # Check if i is a swing high
-        is_swing_high = True
-        for k in range(1, lookback + 1):
-            if high[i] <= high[i - k] or high[i] <= high[i + k]:
-                is_swing_high = False
-                break
-        if is_swing_high:
-            swing_highs[i] = high[i]
-
-        # Check if i is a swing low
-        is_swing_low = True
-        for k in range(1, lookback + 1):
-            if low[i] >= low[i - k] or low[i] >= low[i + k]:
-                is_swing_low = False
-                break
-        if is_swing_low:
+    # Find local minima using only past data
+    for i in range(lookback, n):
+        # Check if this bar's low is lower than all previous lookback bars
+        min_low_in_window = min(low[max(0, i - lookback):i])
+        if low[i] < min_low_in_window:
             swing_lows[i] = low[i]
+
+        # Check if this bar's high is higher than all previous lookback bars
+        max_high_in_window = max(high[max(0, i - lookback):i])
+        if high[i] > max_high_in_window:
+            swing_highs[i] = high[i]
 
     return swing_highs, swing_lows
 
@@ -217,25 +214,26 @@ def backtest_strategy(
             # Check stop loss
             if direction == 1:
                 if low[i] <= sl_px:
-                    pips = (sl_px - entry_px) / PIP_SIZE - SPREAD_PIPS
+                    # Spread deducted: 1 pip at entry + 1 pip at exit = 2 pips total
+                    pips = (sl_px - entry_px) / PIP_SIZE - 2 * SPREAD_PIPS
                     trades.append({"pips": pips, "hold": i - entry_i, "exit": "sl"})
                     pos = False
                     continue
                 # Check take profit
                 if high[i] >= tp_px:
-                    pips = (tp_px - entry_px) / PIP_SIZE - SPREAD_PIPS
+                    pips = (tp_px - entry_px) / PIP_SIZE - 2 * SPREAD_PIPS
                     trades.append({"pips": pips, "hold": i - entry_i, "exit": "tp"})
                     pos = False
                     continue
             else:  # SHORT
                 if high[i] >= sl_px:
-                    pips = (entry_px - sl_px) / PIP_SIZE - SPREAD_PIPS
+                    pips = (entry_px - sl_px) / PIP_SIZE - 2 * SPREAD_PIPS
                     trades.append({"pips": pips, "hold": i - entry_i, "exit": "sl"})
                     pos = False
                     continue
                 # Check take profit
                 if low[i] <= tp_px:
-                    pips = (entry_px - tp_px) / PIP_SIZE - SPREAD_PIPS
+                    pips = (entry_px - tp_px) / PIP_SIZE - 2 * SPREAD_PIPS
                     trades.append({"pips": pips, "hold": i - entry_i, "exit": "tp"})
                     pos = False
                     continue
@@ -244,6 +242,7 @@ def backtest_strategy(
         if not pos and i in entry_triggers:
             trigger_type, current_swing, prev_swing = entry_triggers[i]
             pos = True
+            # Entry price includes spread (we buy at ask)
             entry_px = close[i]
             entry_i = i
 
@@ -306,9 +305,9 @@ def main():
     print("=" * 100)
 
     # Load data
-    print("\nLoading EURUSD 1H data...")
-    df = get_data(ticker="EURUSD", timeframe="1h",
-                  start="2025-01-01", end="2025-12-31")
+    print("\nLoading EURUSD 5m data...")
+    df = get_data(ticker="EURUSD", timeframe="5m",
+                  start="2026-01-01", end="2026-05-16")
     print(f"  Loaded {len(df)} bars ({df.index[0]} to {df.index[-1]})")
 
     # Add daily candle info
