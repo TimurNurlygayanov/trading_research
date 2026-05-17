@@ -1,0 +1,121 @@
+//@version=5
+// Strategy 034 — Wick-Cluster Rejection (SHORT only)
+//
+// Production variant (after loser-analysis on 4 USD majors, 2026 Jan–May):
+//   - S1 (twin tops) DISABLED — negative expectancy at every RR/SL we tested.
+//   - S2 (wick cluster) ENABLED with NEW SL = peak wick high in lookback window.
+//   - RR default = 4.0.
+//   - Required filter: EMA50 not falling (slope >= 0 over a 25-bar lookback).
+//
+// Detection (S2):
+//   - level = max(max(open, close)) over the PRIOR 10 bars (current excluded)
+//   - "Clean level" filter: in the PRIOR 20 bars, NO body crosses level
+//   - >= 3 of those 10 bars had high > level (wicks pierced the level)
+//   - Current bar is red AND high < level (no new high → confirmation)
+//   - EMA50[i] >= EMA50[i-25]  (slope filter: don't short into a falling EMA50)
+//   - Enter short at close of confirmation bar
+//   - SL = highest high over the 10-bar wick window
+//   - TP = entry - RR * (SL - entry)
+//
+// No pyramiding. Recommended timeframe: 5m.
+
+strategy("ST034 Wick-Cluster (Short, S2-only)",
+     overlay                 = true,
+     initial_capital         = 10000,
+     default_qty_type        = strategy.percent_of_equity,
+     default_qty_value       = 100,
+     commission_type         = strategy.commission.percent,
+     commission_value        = 0.02,
+     pyramiding              = 0,
+     calc_on_every_tick      = false,
+     process_orders_on_close = false)
+
+// ============================================================================
+// PARAMETERS
+// ============================================================================
+rr_ratio       = input.float(4.0,  "Risk:Reward",                minval = 0.5,  step = 0.1)
+atr_len        = input.int(14,     "ATR length",                 minval = 1)
+s1_enable      = input.bool(false, "Enable Signal 1 (twin tops) — DISABLED by default (negative expectancy)")
+s2_enable      = input.bool(true,  "Enable Signal 2 (wick cluster)")
+s1_tol_atr     = input.float(0.1,  "S1 close/open tolerance (× ATR)", minval = 0.0, step = 0.01)
+s1_body_clear  = input.int(20,     "S1 body-clear lookback (incl. pattern)", minval = 2, maxval = 200)
+s2_lookback    = input.int(10,     "S2 lookback bars (wick window)", minval = 3,    maxval = 50)
+s2_body_clear  = input.int(20,     "S2 body-clear lookback",     minval = 1,    maxval = 200)
+s2_min_wicks   = input.int(3,      "S2 min wick count",          minval = 1)
+ema50_len      = input.int(50,     "EMA50 length",               minval = 5)
+ema50_slope_lb = input.int(25,     "EMA50 slope lookback",       minval = 2,    maxval = 200)
+
+// ============================================================================
+// INDICATORS
+// ============================================================================
+atr14 = ta.atr(atr_len)
+ema50 = ta.ema(close, ema50_len)
+ema50_slope_ok = ema50 >= ema50[ema50_slope_lb]   // EMA50 not falling
+
+// ============================================================================
+// SIGNAL 1 — Twin tops with matching mid  (disabled by default)
+// ============================================================================
+green_prev = close[1] > open[1]
+red_curr   = close    < open
+wick_prev  = high[1] > math.max(open[1], close[1])
+wick_curr  = high    > math.max(open,    close)
+match_mid  = math.abs(close[1] - open) <= s1_tol_atr * atr14
+
+level_s1 = math.max(close[1], open)
+s1_body_clear_ok = true
+for j = 0 to s1_body_clear - 1
+    if math.max(open[j], close[j]) > level_s1
+        s1_body_clear_ok := false
+        break
+
+s1 = s1_enable and green_prev and red_curr and wick_prev and wick_curr and match_mid and s1_body_clear_ok
+s1_sl    = level_s1               // NEW: SL at body-match mid
+s1_entry = close
+s1_tp    = s1_entry - rr_ratio * (s1_sl - s1_entry)
+
+// ============================================================================
+// SIGNAL 2 — Wick cluster rejection (production)
+// ============================================================================
+body_top = math.max(open, close)
+level    = ta.highest(body_top, s2_lookback)[1]      // max body_top over prior `s2_lookback`
+peak_hi  = ta.highest(high,     s2_lookback)[1]      // max high       over prior `s2_lookback`
+
+wick_count = 0
+for i = 1 to s2_lookback
+    if high[i] > level
+        wick_count := wick_count + 1
+
+body_clear = true
+for j = 1 to s2_body_clear
+    if math.max(open[j], close[j]) > level
+        body_clear := false
+        break
+
+s2_red       = close < open
+s2_no_new_hi = high  < level
+s2 = s2_enable and not na(level) and body_clear and wick_count >= s2_min_wicks and s2_red and s2_no_new_hi and ema50_slope_ok
+
+s2_entry = close
+s2_sl    = peak_hi                // NEW: SL at peak wick high in lookback window
+s2_tp    = s2_entry - rr_ratio * (s2_sl - s2_entry)
+
+// ============================================================================
+// ENTRIES
+// ============================================================================
+if strategy.position_size == 0
+    if s2 and s2_sl > s2_entry
+        strategy.entry("S2 Short", strategy.short)
+        strategy.exit("S2 X", "S2 Short", stop = s2_sl, limit = s2_tp)
+    else if s1 and s1_sl > s1_entry
+        strategy.entry("S1 Short", strategy.short)
+        strategy.exit("S1 X", "S1 Short", stop = s1_sl, limit = s1_tp)
+
+// ============================================================================
+// VISUALIZATION
+// ============================================================================
+plotshape(s1, "S1",      style = shape.triangledown, location = location.abovebar, color = color.red,    size = size.tiny, text = "S1")
+plotshape(s2, "S2",      style = shape.triangledown, location = location.abovebar, color = color.orange, size = size.tiny, text = "S2")
+plot(level,   "S2 level", color = color.new(color.blue, 50), linewidth = 1)
+plot(ema50,   "EMA50",    color = color.new(color.purple, 30), linewidth = 1)
+
+alertcondition(s2, title = "ST034 S2 Short", message = "Wick-cluster rejection short signal")

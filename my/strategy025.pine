@@ -1,0 +1,167 @@
+//@version=5
+// Strategy 025 — Swing Point + Daily Color Filter
+//
+// LONG entry:
+//   - Current bar is a swing low (low < min(low) over previous `lookback` bars)
+//   - Current swing low > previous swing low  (HIGHER LOW pattern)
+//   - Both yesterday and today's daily candles are GREEN
+//
+// SHORT entry (mirror):
+//   - Swing high higher than previous lookback
+//   - Current swing high < previous swing high (LOWER HIGH pattern)
+//   - Both yesterday and today's daily candles are RED
+//
+// Exit:
+//   - SL at previous swing (sl_at_prev=true) OR current swing
+//   - TP at entry + risk * RR (default 1:3)
+//
+// Recommended timeframe: 5m
+// Best config from backtesting (EURUSD 2026, ~3.3 months):
+//   direction=SHORT, lookback=5, sl_at_prev=true → +4.1% return, 1.3% MaxDD
+
+strategy("ST025 Swing + Daily Color",
+     overlay              = true,
+     initial_capital      = 10000,
+     default_qty_type     = strategy.fixed,
+     default_qty_value    = 10000,
+     commission_type      = strategy.commission.percent,
+     commission_value     = 0.02,
+     pyramiding           = 0,
+     calc_on_every_tick   = false,
+     process_orders_on_close = false)
+
+// ============================================================================
+// PARAMETERS
+// ============================================================================
+direction   = input.string("SHORT", "Direction",       options = ["LONG", "SHORT", "BOTH"])
+lookback    = input.int(5,          "Lookback bars",   minval  = 2,    maxval = 50)
+sl_at_prev  = input.bool(true,      "SL at PREVIOUS swing (otherwise current swing)")
+rr_ratio    = input.float(3.0,      "Risk:Reward",     minval  = 0.5,  step   = 0.1)
+
+// ---- Backtest date range -------------------------------------------------
+use_date_range = input.bool(true, "Restrict to date range", group = "Backtest period")
+start_date     = input.time(timestamp("2026-01-01 00:00 +0000"), "Start date", group = "Backtest period")
+end_date       = input.time(timestamp("2026-12-31 23:59 +0000"), "End date",   group = "Backtest period")
+
+in_date_range = (not use_date_range) or (time >= start_date and time <= end_date)
+
+show_swings = input.bool(true,  "Show swing markers", group = "Display")
+show_levels = input.bool(true,  "Show SL/TP levels while in trade", group = "Display")
+
+// ============================================================================
+// DAILY CANDLE COLORS
+// ============================================================================
+// Today's daily open (uses lookahead_on with current bar — safe because we
+// already know today's open by the time we trade).
+[today_open_d, _today_close_d] = request.security(
+     syminfo.tickerid, "D", [open, close],
+     lookahead = barmerge.lookahead_on,
+     gaps      = barmerge.gaps_off)
+
+// Yesterday's CONFIRMED daily open/close (using [1] in the request expression
+// shifts the lookup to the previous daily bar — no lookahead bias).
+[yest_open_d, yest_close_d] = request.security(
+     syminfo.tickerid, "D", [open[1], close[1]],
+     lookahead = barmerge.lookahead_on,
+     gaps      = barmerge.gaps_off)
+
+// Current "running" daily color: based on today's daily open vs the
+// current close on this intraday bar.
+today_color = close > today_open_d ?  1 : close < today_open_d ? -1 : 0
+prev_color  = yest_close_d > yest_open_d ?  1 : yest_close_d < yest_open_d ? -1 : 0
+
+// ============================================================================
+// SWING DETECTION (on the chart's timeframe — use 5m for original)
+// ============================================================================
+// A swing low at the current bar: low < min of the previous `lookback` lows
+// (excluding the current bar). Same idea for swing highs.
+prev_min_low  = ta.lowest(low,  lookback)[1]   // [1] makes the window exclude current
+prev_max_high = ta.highest(high, lookback)[1]
+
+is_swing_low  = low  < prev_min_low
+is_swing_high = high > prev_max_high
+
+// Track the two most-recent swing lows / highs so we can detect the
+// "higher low" / "lower high" pattern.
+var float last_swing_low  = na
+var float prev_swing_low  = na
+var float last_swing_high = na
+var float prev_swing_high = na
+
+if is_swing_low
+    prev_swing_low := last_swing_low
+    last_swing_low := low
+
+if is_swing_high
+    prev_swing_high := last_swing_high
+    last_swing_high := high
+
+// ============================================================================
+// ENTRY CONDITIONS
+// ============================================================================
+long_dir_ok  = direction == "LONG"  or direction == "BOTH"
+short_dir_ok = direction == "SHORT" or direction == "BOTH"
+
+long_signal  = long_dir_ok and is_swing_low
+     and not na(prev_swing_low)
+     and low > prev_swing_low
+     and prev_color  == 1
+     and today_color == 1
+
+short_signal = short_dir_ok and is_swing_high
+     and not na(prev_swing_high)
+     and high < prev_swing_high
+     and prev_color  == -1
+     and today_color == -1
+
+// ============================================================================
+// ENTRY / EXIT
+// ============================================================================
+if long_signal and strategy.position_size == 0 and in_date_range
+    entry_p = close
+    sl_p    = sl_at_prev ? prev_swing_low : low
+    if entry_p > sl_p
+        risk = entry_p - sl_p
+        tp_p = entry_p + risk * rr_ratio
+        strategy.entry("LONG", strategy.long)
+        strategy.exit("LX", from_entry = "LONG", stop = sl_p, limit = tp_p)
+
+if short_signal and strategy.position_size == 0 and in_date_range
+    entry_p = close
+    sl_p    = sl_at_prev ? prev_swing_high : high
+    if entry_p < sl_p
+        risk = sl_p - entry_p
+        tp_p = entry_p - risk * rr_ratio
+        strategy.entry("SHORT", strategy.short)
+        strategy.exit("SX", from_entry = "SHORT", stop = sl_p, limit = tp_p)
+
+// Force-close any open position when we leave the date range
+if use_date_range and time > end_date and strategy.position_size != 0
+    strategy.close_all(comment = "End of test period")
+
+// ============================================================================
+// VISUALIZATION
+// ============================================================================
+plotshape(show_swings and is_swing_low,  "Swing Low",   style = shape.triangleup,
+     location = location.belowbar, color = color.new(color.green, 50), size = size.tiny)
+plotshape(show_swings and is_swing_high, "Swing High",  style = shape.triangledown,
+     location = location.abovebar, color = color.new(color.red,   50), size = size.tiny)
+
+plotshape(long_signal,  "LONG entry",  style = shape.labelup,
+     location = location.belowbar, color = color.lime,   text = "L",
+     textcolor = color.black, size = size.small)
+plotshape(short_signal, "SHORT entry", style = shape.labeldown,
+     location = location.abovebar, color = color.orange, text = "S",
+     textcolor = color.black, size = size.small)
+
+// Background tint by today's running daily color
+bgcolor(today_color ==  1 ? color.new(color.green, 95)
+      : today_color == -1 ? color.new(color.red,   95) : na,
+     title = "Daily color tint")
+
+// Plot SL/TP while in a trade
+in_long  = strategy.position_size > 0
+in_short = strategy.position_size < 0
+sl_plot  = in_long or in_short ? strategy.position_avg_price + (in_long ? -1 : 1) * math.abs(strategy.position_avg_price - (in_long ? prev_swing_low : prev_swing_high)) : na
+plot(show_levels and in_long  ? prev_swing_low  : na, "LONG SL",  color = color.red,   linewidth = 1, style = plot.style_linebr)
+plot(show_levels and in_short ? prev_swing_high : na, "SHORT SL", color = color.red,   linewidth = 1, style = plot.style_linebr)
