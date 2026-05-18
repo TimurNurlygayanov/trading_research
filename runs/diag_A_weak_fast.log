@@ -1,0 +1,33 @@
+>>> static leakage scan
+  clean.
+>>> loading EURUSD 5m
+  23,900 bars, 2025-01-01 21:00:00+00:00 - 2025-04-30 23:55:00+00:00
+  HTF 1h: 1,997 bars
+
+[window 0] train 2025-01-01..2025-04-01 | trade 2025-04-01..2025-05-01
+  base=0.427/0.430  PR-AUC train=0.599 val=0.513 (lift 1.19x)  thr=0.62 P=0.57 R=0.10
+  trades=96  tp=50 sl=45  equity 100,000 -> 94,965 (-5.04%)
+
+stopped after 1 windows (--max-windows)
+
+>>> walk-forward done in 0.2 min
+
+=== SUMMARY ===
+  n_windows: 1
+  n_trades: 96
+  win_rate: 0.5208
+  avg_win_usd: 132.5
+  avg_loss_usd: -253.49
+  profit_factor: 0.568
+  start_equity: 100000.0
+  end_equity: 94964.66
+  return_pct: -5.04
+  max_drawdown_pct: -5.18
+  worst_day_pct: -1.23
+  worst_day: 2025-04-21
+  trade_sharpe_annualized: -9.351
+  halted: False
+  halt_reason: None
+  ftmo_max_dd_ok: True
+  ftmo_daily_ok: True
+  output: runs\diag_A_weak_fast

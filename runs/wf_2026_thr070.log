@@ -1,0 +1,39 @@
+>>> static leakage scan
+  clean.
+>>> loading EURUSD 5m
+  36,724 bars, 2025-10-01 00:00:00+00:00 - 2026-03-31 23:55:00+00:00
+  HTF 1h: 3,069 bars
+
+[window 0] train 2025-10-01..2026-01-01 | trade 2026-01-01..2026-02-01
+  base=0.648/0.654  PR-AUC train=0.790 val=0.737 (lift 1.13x)  thr=0.10 P=0.65 R=1.00
+  trades=656  tp=483 sl=139  equity 100,000 -> 106,217 (+6.22%)
+
+[window 1] train 2025-11-01..2026-02-01 | trade 2026-02-01..2026-03-01
+  base=0.650/0.650  PR-AUC train=0.768 val=0.749 (lift 1.15x)  thr=0.10 P=0.65 R=1.00
+  trades=456  tp=359 sl=81  equity 106,217 -> 115,925 (+9.14%)
+
+[window 2] train 2025-12-01..2026-03-01 | trade 2026-03-01..2026-04-01
+  base=0.651/0.636  PR-AUC train=0.872 val=0.780 (lift 1.23x)  thr=0.10 P=0.64 R=1.00
+  trades=838  tp=685 sl=127  equity 115,925 -> 151,055 (+30.30%)
+
+>>> walk-forward done in 0.7 min
+
+=== SUMMARY ===
+  n_windows: 3
+  n_trades: 1950
+  win_rate: 0.7887
+  avg_win_usd: 93.52
+  avg_loss_usd: -225.21
+  profit_factor: 1.55
+  start_equity: 100000.0
+  end_equity: 151054.59
+  return_pct: 51.05
+  max_drawdown_pct: -1.65
+  worst_day_pct: -1.59
+  worst_day: 2026-01-22
+  trade_sharpe_annualized: 17.374
+  halted: False
+  halt_reason: None
+  ftmo_max_dd_ok: True
+  ftmo_daily_ok: True
+  output: runs\wf_2026_thr070

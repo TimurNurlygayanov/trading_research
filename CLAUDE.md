@@ -1,157 +1,136 @@
-# CLAUDE.md — Trading Research Pipeline
+# CLAUDE.md — Adaptive ML Trading Pipeline
 
-Behavioral guidelines for working on this codebase. Read before making changes.
+Behavioral guidelines for this codebase.
 
 ---
 
-## 1. Think Before Coding
+## 1. Project scope
 
-- State assumptions explicitly. If uncertain, ask first.
-- If multiple approaches exist, present them — don't pick silently.
-- If something is unclear, say so. Ask. Don't guess and implement.
+A single-purpose research codebase: walk-forward CatBoost classifier for trade entries, with strict leakage controls and FTMO-compliant simulation. See `PLAN.md` for the full design.
+
+Default target: **EURUSD 5m**, 3-month train → 1-month trade, rolling.
+
+---
+
+## 2. Think before coding
+
+- State assumptions. If uncertain, ask first.
 - Push back when a simpler approach exists.
+- Don't guess and implement.
 
 ---
 
-## 2. Surgical Changes
+## 3. Surgical changes
 
-- Touch only what the task requires. Don't "improve" adjacent code.
-- Don't refactor things that aren't broken.
-- Match existing style even if you'd do it differently.
-- Every changed line should trace directly to the request.
-- When your changes make imports/variables unused, remove them. Don't remove pre-existing dead code unless asked.
+- Touch only what the task requires.
+- Match existing style.
+- Remove imports/variables you make unused. Don't remove pre-existing dead code unless asked.
 
 ---
 
-## 3. Simplicity First
+## 4. Simplicity first
 
-- No features beyond what was asked.
-- No speculative abstractions or "future flexibility".
-- If you write 200 lines and 50 would do, rewrite it.
-- Ask: "Would a senior engineer call this overcomplicated?" If yes, simplify.
-
----
-
-## 4. Verify Before Finishing
-
-Always run `python -c "import ast; ast.parse(open('file.py').read())"` on every Python file you edit.
-State a brief plan for multi-step tasks before starting.
+- No speculative abstractions.
+- No "future flexibility" features.
+- Senior-engineer test: if they'd call it overcomplicated, simplify.
 
 ---
 
-## 5. Project-Specific: Known Bug Patterns
+## 5. Verify before finishing
 
-These bugs have already been fixed. Do not reintroduce them.
-
-### 5a. The `or 0` trap
-```python
-# WRONG — 0.0 is falsy in Python, so `0.0 or 0` → 0 (int)
-sharpe = float(stats.get("Sharpe Ratio", 0) or 0)
-
-# RIGHT — use _safe_float() from backtest/engine.py
-sharpe = _safe_float(stats.get("Sharpe Ratio"))
+Always syntax-check edited Python files:
+```
+python -c "import ast; ast.parse(open('file.py').read())"
 ```
 
-### 5b. `setattr` race condition in Optuna parallel trials
-```python
-# WRONG — mutates the shared class object; all parallel trials stomp each other
-for k, v in params.items():
-    setattr(strategy_class, k, v)
-bt = Backtest(df, strategy_class, ...)
+---
 
-# RIGHT — create a throw-away subclass per trial
-parameterized = type(strategy_class.__name__, (strategy_class,), {k: v for k, v in params.items()})
-bt = Backtest(df, parameterized, ...)
+## 6. Hard rules — leakage & realism
+
+The most important rules in this repo. Violating them silently invalidates results.
+
+### 6a. Feature pure-function contract
+Every feature builder takes `df_up_to_t` and returns a value depending **only** on rows ≤ t. Unit test:
+```python
+assert f(df.iloc[:t]) == f(df.iloc[:t+10]).iloc[t]
 ```
 
-### 5c. Equity-curve Sharpe is always ~0 for intraday strategies
-backtesting.py computes Sharpe from *daily* equity returns. Intraday strategies that open and close within the same day produce near-zero daily returns, making Sharpe ≈ 0.
-- `result.sharpe` in `BacktestResult` is the **per-trade annualized Sharpe** (`mean_pnl/std_pnl * sqrt(trades/year)`) — this is the metric used everywhere.
-- `result.equity_sharpe` is the backtesting.py value — diagnostic only, never used for gates or optimization.
+### 6b. No `shift(-N)`, no `iloc[i+...]`, no `min_periods=0` in features
+Caught by `ml/leakage.py` static scan. Run gates whenever `ml/features.py` changes.
 
-### 5d. Python dataclass field ordering
-Fields with defaults must come after fields without defaults.
+### 6c. Label resolution ≤ train-window end − embargo
+Embargo = `max_holding_bars`. Asserted in `walkforward.py`.
+
+### 6d. Cost model is non-negotiable
+- Long entry pays half-spread above mid; exits at mid − half-spread.
+- Commission round-trip = `notional × commission × 2`.
+- Labels are computed **net of costs**.
+
+### 6e. TP/SL invariants
+At order time:
+```
+long:  tp > entry > sl
+short: sl > entry > tp
+```
+
+### 6f. The `or 0` trap
 ```python
-# WRONG — non-default field after default field → TypeError at class definition
-trade_sharpe: float = 0.0
-raw_stats: dict          # no default
-
+# WRONG — 0.0 is falsy
+x = float(stats.get("k", 0) or 0)
 # RIGHT
-raw_stats: dict
-trade_sharpe: float = 0.0
+v = stats.get("k")
+x = float(v) if v is not None else 0.0
 ```
 
-### 5e. modal_job_id must be cleared on failure
-Every `except` block in a Modal function must include `"modal_job_id": None` in the DB update, or the UI will show "job stuck" forever.
-```python
-except Exception as e:
-    db.update_strategy(strategy_id, {
-        "status": "failed",
-        "modal_job_id": None,   # ← always include this
-        "error_log": ...,
-    })
-```
+### 6g. ATR alignment
+When entering at close of bar `t`, SL/TP must use `ATR(t-1)`. Don't include `t`'s own range.
 
-### 5f. pandas_ta column names with float params
-```python
-# WRONG — pandas_ta may format 3.0 as "3.0" or "3" depending on version
-col = "SUPERT_7_3.0"
-
-# RIGHT — build column name dynamically from the actual params
-col = f"SUPERT_{self.st_period}_{float(self.st_mult)}"
-```
-
-### 5g. Session filter blocks all trades on higher timeframes
-Default `start_hour=7, end_hour=20` works for 1h/15m data but can block all 4h/1d bars.
-Always default to `start_hour=0, end_hour=23` (no filter). Let the optimizer find good windows.
+### 6h. Session VWAP resets at session open
+Never roll continuously across sessions.
 
 ---
 
-## 6. Project Architecture
+## 7. Class imbalance
 
-### Pipeline stages (in order)
-```
-idea → filtered → implementing → [awaiting_research] → implemented
-     → quick_testing → quick_tested → backtesting → validating → live
-```
-Failed strategies are auto-retried by `_process_failed_strategies()` in `queue_worker.py`.
+- CatBoost `auto_class_weights="Balanced"`.
+- No SMOTE / oversampling — breaks time order.
+- Evaluate with PR-AUC and precision@k. Not accuracy.
 
-### Key files
+---
+
+## 8. Walk-forward discipline
+
+- Train and trade windows are **adjacent**, never overlap.
+- Slide by `trade_months`.
+- Each window's model is independent. No parameter carryover.
+
+---
+
+## 9. Tuning order
+
+1. Re-check leakage gates.
+2. Tune the label (RR, SL multiplier, timeout).
+3. Raise `min_proba`.
+4. Symbol/TF scan.
+5. Feature ablation.
+
+Don't reach for deeper trees or more features before #1-3.
+
+---
+
+## 10. Files
+
 | File | Role |
-|------|------|
-| `orchestrator/queue_worker.py` | 10-min loop, dispatches Modal jobs, auto-fixes |
-| `orchestrator/main.py` | FastAPI dashboard + API endpoints |
-| `modal_jobs/backtest_job.py` | `run_quick_backtest`, `run_backtest_pipeline` on Modal |
-| `backtest/engine.py` | `run_backtest()` wrapper, `BacktestResult` dataclass |
-| `backtest/optimizer.py` | Optuna optimizer (uses `result.sharpe` = trade Sharpe) |
-| `backtest/walk_forward.py` | Walk-forward validation (uses `result.sharpe`) |
-| `agents/pre_filter.py` | Classifies submission as strategy or research, scores ideas |
-| `agents/implementer.py` | Generates backtesting.py Strategy class from description |
-| `agents/code_fixer.py` | Diagnoses failures, LLM-repairs broken strategy code |
-| `db/supabase_client.py` | All DB helpers — never use supabase directly elsewhere |
-| `db/schema.sql` | Source of truth for DB schema — always update when adding columns |
-
-### Multi-timeframe quick test
-Every strategy is tested on `["4h", "1h", "15m", "5m", "1m"]` with default params.
-The best timeframe (by trade Sharpe) is stored in `best_timeframe` and used for full optimization.
-Zero trades on ALL timeframes → `failed` immediately, routed to `code_fixer`.
-
-### Research tasks
-Submissions that look like questions ("how does X affect Y?") are classified as `research` by pre-filter and inserted into `research_tasks` table instead of `strategies`.
-The `Modal` researcher agent runs the analysis and stores findings.
-
-### Sharpe metric policy
-- **Never** use backtesting.py's "Sharpe Ratio" stat as the primary metric for intraday strategies.
-- **Always** use `_compute_trade_sharpe(trades_df, signals_per_year)` from `engine.py`.
-- Quality gates, Optuna objective, walk-forward IS/OOS comparison — all use `result.sharpe` which is the trade Sharpe.
-
----
-
-## 7. DB Schema Rules
-
-- Always add `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` for new columns (idempotent).
-- Always add new tables to the RLS policy cleanup block in `schema.sql`:
-  ```sql
-  WHERE tablename IN ('strategies', 'user_ideas', ..., 'your_new_table')
-  ```
-- Run the full schema in Supabase SQL editor to verify before shipping.
+|---|---|
+| `scripts/ml_adaptive_entries.py` | CLI entrypoint |
+| `ml/data.py` | Parquet loader from `data/cache/` |
+| `ml/features.py` | Past-only feature builders |
+| `ml/labels.py` | Triple-barrier labeling, 1m resolution |
+| `ml/dataset.py` | (X, y, t) assembly |
+| `ml/model.py` | CatBoost wrapper |
+| `ml/simulator.py` | Bar-by-bar sim with spread/commission/FTMO |
+| `ml/walkforward.py` | Rolling-window driver |
+| `ml/leakage.py` | Static + runtime checks |
+| `ml/report.py` | Per-run report |
+| `data/cache/` | Historical parquet files |
+| `PLAN.md` | Full design document |

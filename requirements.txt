@@ -1,47 +1,16 @@
-# Core
-anthropic
-supabase
-python-dotenv
-psycopg2-binary   # direct Postgres connection for DB migrations
-
 # Data
 pandas
-pandas_ta
 numpy
-requests
-httpx
-massive
-
-# Backtesting
-backtesting
-
-# Optimization
-optuna
-scikit-learn
-xgboost
-
-# Web / API server
-fastapi
-uvicorn[standard]
-jinja2
-python-multipart
-
-# Scheduling & async
-apscheduler
-
-# Modal (cloud compute)
-modal
-
-# Storage
-boto3
 pyarrow
+pandas_ta
 
-# Stats
-scipy
-statsmodels
+# Model
+catboost
+scikit-learn
+
+# Plots / report
+matplotlib
 
 # Utilities
 python-dateutil
-pytz
 tqdm
-structlog

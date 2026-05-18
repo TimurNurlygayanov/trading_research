@@ -1,0 +1,42 @@
+>>> static leakage scan
+  clean.
+>>> loading EURUSD 5m
+  36,724 bars, 2025-10-01 00:00:00+00:00 - 2026-03-31 23:55:00+00:00
+  HTF 1h: 3,069 bars
+
+[window 0] train 2025-10-01..2026-01-01 | trade 2026-01-01..2026-02-01
+  base=0.648/0.654  PR-AUC train=0.790 val=0.737 (lift 1.13x)  thr=0.10 P=0.65 R=1.00
+  ema-filter: blocked 3130 long bars (slope<0), 2903 short bars (slope>0)
+  trades=6  tp=5 sl=1  equity 100,000 -> 100,152 (+0.15%)
+
+[window 1] train 2025-11-01..2026-02-01 | trade 2026-02-01..2026-03-01
+  base=0.650/0.650  PR-AUC train=0.768 val=0.749 (lift 1.15x)  thr=0.10 P=0.65 R=1.00
+  ema-filter: blocked 2835 long bars (slope<0), 2883 short bars (slope>0)
+  trades=64  tp=56 sl=5  equity 100,152 -> 103,418 (+3.26%)
+
+[window 2] train 2025-12-01..2026-03-01 | trade 2026-03-01..2026-04-01
+  base=0.651/0.636  PR-AUC train=0.872 val=0.780 (lift 1.23x)  thr=0.10 P=0.64 R=1.00
+  ema-filter: blocked 3425 long bars (slope<0), 2943 short bars (slope>0)
+  trades=74  tp=69 sl=3  equity 103,418 -> 108,912 (+5.31%)
+
+>>> walk-forward done in 0.7 min
+
+=== SUMMARY ===
+  n_windows: 3
+  n_trades: 144
+  win_rate: 0.9306
+  avg_win_usd: 82.09
+  avg_loss_usd: -208.72
+  profit_factor: 5.27
+  start_equity: 100000.0
+  end_equity: 108912.2
+  return_pct: 8.91
+  max_drawdown_pct: -0.45
+  worst_day_pct: -0.23
+  worst_day: 2026-02-23
+  trade_sharpe_annualized: 22.181
+  halted: False
+  halt_reason: None
+  ftmo_max_dd_ok: True
+  ftmo_daily_ok: True
+  output: runs\wf_2026_C_thr090_ema

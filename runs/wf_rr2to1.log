@@ -1,0 +1,63 @@
+>>> static leakage scan
+  clean.
+>>> loading EURUSD 5m
+  73,778 bars, 2025-01-01 21:00:00+00:00 - 2025-12-31 22:00:00+00:00
+  HTF 1h: 6,163 bars
+
+[window 0] train 2025-01-01..2025-04-01 | trade 2025-04-01..2025-05-01
+  base=0.644/0.631  PR-AUC train=0.791 val=0.767 (lift 1.21x)  thr=0.10 P=0.63 R=1.00
+  trades=1006  tp=746 sl=236  equity 100,000 -> 114,348 (+14.35%)
+
+[window 1] train 2025-02-01..2025-05-01 | trade 2025-05-01..2025-06-01
+  base=0.647/0.643  PR-AUC train=0.806 val=0.802 (lift 1.25x)  thr=0.10 P=0.64 R=1.00
+  trades=924  tp=693 sl=203  equity 114,348 -> 127,870 (+11.83%)
+
+[window 2] train 2025-03-01..2025-06-01 | trade 2025-06-01..2025-07-01
+  base=0.649/0.651  PR-AUC train=0.813 val=0.778 (lift 1.20x)  thr=0.10 P=0.65 R=1.00
+  trades=931  tp=675 sl=231  equity 127,870 -> 131,447 (+2.80%)
+
+[window 3] train 2025-04-01..2025-07-01 | trade 2025-07-01..2025-08-01
+  base=0.652/0.628  PR-AUC train=0.828 val=0.755 (lift 1.20x)  thr=0.10 P=0.63 R=1.00
+  trades=913  tp=665 sl=217  equity 131,447 -> 135,377 (+2.99%)
+
+[window 4] train 2025-05-01..2025-08-01 | trade 2025-08-01..2025-09-01
+  base=0.648/0.647  PR-AUC train=0.780 val=0.771 (lift 1.19x)  thr=0.10 P=0.65 R=1.00
+  trades=825  tp=592 sl=200  equity 135,377 -> 135,217 (-0.12%)
+
+[window 5] train 2025-06-01..2025-09-01 | trade 2025-09-01..2025-10-01
+  base=0.640/0.642  PR-AUC train=0.813 val=0.732 (lift 1.14x)  thr=0.10 P=0.64 R=1.00
+  trades=874  tp=642 sl=200  equity 135,217 -> 138,328 (+2.30%)
+
+[window 6] train 2025-07-01..2025-10-01 | trade 2025-10-01..2025-11-01
+  base=0.642/0.647  PR-AUC train=0.792 val=0.752 (lift 1.16x)  thr=0.10 P=0.65 R=1.00
+  trades=887  tp=653 sl=205  equity 138,328 -> 142,138 (+2.75%)
+
+[window 7] train 2025-08-01..2025-11-01 | trade 2025-11-01..2025-12-01
+  base=0.645/0.637  PR-AUC train=0.842 val=0.778 (lift 1.22x)  thr=0.10 P=0.64 R=1.00
+  trades=698  tp=507 sl=162  equity 142,138 -> 142,257 (+0.08%)
+
+[window 8] train 2025-09-01..2025-12-01 | trade 2025-12-01..2026-01-01
+  base=0.646/0.658  PR-AUC train=0.852 val=0.787 (lift 1.20x)  thr=0.10 P=0.66 R=1.00
+  trades=725  tp=562 sl=134  equity 142,257 -> 159,723 (+12.28%)
+
+>>> walk-forward done in 2.8 min
+
+=== SUMMARY ===
+  n_windows: 9
+  n_trades: 7783
+  win_rate: 0.7434
+  avg_win_usd: 103.12
+  avg_loss_usd: -268.85
+  profit_factor: 1.111
+  start_equity: 100000.0
+  end_equity: 159722.95
+  return_pct: 59.72
+  max_drawdown_pct: -5.32
+  worst_day_pct: -2.79
+  worst_day: 2025-10-14
+  trade_sharpe_annualized: 4.686
+  halted: False
+  halt_reason: None
+  ftmo_max_dd_ok: True
+  ftmo_daily_ok: True
+  output: runs\wf_rr2to1
